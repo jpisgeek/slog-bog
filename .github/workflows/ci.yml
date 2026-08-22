@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks scans history, not just the tip
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: gitleaks (credential patterns, full history)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: scanner self-test
+        run: scripts/test-scan.sh
+
+      - name: identifier scan (generic rules; the private denylist runs locally only)
+        # review/ is excluded on purpose: the prompt names the patterns it hunts.
+        run: scripts/scan-identifiers.sh extensions/ templates/ README.md CONTRIBUTING.md SECURITY.md
+
+      - name: deno fmt
+        run: deno fmt --check extensions/ scripts/
+
+      - name: deno tests
+        run: |
+          if ls extensions/**/*_test.ts extensions/*/*_test.ts >/dev/null 2>&1; then
+            deno test --allow-read --allow-env --allow-net extensions/
+          else
+            echo "no tests yet"
+          fi
+
+      - name: review verdicts match content hashes
+        run: scripts/check-review-verdicts.sh
+
+      # swamp itself is not installed in CI: the registry-side gates
+      # (extension fmt / quality / push --dry-run) run locally via
+      # scripts/publish.sh, where the swamp toolchain and registry auth live.

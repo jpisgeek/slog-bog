@@ -1,0 +1,7 @@
+# swamp runtime state never belongs in this repo
+.swamp/
+# review scratch
+reviews/**/*.tmp
+# editor / OS
+.DS_Store
+*.swp

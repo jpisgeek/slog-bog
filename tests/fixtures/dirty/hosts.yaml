@@ -1,0 +1,4 @@
+host: box.local
+other: nas.lan
+also: svc.home.arpa
+and localhost:19999

@@ -1,0 +1,11 @@
+# gitleaks configuration — extends the default ruleset, allowlists only the
+# scanner's own test fixtures, which intentionally contain fake secrets.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Deliberately dirty fixtures for scripts/test-scan.sh"
+paths = [
+  '''tests/fixtures/dirty/.*''',
+  '''tests/fixtures/denylist\.sample\.txt''',
+]
