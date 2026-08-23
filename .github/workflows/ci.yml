@@ -41,11 +41,25 @@ jobs:
 
       - name: deno tests
         run: |
-          if ls */*_test.ts >/dev/null 2>&1; then
-            deno test --allow-read --allow-env --allow-net $(ls -d */*_test.ts | xargs -n1 dirname | sort -u)
-          else
-            echo "no tests yet"
+          # --allow-run: the vault tests drive a fake pass-cli.
+          # --allow-write: the dashboard tests render to a temp file.
+          # No test reaches the network — fetch is stubbed — but --allow-net
+          # keeps a stub miss surfacing as a test failure, not a permission one.
+          deno test --allow-read --allow-write --allow-env --allow-net --allow-run \
+            $(ls -d */*_test.ts | xargs -n1 dirname | sort -u)
+
+      - name: every extension has tests
+        run: |
+          missing=""
+          for d in */; do
+            [ -f "$d/manifest.yaml" ] || continue
+            ls "$d"*_test.ts >/dev/null 2>&1 || missing="$missing $d"
+          done
+          if [ -n "$missing" ]; then
+            echo "extensions without tests:$missing" >&2
+            exit 1
           fi
+          echo "all extensions have tests"
 
       - name: READMEs are generated and current (zod schemas read from source — no swamp needed)
         run: deno run --allow-read --allow-write --allow-run --allow-env scripts/gen-readme.ts --check

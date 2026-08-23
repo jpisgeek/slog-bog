@@ -10,6 +10,7 @@
 #   --skip-review   reuse an existing PASS verdict for the current hash; do
 #                   not call the model. Fails if none exists.
 #   --channel       registry prerelease channel (default: stable)
+#   --allow-untested  publish an extension that has no *_test.ts (discouraged)
 #
 # Environment:
 #   SLOG_BOG_DENYLIST   path to the private identifier denylist (outside the
@@ -37,11 +38,12 @@ fi
 
 name="${1:-}"; shift || true
 [ -n "$name" ] || { sed -n '2,25p' "$0"; exit 2; }
-review_only=0; skip_review=0; channel=""
+review_only=0; skip_review=0; channel=""; allow_untested=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --review-only) review_only=1 ;;
     --skip-review) skip_review=1 ;;
+    --allow-untested) allow_untested=1 ;;
     --channel) channel="${2:-}"; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -64,9 +66,14 @@ swamp extension fmt "$manifest" --check
 step "2/8 deno fmt + tests"
 deno fmt --check "$name/" scripts/
 if ls "$name"/*_test.ts >/dev/null 2>&1; then
-  deno test --allow-read --allow-env --allow-net "$name/"
+  # --allow-run is needed by the vault tests (they drive a fake pass-cli);
+  # --allow-write by the dashboard tests (they render to a temp file).
+  deno test --allow-read --allow-write --allow-env --allow-net --allow-run "$name/"
 else
-  echo "WARNING: no tests found — testing-completeness will be flagged" >&2
+  echo "REFUSING: $name has no *_test.ts. Publishing untested code under your" >&2
+  echo "name is the one gap the security review cannot cover. Write tests, or" >&2
+  echo "pass --allow-untested to override deliberately." >&2
+  [ "${allow_untested:-0}" -eq 1 ] || exit 1
 fi
 
 step "3/8 swamp extension quality"
@@ -133,8 +140,19 @@ echo "  extension : $name  (version $version)"
 echo "  hash      : $hash"
 echo "  verdict   : $verdict (PASS)"
 echo "  channel   : ${channel:-stable}"
-echo "  visibility: registry default (private) — flip public after install-verify"
 echo "  files     :"; printf '    %s\n' "${published[@]}"
+echo
+# Visibility: the registry has no private/public concept that we could find --
+# `swamp extension push` has no visibility flag, `swamp extension` has no
+# visibility subcommand, and registry metadata carries no visibility field
+# (checked against a published extension, 2026-08-23). The Extension Registry
+# Terms describe a single registry users may browse and obtain from. So:
+# PUBLISHING IS PUBLIC AND IMMEDIATE. The recourse afterwards is
+# `swamp extension yank` (reversible with unyank) or `deprecate` -- not
+# deletion, and not before someone could already have pulled it.
+printf '  \033[1mvisibility: PUBLIC and immediate.\033[0m No private-then-promote step exists.\n'
+echo "  reversal  : yank/deprecate only (the artifact was still public)."
+[ -n "$channel" ] || echo "  tip       : --channel beta publishes as a prerelease instead of stable."
 echo
 read -r -p "Type JP-GO to push, anything else to abort: " answer
 [ "$answer" = "JP-GO" ] || { echo "aborted."; exit 1; }
@@ -145,7 +163,7 @@ push=(swamp extension push "$manifest" --yes)
 [ -n "$channel" ] && push+=(--channel "$channel")
 "${push[@]}"
 echo
-echo "Published $pkg. Next: install-verify from a clean clone, then flip public:"
-echo "  swamp extension install $pkg   # into a scratch dir; confirm it resolves"
-echo "  (registry defaults to private — make it public from the swamp-club UI/CLI when verified)"
-echo "published. Next: install-verify from a clean clone, then flip visibility."
+echo "Published $pkg (public). Verify the registry copy resolves for a consumer:"
+echo "  cd \$(mktemp -d) && swamp repo init --tool none"
+echo "  swamp extension pull $pkg && swamp model type search jpisgeek"
+echo "If it is wrong: swamp extension yank $pkg <version>   (reversible: unyank)"

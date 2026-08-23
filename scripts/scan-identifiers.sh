@@ -61,9 +61,21 @@ fi
 files=()
 for p in "${paths[@]}"; do
   if [ -d "$p" ]; then
+    # Walking a directory scans the PUBLISHED surface. Two kinds of file are
+    # deliberately excluded because they exist to hold hostile input:
+    #   tests/fixtures/  — this scanner's own corpus
+    #   *_test.ts        — extension tests; they assert that strings like
+    #                      file:/// and user:pass@host are REJECTED, so the
+    #                      strings must appear there. Test files are never
+    #                      listed in a manifest, so they are never published
+    #                      (publish.sh scans the explicit published file list,
+    #                      not a directory, and therefore never sees them).
+    # Real credentials in tests are still caught: gitleaks scans the whole
+    # repo, including tests, in CI.
+    # Pointing the scanner AT one of these paths scans it anyway.
     case "$p" in
       *tests/fixtures*) prune=() ;;
-      *) prune=(! -path '*/tests/fixtures/*') ;;
+      *) prune=(! -path '*/tests/fixtures/*' ! -name '*_test.ts') ;;
     esac
     while IFS= read -r -d '' f; do files+=("$f"); done < <(
       find "$p" -type f \
