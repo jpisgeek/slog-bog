@@ -7,7 +7,7 @@ API: system identity, ZFS pools, physical disks, active alerts, and certificate
 expiry — each its own addressable resource, so a workflow can gate on any one of
 them.
 
-**Version** `2026.08.22.2` · **License** MIT · **Source**
+**Version** `2026.08.23.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/truenas
 
 ## Install

@@ -8,7 +8,7 @@ Proton Pass and are never copied into swamp storage, this repository, or disk.
 For people who keep their lives in the Proton ecosystem and want swamp to read
 credentials from the same place everything else does.
 
-**Version** `2026.08.22.2` · **License** MIT · **Source**
+**Version** `2026.08.23.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/proton-pass
 
 ## Install

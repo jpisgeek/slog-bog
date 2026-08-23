@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/truenas"
-version: 2026.08.22.2
+version: 2026.08.23.1
 description: >
   Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket API. Records system state, pools, disks, alerts, and certificate expiry as separate addressable resources, so a workflow can gate on any of them individually. Deliberately narrow: discovery only, no dataset, share, or snapshot management. The API key is supplied at runtime via vault.get().
 repository: https://github.com/jpisgeek/slog-bog/tree/main/truenas

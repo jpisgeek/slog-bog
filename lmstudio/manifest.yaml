@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/lmstudio"
-version: 2026.08.22.2
+version: 2026.08.23.1
 description: >
   Probe and validate an OpenAI-compatible inference endpoint before you trust it.
   Records the MEASURED embedding dimension rather than assuming it from a model

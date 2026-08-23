@@ -3,13 +3,13 @@
  *
  * Secrets stay in Proton Pass. This provider shells out to the official
  * `pass-cli` on demand, so nothing is ever copied into swamp's own storage,
- * into this repository, or onto disk. `${{ vault.get('proton', 'KEY') }}`
+ * into this repository, or onto disk. `${{ vault.get('myvault', 'KEY') }}`
  * resolves live at run time.
  *
- * Secret key forms accepted by `get()`:
- *   "FIREWALLA_MSP_TOKEN"            -> item titled so, field = defaultField
- *   "FIREWALLA_MSP_TOKEN/password"   -> explicit field on that item
- *   "pass://SHARE_ID/ITEM_ID/FIELD"  -> stable URI; survives item renames
+ * Secret key forms accepted by `get()` (placeholders — not real item names):
+ *   "Example Service/API Key"          -> item titled so, field = defaultField
+ *   "Example Service/API Key/password" -> explicit field on that item
+ *   "pass://SHARE_ID/ITEM_ID/FIELD"    -> stable URI; survives item renames
  *
  * Prefer the URI form for anything long-lived: titles can be edited in the
  * Proton Pass UI, item IDs cannot.

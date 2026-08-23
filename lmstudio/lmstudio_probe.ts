@@ -59,8 +59,21 @@ const GlobalArgsSchema = z.object({
   baseUrl: z
     .string()
     .min(1)
-    .refine((v) => /^https?:\/\//i.test(v), {
-      message: "baseUrl must start with http:// or https://",
+    .refine((v) => {
+      try {
+        const u = new URL(v);
+        // http(s) only, and no embedded credentials: baseUrl is logged and can
+        // appear in stored error text, so `https://user:pass@host` would leak.
+        // The only credential is apiToken.
+        return (u.protocol === "http:" || u.protocol === "https:") &&
+          u.username === "" && u.password === "";
+      } catch {
+        return false;
+      }
+    }, {
+      message:
+        "baseUrl must be a valid http(s) URL with no embedded credentials " +
+        "(user:pass@host); pass the token via apiToken.",
     })
     .describe(
       "Base URL of the OpenAI-compatible inference endpoint, including any " +
@@ -985,7 +998,7 @@ async function capabilities(
  */
 export const model = {
   type: "@jpisgeek/lmstudio/probe",
-  version: "2026.08.22.2",
+  version: "2026.08.23.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {

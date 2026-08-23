@@ -9,7 +9,7 @@ llama.cpp server, a gateway in front of one) before you trust it in a workflow.
 reasoning-budget and context-exhaustion diagnostics, and a short capability
 battery.
 
-**Version** `2026.08.22.2` · **License** MIT · **Source**
+**Version** `2026.08.23.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/lmstudio
 
 ## Install

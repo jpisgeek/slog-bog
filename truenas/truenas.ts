@@ -391,12 +391,16 @@ class TrueNasRpc {
       if (msg.error) {
         const e = msg.error as Record<string, unknown>;
         const code = e.code !== undefined ? String(e.code) : "?";
-        const detail = e.data !== undefined ? ` ${JSON.stringify(e.data)}` : "";
+        // Only the human `message` is surfaced. The `data` object is a
+        // middlewared traceback (frames with locals, `formatted`) whose
+        // contents are not guaranteed to redact call arguments -- and one
+        // call, auth.login_with_api_key, takes the API key as its only
+        // argument. Stringifying `data` into an error that can reach a swamp
+        // log would risk persisting the key, so it is dropped; a failing call
+        // is still identified by its RPC error code + message.
         waiter.reject(
           new Error(
-            `TrueNAS RPC error ${code}: ${
-              String(e.message ?? JSON.stringify(e))
-            }${detail}`,
+            `TrueNAS RPC error ${code}: ${String(e.message ?? "(no message)")}`,
           ),
         );
       } else {
@@ -819,7 +823,7 @@ async function discover(_args: unknown, ctx: {
  */
 export const model = {
   type: "@jpisgeek/truenas",
-  version: "2026.08.22.2",
+  version: "2026.08.23.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {
