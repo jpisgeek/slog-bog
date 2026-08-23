@@ -1,0 +1,27 @@
+manifestVersion: 1
+name: "@jpisgeek/dashboard"
+version: 2026.08.22.2
+description: >
+  Renders a self-contained HTML status page from resources other collector models have already written. Collects nothing itself and reaches no network. If a source model has not run, the page says so rather than inventing a value.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/dashboard
+paths:
+  base: manifest
+models:
+  - dashboard.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - dashboard
+  - html
+  - reporting
+  - homelab
+dependencies: []

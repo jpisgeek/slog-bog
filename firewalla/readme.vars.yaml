@@ -1,0 +1,37 @@
+package: "@jpisgeek/firewalla"
+types:
+  - "@jpisgeek/firewalla"
+purpose: >-
+  Device and machine inventory from the Firewalla MSP API. The firewall is the
+  authoritative view of a network — it knows every device it has ever seen,
+  including ones offline right now. One `device` resource per device, one
+  `machine` per deduplicated host (NICs collapsed), one `inventory` roll-up.
+example: |
+  globalArguments:
+    mspDomain: your-msp-domain.firewalla.net
+    token: ${{ vault.get('myvault', 'Example Firewalla/MSP API Key') }}
+    deepCheckTypes: [desktop, "nas&server", switch, goldpro, fwap]
+    interfaceSuffixes: [eth, wifi, wl, lan, en0]
+    wiredSuffixes: [eth, lan, en0]
+    apiManaged: [nas]
+    excludeNetworks: [Guest]
+    exclude: ["dock-*"]
+    dependencies:
+      app-server: nas
+    timeoutSec: 30
+caveats: >-
+  Inventory, not control: it only reads `/v2/devices` and never writes to the
+  firewall. Pruning of departed records happens only on a full, unfiltered
+  sync. A `tier`- or `network`-restricted run never deletes. Devices on
+  `excludeNetworks` are skipped before anything is written. The `machine`
+  list, not the raw `device` list, is the correct source for generating an
+  SSH fleet.
+security: >-
+  `mspDomain` is parsed as a URL and must be a bare `*.firewalla.net`
+  hostname — no path, query, fragment, port, or userinfo — because that is
+  where the token is sent; the request always goes to `https://<hostname>`.
+  The token is marked sensitive, sent in the `Token` header, and redacted from
+  any error body before it can reach a message. 429/503 retries honour
+  `Retry-After` capped at 5 s and are cancellable. Written data is a personal
+  inventory of your network — device names, MAC addresses, IPs, vendors,
+  networks, online state, traffic totals. Treat the datastore accordingly.

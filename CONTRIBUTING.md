@@ -6,20 +6,22 @@ or policy baked in. A user's workflow decides what "bad" means.
 
 ## Layout
 
+One directory per extension at the repo root, self-contained
+(`paths.base: manifest` in its manifest):
+
 ```
-extensions/models/<name>.ts              model extension source
-extensions/models/<name>_test.ts         its tests (sibling; a test file named
-                                         *_test.ts is correct — the loader skips
-                                         it as a model, which is what you want)
-extensions/vaults/<name>/mod.ts          vault extension source
-extensions/manifests/<name>/manifest.yaml  publish manifest
-extensions/manifests/<name>/readme.vars.yaml  the ONLY hand-written README input
-extensions/manifests/<name>/README.md    GENERATED — do not edit
+<name>/manifest.yaml        publish manifest; repository: points at this directory
+<name>/<name>.ts            source (a vault: <name>.ts exporting `vault`)
+<name>/<name>_test.ts       tests beside the source (a *_test.ts file is correct —
+                            the loader skips it as a model, which is what you want)
+<name>/readme.vars.yaml     the ONLY hand-written README input
+<name>/README.md            GENERATED — do not edit
+<name>/LICENSE              MIT
 ```
 
 ## READMEs are generated
 
-Do not write or edit `README.md` under `extensions/manifests/`. Edit
+Do not write or edit any `<name>/README.md`, nor the extensions table in the root README. Edit
 `readme.vars.yaml` (purpose line, a placeholder example config, caveats) and
 run `scripts/gen-readme.ts`. Everything else in the README — type names,
 methods, argument and resource schemas, version — comes from the code via
@@ -31,11 +33,11 @@ code on every fix and a README is published surface.
 
 ```
 deno fmt --check
-swamp extension fmt extensions/manifests/<name>/manifest.yaml --check
-deno test extensions/
-swamp extension quality extensions/manifests/<name>/manifest.yaml
+swamp extension fmt <name>/manifest.yaml --check
+deno test <name>/
+swamp extension quality <name>/manifest.yaml
 scripts/gen-readme.ts --check
-scripts/scan-identifiers.sh extensions/
+scripts/scan-identifiers.sh <name>/
 ```
 
 No real hostnames, IPs, domains, vault item paths, account IDs, or local paths —

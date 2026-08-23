@@ -1,0 +1,33 @@
+package: "@jpisgeek/truenas"
+types:
+  - "@jpisgeek/truenas"
+purpose: >-
+  Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket
+  API: system identity, ZFS pools, physical disks, active alerts, and
+  certificate expiry — each its own addressable resource, so a workflow can
+  gate on any one of them.
+example: |
+  globalArguments:
+    # Prefer the DNS name the host's certificate was issued to; that is what
+    # lets TLS verification succeed.
+    baseUrl: https://truenas.example.com
+    apiKey: ${{ vault.get('myvault', '<your-truenas-api-key-item>') }}
+    timeoutSec: 20
+    certWarnDays: 30
+    allowInsecureHttp: false
+caveats: >-
+  Discovery only: there is no write path to TrueNAS anywhere in this model.
+  Certificate expiry is computed independently of TrueNAS's own alert state —
+  a `CertificateIsExpiring` alert dismissed in the UI is still reported with
+  `silenced: true`. `expiryKnown` must be checked before `daysRemaining` (a CSR
+  has no expiry). Verified against SCALE 25.10; `auth.login_with_api_key` is
+  scheduled for removal in TrueNAS 27 and the model warns when it connects to
+  a host that new. If a scheduled run fails to connect while the same call
+  works from a shell on the same Mac, suspect macOS Local Network privacy.
+security: >-
+  The API key is marked sensitive, sent once over the authenticated WebSocket,
+  and never logged. `baseUrl` must be `https://` (→ `wss://`) and must not
+  embed userinfo. `allowInsecureHttp: true` permits `http://` → `ws://` with
+  the key in cleartext — off by default, for trusted loopback/VPN paths only.
+  Written data: hostname, version, pool names and health, disk models and
+  serial numbers, alert text, certificate names and CNs.

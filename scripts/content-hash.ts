@@ -8,14 +8,14 @@
 // silently cover a different build.
 //
 // Usage:
-//   scripts/content-hash.ts extensions/manifests/<name>/manifest.yaml [--list]
+//   scripts/content-hash.ts <name>/manifest.yaml [--list]
 //
 // --list prints the resolved file set instead of the hash (for debugging and
 // for feeding the review prompt the exact same files).
 //
 // Path resolution (matches swamp's defaults as used in this repo):
-//   models:          relative to extensions/models/
-//   vaults:          relative to extensions/vaults/
+//   models/vaults/workflows/reports: relative to the manifest's directory
+//                    when paths.base is "manifest" (this repo), else extensions/<kind>/
 //   additionalFiles: relative to the manifest's own directory
 //   README.md, LICENSE beside the manifest are always included if present.
 
@@ -53,13 +53,22 @@ function strings(v: unknown): string[] {
   });
 }
 
+// paths.base: "manifest" resolves typed keys against the manifest's own
+// directory (the per-extension layout this repo uses); the default
+// "typedDir" resolves them against extensions/<kind>/.
+const base = ((manifest.paths as Record<string, unknown> | undefined)?.base ??
+  "typedDir") as string;
+const typed = (kind: string, rel: string) =>
+  normalize(
+    base === "manifest"
+      ? join(manifestDir, rel)
+      : join("extensions", kind, rel),
+  );
 const files = new Set<string>([normalize(manifestPath)]);
-for (const m of strings(manifest.models)) {
-  files.add(normalize(join("extensions/models", m)));
-}
-for (const v of strings(manifest.vaults)) {
-  files.add(normalize(join("extensions/vaults", v)));
-}
+for (const m of strings(manifest.models)) files.add(typed("models", m));
+for (const v of strings(manifest.vaults)) files.add(typed("vaults", v));
+for (const w of strings(manifest.workflows)) files.add(typed("workflows", w));
+for (const r of strings(manifest.reports)) files.add(typed("reports", r));
 for (const a of strings(manifest.additionalFiles)) {
   files.add(normalize(join(manifestDir, a)));
 }

@@ -5,7 +5,7 @@
 # Usage:
 #   scripts/publish.sh <name> [--review-only] [--skip-review] [--channel beta|rc]
 #
-#   <name>          directory under extensions/manifests/
+#   <name>          extension directory at the repo root (holds manifest.yaml)
 #   --review-only   run gates 1–6 (through the security review) and stop
 #   --skip-review   reuse an existing PASS verdict for the current hash; do
 #                   not call the model. Fails if none exists.
@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-manifest="extensions/manifests/$name/manifest.yaml"
+manifest="$name/manifest.yaml"
 [ -f "$manifest" ] || { echo "no manifest at $manifest" >&2; exit 2; }
 model="${REVIEW_MODEL:-claude-fable-5}"
 
@@ -58,9 +58,9 @@ step "1/8 swamp extension fmt --check"
 swamp extension fmt "$manifest" --check
 
 step "2/8 deno fmt + tests"
-deno fmt --check extensions/ scripts/
-if ls extensions/models/*_test.ts extensions/vaults/*/*_test.ts >/dev/null 2>&1; then
-  deno test --allow-read --allow-env --allow-net extensions/
+deno fmt --check "$name/" scripts/
+if ls "$name"/*_test.ts >/dev/null 2>&1; then
+  deno test --allow-read --allow-env --allow-net "$name/"
 else
   echo "WARNING: no tests found — testing-completeness will be flagged" >&2
 fi

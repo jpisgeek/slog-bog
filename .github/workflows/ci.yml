@@ -30,18 +30,25 @@ jobs:
 
       - name: identifier scan (generic rules; the private denylist runs locally only)
         # review/ is excluded on purpose: the prompt names the patterns it hunts.
-        run: scripts/scan-identifiers.sh extensions/ templates/ README.md CONTRIBUTING.md SECURITY.md
+        run: |
+          dirs=$(for d in */; do [ -f "$d/manifest.yaml" ] && printf '%s ' "$d"; done)
+          scripts/scan-identifiers.sh $dirs templates/ README.md CONTRIBUTING.md SECURITY.md
 
       - name: deno fmt
-        run: deno fmt --check extensions/ scripts/
+        run: |
+          dirs=$(for d in */; do [ -f "$d/manifest.yaml" ] && printf '%s ' "$d"; done)
+          deno fmt --check $dirs scripts/
 
       - name: deno tests
         run: |
-          if ls extensions/**/*_test.ts extensions/*/*_test.ts >/dev/null 2>&1; then
-            deno test --allow-read --allow-env --allow-net extensions/
+          if ls */*_test.ts >/dev/null 2>&1; then
+            deno test --allow-read --allow-env --allow-net $(ls -d */*_test.ts | xargs -n1 dirname | sort -u)
           else
             echo "no tests yet"
           fi
+
+      - name: READMEs are generated and current (zod schemas read from source — no swamp needed)
+        run: deno run --allow-read --allow-write --allow-run --allow-env scripts/gen-readme.ts --check
 
       - name: review verdicts match content hashes
         run: scripts/check-review-verdicts.sh

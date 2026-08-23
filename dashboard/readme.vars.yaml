@@ -1,0 +1,46 @@
+package: "@jpisgeek/dashboard"
+types:
+  - "@jpisgeek/dashboard"
+purpose: >-
+  Renders one self-contained, exceptions-first HTML status page from resources
+  other collector models have already written. Collects nothing, reaches no
+  network; if a source has never run, the page says so instead of inventing a
+  value. Each exception is also written back as a resource so alerting can be
+  built on the same evaluation.
+example: |
+  globalArguments:
+    title: Homelab
+    sources:
+      - name: telemetry
+        type: '@jpisgeek/netdata'
+        id: <id from `swamp model get <your-netdata-model> --json`>
+      - name: nas
+        type: '@jpisgeek/truenas'
+        id: <id from `swamp model get <your-truenas-model> --json`>
+      - name: firewalla
+        type: '@jpisgeek/firewalla'
+        id: <id from `swamp model get <your-firewalla-model> --json`>
+      - name: homelab
+        type: '@swamp/ssh'
+        id: <id from `swamp model get <your-ssh-fleet-model> --json`>
+    outputPath: ./dashboard/index.html
+    diskWarnPercent: 85
+    certWarnDays: 30
+    suppress:
+      - id: unreachable:printer
+        reason: powered off outside business hours, expected
+caveats: >-
+  The exception rules key off the literal source aliases `telemetry`, `nas`,
+  `homelab`, `firewalla` (paired with `@jpisgeek/netdata`, `@jpisgeek/truenas`,
+  `@swamp/ssh`, `@jpisgeek/firewalla`). A misspelled alias does not error —
+  that source's exceptions just never evaluate — which is why the
+  `known-source-aliases` check fails a run missing one of the four (skippable
+  with `--skip-check`). This is the opinionated member of the family: a
+  reference dashboard for that specific collector set, not a generic renderer.
+  Delivery is out of scope — it writes a file; ship it with `@swamp/ssh copy`
+  or similar.
+security: >-
+  No network, no credentials. Every interpolated value is HTML-escaped. The
+  rendered page lists machine names, addresses, mounts, and certificate names
+  from your collectors — if you publish it to a web server, put it behind
+  authentication or on a trusted network.

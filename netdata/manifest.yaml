@@ -1,0 +1,27 @@
+manifestVersion: 1
+name: "@jpisgeek/netdata"
+version: 2026.08.23.1
+description: >
+  Netdata standalone agent state across a set of nodes. Deliberately not a metrics collector: Netdata already stores high-resolution telemetry and runs its own health engine, so this records state truth instead. Which nodes answer, what they are, which alarms are firing, and filesystem capacity.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/netdata
+paths:
+  base: manifest
+models:
+  - netdata.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - netdata
+  - monitoring
+  - observability
+  - alarms
+dependencies: []

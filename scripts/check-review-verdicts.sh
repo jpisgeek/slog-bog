@@ -9,7 +9,7 @@
 # is filed under the new hash.
 #
 # Usage: scripts/check-review-verdicts.sh [manifest.yaml ...]
-#        (no args = every extensions/manifests/*/manifest.yaml)
+#        (no args = every <dir>/manifest.yaml at the repo root)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
@@ -22,7 +22,7 @@ fi
 
 manifests=("$@")
 if [ ${#manifests[@]} -eq 0 ]; then
-  while IFS= read -r m; do manifests+=("$m"); done < <(ls extensions/manifests/*/manifest.yaml 2>/dev/null || true)
+  while IFS= read -r m; do manifests+=("$m"); done < <(ls */manifest.yaml 2>/dev/null || true)
 fi
 if [ ${#manifests[@]} -eq 0 ]; then
   echo "check-review-verdicts: no manifests yet"; exit 0

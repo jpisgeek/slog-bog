@@ -105,8 +105,9 @@ rule_regex=(
   '(^|[^0-9.])(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|169\.254\.[0-9]{1,3}\.[0-9]{1,3}|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3})([^0-9.]|$)|(^|[^0-9a-fA-F:])(f[cd][0-9a-fA-F]{2}:|fe80:)'
   # host-local
   '(^|[^A-Za-z0-9.-])localhost([^A-Za-z0-9-]|$)|[A-Za-z0-9-]+\.(local|lan|internal|home\.arpa)([^A-Za-z0-9.-]|$)'
-  # path-local
-  '(^|[^A-Za-z0-9])(/Users/|/home/[A-Za-z]|/Volumes/|/private/(tmp|var|etc)|[A-Za-z]:\\Users\\)|file://'
+  # path-local (/home/linuxbrew/, the public Linuxbrew prefix, is filtered
+  # out after the match — BSD grep has no lookahead)
+  '(^|[^A-Za-z0-9])(/Users/[A-Za-z0-9._-]*|/home/[A-Za-z][A-Za-z0-9._-]*|/Volumes/|/private/(tmp|var|etc)|[A-Za-z]:\\Users\\)|file://'
   # secret-shape
   '(AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|Bearer [A-Za-z0-9._~+/=-]{24,}|(password|passwd|secret|api[_-]?key|token)[[:space:]]*[=:][[:space:]]*["'"'"'][^"'"'"']{8,}["'"'"'])'
   # mac-address
@@ -118,19 +119,29 @@ rule_regex=(
   '[a-z][a-z0-9+.-]*://[^/@[:space:]]+:[^/@[:space:]]+@'
 )
 
+# Per-rule post-filters for documented placeholders (no lookaheads: BSD grep).
+# Each must stay narrow enough that a real value never hides behind it. A
+# function rather than an inline case: bash 3.2 mis-parses `pattern)` inside
+# a process substitution.
+post_filter() {
+  case "$1" in
+    email) grep -a -v -E -i '@([a-z0-9-]+\.)*example\.[a-z]+$|@localhost$' || true ;;
+    path-local) grep -a -v -E '/home/linuxbrew($|[^A-Za-z0-9._-])' || true ;;
+    userinfo-url) grep -a -v -E '://user:pass@$' || true ;;
+    # bare loopback is a documentation idiom (e.g. an agent reached over SSH);
+    # it identifies nothing. Any other 127.x address still fires.
+    ip-private) grep -a -v -E '(^|[^0-9.])127\.0\.0\.1([^0-9.]|$)' || true ;;
+    *) cat ;;
+  esac
+}
+
 for i in "${!rule_names[@]}"; do
   name="${rule_names[$i]}"; re="${rule_regex[$i]}"
   for f in "${files[@]}"; do
     while IFS= read -r line; do
       [ -n "$line" ] && report "$name" "$f:$line"
     done < <(
-      grep -a -n -E -o -- "$re" "$f" 2>/dev/null | {
-        if [ "$name" = "email" ]; then
-          grep -a -v -E -i '@([a-z0-9-]+\.)*example\.[a-z]+$|@localhost$' || true
-        else
-          cat
-        fi
-      } | head -50 || true
+      grep -a -n -E -o -- "$re" "$f" 2>/dev/null | post_filter "$name" | head -50 || true
     )
   done
 done

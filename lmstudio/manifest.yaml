@@ -1,0 +1,35 @@
+manifestVersion: 1
+name: "@jpisgeek/lmstudio"
+version: 2026.08.22.2
+description: >
+  Probe and validate an OpenAI-compatible inference endpoint before you trust it.
+  Records the MEASURED embedding dimension rather than assuming it from a model
+  name, distinguishes an endpoint that is down from one that rejects your token,
+  and separates a model that exhausted its context from one that hit max_tokens.
+  Also detects reasoning models, which can spend an entire completion budget on
+  reasoning and return empty content -- a failure that otherwise looks like the
+  model ignoring its instructions.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/lmstudio
+paths:
+  base: manifest
+models:
+  - lmstudio_endpoint.ts
+  - lmstudio_probe.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - inference
+  - llm
+  - openai-compatible
+  - embeddings
+  - diagnostics
+dependencies: []

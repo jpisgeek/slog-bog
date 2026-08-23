@@ -83,7 +83,13 @@ Every example, default, and placeholder must be obviously fake
   resource that reads as "0 alarms" / "0 issues" / "healthy".
 
 ### 5. Supply chain
-- Every `npm:` / `jsr:` / `https:` import is pinned to an exact version.
+- Every `npm:` / `jsr:` / `https:` import is pinned to an exact version —
+  **with one platform exception: `zod`**. The swamp bundler excludes `zod`
+  from the extension bundle and the swamp runtime provides it, so the
+  sanctioned specifier is the bare major (`npm:zod@4`), which resolves against
+  the runtime's copy; pinning `zod` to an exact patch is *wrong* here (it can
+  diverge from what the runtime supplies). Treat `npm:zod@<major>` as correct,
+  not a finding. Every OTHER npm/jsr/https import must still be pinned exactly.
 - No dependency outside the declared allowlist; no dynamic `import()` of
   remote code; nothing fetched and executed at load time.
 - No `eval`, `new Function`, or deserialisation of untrusted data into code.

@@ -1,0 +1,27 @@
+manifestVersion: 1
+name: "@jpisgeek/firewalla"
+version: 2026.08.22.2
+description: >
+  Device and machine inventory from the Firewalla MSP API. The firewall is the authoritative view of a network because it knows every device ever seen, including ones currently offline, which no amount of scanning reveals. Emits one resource per device plus an inventory roll-up. The MSP token is supplied at runtime via vault.get().
+repository: https://github.com/jpisgeek/slog-bog/tree/main/firewalla
+paths:
+  base: manifest
+models:
+  - firewalla.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - firewalla
+  - network
+  - inventory
+  - security
+dependencies: []

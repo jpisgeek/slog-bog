@@ -5,3 +5,5 @@ const ip = "203.0.113.10"; // TEST-NET-3
 const mail = "ops@example.com";
 const key = "YOUR_API_KEY";
 const ver = "2026.08.22.1";
+const brew = "/home/linuxbrew/.linuxbrew/bin/tool"; // public prefix, allowed
+const doc = "rejected form: http://user:pass@host:port"; // documentation placeholder, allowed
