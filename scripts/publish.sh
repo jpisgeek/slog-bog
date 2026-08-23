@@ -51,6 +51,10 @@ done
 manifest="$name/manifest.yaml"
 [ -f "$manifest" ] || { echo "no manifest at $manifest" >&2; exit 2; }
 model="${REVIEW_MODEL:-claude-fable-5}"
+# Read once, up front: the publish summary (gate 8) needs these even when the
+# review branch is skipped because a PASS verdict is already on file.
+version="$(grep -m1 -E '^version:' "$manifest" | sed 's/version:[[:space:]]*//' | tr -d '"'"'"'')"
+pkg="$(grep -m1 -E '^name:' "$manifest" | sed -E 's/^name:[[:space:]]*//' | tr -d '"'"'"'')"
 
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
@@ -90,7 +94,6 @@ elif [ "$skip_review" -eq 1 ]; then
   echo "--skip-review given but no verdict exists for ${hash:0:12}…" >&2; exit 1
 else
   command -v claude >/dev/null || { echo "claude CLI not found" >&2; exit 1; }
-  version="$(grep -m1 -E '^version:' "$manifest" | sed 's/version:[[:space:]]*//' | tr -d '"'"'"'')"
   {
     cat review/secrets-security-pass.md
     printf '\n\n# INPUT\nextension: %s\nversion: %s\ncontent-hash: %s\ndate: %s\n\n' \
@@ -141,7 +144,6 @@ read -r -p "Type JP-GO to push, anything else to abort: " answer
 push=(swamp extension push "$manifest" --yes)
 [ -n "$channel" ] && push+=(--channel "$channel")
 "${push[@]}"
-pkg="$(grep -m1 -E '^name:' "$manifest" | sed -E 's/^name:[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//')"
 echo
 echo "Published $pkg. Next: install-verify from a clean clone, then flip public:"
 echo "  swamp extension install $pkg   # into a scratch dir; confirm it resolves"
