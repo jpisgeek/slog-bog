@@ -101,6 +101,47 @@ export const GlobalArgsSchema = z.object({
     ),
 });
 
+export type Drift =
+  | "notinstalled"
+  | "notactive"
+  | "notineffect"
+  | "outdated"
+  | "expected"
+  | "unmeasured";
+
+export type ToolEntry = { installed: boolean; active: boolean };
+
+/**
+ * Does `resolved` satisfy the `expect` value? Compared segment by segment, so
+ * "22" accepts 22.23.2 while "22.2" does not. A plain string prefix would
+ * quietly accept 22.23.2 for an operator who asked for the 22.2 line, which is
+ * the sort of near-miss nobody notices until a build breaks.
+ */
+export function satisfiesExpect(expected: string, resolved: string): boolean {
+  const want = expected.split(".");
+  const got = resolved.split(".");
+  if (want.length > got.length) return false;
+  return want.every((seg, i) => seg === got[i]);
+}
+
+/**
+ * Drift for a single tool the current config asked for. Install state is
+ * mutually exclusive (a tool cannot be both missing and merely inactive), so
+ * those two are an either/or. Outdated and expect are independent judgements
+ * layered on top.
+ */
+export function classifyTool(
+  entry: ToolEntry,
+  opts: { outdated: boolean; expectFail: boolean },
+): Drift[] {
+  const drift: Drift[] = [];
+  if (!entry.installed) drift.push("notinstalled");
+  else if (!entry.active) drift.push("notactive");
+  if (opts.outdated) drift.push("outdated");
+  if (opts.expectFail) drift.push("expected");
+  return drift;
+}
+
 export const model = {
   type: "@jpisgeek/mise",
   version: "2026.08.24.1",

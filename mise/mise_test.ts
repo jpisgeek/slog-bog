@@ -14,7 +14,7 @@
  * Requires --allow-run --allow-write --allow-read (fake binary in a temp dir).
  */
 import { assertEquals } from "jsr:@std/assert@1";
-import { GlobalArgsSchema } from "./mise.ts";
+import { classifyTool, GlobalArgsSchema, satisfiesExpect } from "./mise.ts";
 
 const okNode = { name: "studio" };
 
@@ -69,4 +69,48 @@ Deno.test("duplicate node names are rejected", () => {
     nodes: [{ name: "studio" }, { name: "studio" }],
   });
   assertEquals(r.success, false, "two nodes cannot share a name");
+});
+
+Deno.test("expect matches on whole version segments, never string prefix", () => {
+  assertEquals(satisfiesExpect("22", "22.23.2"), true);
+  assertEquals(satisfiesExpect("22.23", "22.23.2"), true);
+  assertEquals(satisfiesExpect("22.23.2", "22.23.2"), true);
+  // the whole reason this is segment-wise: "22.2" is a string prefix of
+  // "22.23.2" but a different minor line entirely.
+  assertEquals(satisfiesExpect("22.2", "22.23.2"), false);
+  assertEquals(satisfiesExpect("22", "2.22.0"), false);
+  // asking for more precision than the host reports is not a match
+  assertEquals(satisfiesExpect("22.23.2", "22.23"), false);
+});
+
+Deno.test("a configured tool the host never installed is notinstalled", () => {
+  const d = classifyTool({ installed: false, active: false }, {
+    outdated: false,
+    expectFail: false,
+  });
+  assertEquals(d, ["notinstalled"]);
+});
+
+Deno.test("installed but not active is its own class, not notinstalled", () => {
+  const d = classifyTool({ installed: true, active: false }, {
+    outdated: false,
+    expectFail: false,
+  });
+  assertEquals(d, ["notactive"]);
+});
+
+Deno.test("a healthy tool carries no drift", () => {
+  const d = classifyTool({ installed: true, active: true }, {
+    outdated: false,
+    expectFail: false,
+  });
+  assertEquals(d, []);
+});
+
+Deno.test("outdated and expect failures stack onto the install state", () => {
+  const d = classifyTool({ installed: true, active: true }, {
+    outdated: true,
+    expectFail: true,
+  });
+  assertEquals(d, ["outdated", "expected"]);
 });
