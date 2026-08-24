@@ -1,5 +1,5 @@
 /**
- * TrueNAS SCALE inventory and health, over the REST API v2.0.
+ * TrueNAS SCALE inventory and health, over JSON-RPC 2.0 on a WebSocket.
  *
  * Built in-house rather than pulling a community extension: this model holds a
  * TrueNAS API key at runtime, and the decision was to keep that inside code we

@@ -121,7 +121,9 @@ tells the user so. Flag any write that could include a secret.
 extension: <name>            version: <manifest version>
 content-hash: <sha256 given in the input>
 reviewer: claude-fable-5      date: <YYYY-MM-DD>
-verdict: PASS | FAIL | FAIL (incomplete input)
+verdict: PASS | FAIL | FAIL (incomplete input)   <- this exact line, plain
+                                                    text: no bold, no extra
+                                                    words, never omitted
 
 ## Findings
 | # | severity | file:line | what | evidence | fix |
