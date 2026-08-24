@@ -9,8 +9,9 @@
  * hand-maintained host list.
  *
  * Devices are split into two tiers:
- *   deep     — infrastructure worth logging into and checking properly
- *   presence — everything else; the firewall's online/offline signal is enough
+ *   deep     = infrastructure worth logging into and checking properly
+ *   presence = everything else. The firewall's online/offline signal covers
+ *              the shallow end of the swamp.
  *
  * The token is expected to arrive from Proton Pass:
  *   token: ${{ vault.get('myvault', 'ExampleVault/API Key') }}
@@ -34,13 +35,13 @@ const GlobalArgsSchema = z.object({
     .refine(
       (v) => mspHost(v) !== null,
       "must be a bare *.firewalla.net MSP hostname (scheme optional; no " +
-        "path, query, fragment, port, or userinfo) — this is where the API " +
+        "path, query, fragment, port, or userinfo). This is where the API " +
         "token is sent, and a typo'd or malicious host would otherwise " +
         "receive it",
     )
     .describe(
       "MSP domain, e.g. example-msp.firewalla.net (scheme optional). " +
-        "Must resolve under firewalla.net — the token is sent here.",
+        "Must resolve under firewalla.net. The token is sent here.",
     ),
   token: z
     .string()
@@ -62,7 +63,7 @@ const GlobalArgsSchema = z.object({
     .default(["eth", "lan", "en0"])
     .describe(
       "Interface suffixes considered wired. A wired address wins the " +
-        "primaryIp race — it is the more reliable path to monitor over.",
+        "primaryIp race. It is the more reliable path to monitor over.",
     ),
   interfaceSuffixes: z
     .array(z.string())
@@ -85,7 +86,7 @@ const GlobalArgsSchema = z.object({
     .default([])
     .describe(
       "Firewalla networks that are off limits entirely. Devices on these " +
-        "are skipped before anything is written — not collected, not " +
+        "are skipped before anything is written. Not collected, not " +
         "counted, not stored. Use for VLANs outside the scope of this " +
         "automation (a work network, a guest network you do not own).",
     ),
@@ -129,7 +130,7 @@ const DeviceSchema = z.object({
   name: z.string(),
   /**
    * Omitted, not "", when the firewall reports no current address. An empty
-   * string would be indistinguishable from a genuinely blank value; a
+   * string would be indistinguishable from a genuinely blank value. A
    * missing key mechanically means "unknown" to anything reading it.
    */
   ip: z.string().optional(),
@@ -143,17 +144,17 @@ const DeviceSchema = z.object({
   isFirewalla: z.boolean(),
   totalDownload: z.number(),
   totalUpload: z.number(),
-  /** "deep" or "presence" — which monitoring tier this device falls into. */
+  /** "deep" or "presence", the monitoring tier this device falls into. */
   tier: z.string(),
   /** True when the device can plausibly be reached over SSH by the fleet. */
   sshCandidate: z.boolean(),
-  /** True when `exclude` name-matched this device — reported, not silent. */
+  /** True when `exclude` name-matched this device. Reported, not silent. */
   excluded: z.boolean(),
 });
 
 /**
  * A physical/logical machine, collapsed from one or more Firewalla devices.
- * A multi-homed Mac shows up as several devices (one per NIC); it is one
+ * A multi-homed Mac shows up as several devices (one per NIC). It is one
  * machine, and must be checked once.
  */
 const MachineSchema = z.object({
@@ -201,9 +202,9 @@ const InventorySchema = z.object({
  *
  * This is parsed with the URL parser and checked on `hostname`, never on the
  * raw string: a suffix regex over the string accepted values like
- * `evil.example/#.firewalla.net` — which *ends with* ".firewalla.net" but
+ * `evil.example/#.firewalla.net`, which *ends with* ".firewalla.net" but
  * sends the request (and the token) to evil.example. Path, query, fragment,
- * port and userinfo are all rejected; the only legitimate shape is the host.
+ * port and userinfo are all rejected. The only legitimate shape is the host.
  */
 function mspHost(raw: string): string | null {
   const trimmed = raw.trim().replace(/\/+$/, "");
@@ -308,7 +309,7 @@ function unwrapDevices(payload: unknown): Record<string, unknown>[] {
     }
   }
   throw new Error(
-    "Unexpected /v2/devices response shape — expected an array or an " +
+    "Unexpected /v2/devices response shape. Expected an array or an " +
       "envelope containing one.",
   );
 }
@@ -326,8 +327,8 @@ function networkName(value: unknown): string {
  * Fetch with a small bounded retry for the two transient MSP failure modes
  * (429 rate limit, 503 unavailable), honoring `Retry-After` when the server
  * sends one and falling back to exponential backoff otherwise. Every other
- * status — including 401/403 — is returned as-is for the caller to
- * classify; this only ever retries a *transient* failure, never interprets
+ * status (including 401/403) is returned as-is for the caller to
+ * classify. This only ever retries a *transient* failure, never interprets
  * a permanent one. Network errors and timeouts are wrapped with the URL so
  * they don't escape as a bare, context-free fetch exception.
  */
@@ -417,7 +418,7 @@ async function syncDevices(
   ctx: any,
 ) {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
-  // Already validated by the schema refine; the non-null assertion is safe.
+  // Already validated by the schema refine, so the non-null assertion is safe.
   const domain = mspHost(g.mspDomain)!;
   const url = `https://${domain}/v2/devices`;
   /** Strip the MSP token from any text before it can reach an error message. */
@@ -447,7 +448,7 @@ async function syncDevices(
       );
     }
     // Redaction point: a misconfigured proxy's error page could echo request
-    // headers; scrub the token before the body reaches an error message.
+    // headers. Scrub the token before the body reaches an error message.
     const detail = await response.text().then((t) => redact(t).slice(0, 200))
       .catch(() => "");
     throw new Error(
@@ -519,7 +520,7 @@ async function syncDevices(
   for (const raw of devices) {
     // The documented /v2/devices response identifies every device by `id`
     // (shown as a MAC address) and its example has no separate `mac` field
-    // at all — `id` doubling as the MAC is the norm, not an edge case. A
+    // at all. `id` doubling as the MAC is the norm, not an edge case. A
     // record with neither is too malformed to name or deduplicate safely,
     // so it's skipped and logged rather than silently coerced into an
     // empty-string identity that would collide with every other such record.
@@ -559,7 +560,7 @@ async function syncDevices(
       gid: raw.gid === undefined ? undefined : String(raw.gid),
       name: String(raw.name ?? "(unnamed)"),
       ip: rawIp,
-      // `mac` falls back to `id` per the documented response shape above —
+      // `mac` falls back to `id` per the documented response shape above,
       // not to "", which would silently misrepresent a present-but-elided
       // field as a genuinely absent one.
       mac: raw.mac == null ? rawId : String(raw.mac),
@@ -591,11 +592,11 @@ async function syncDevices(
     if (device.ipReserved) reserved++;
 
     // Collapse NICs onto one machine. Prefer a wired, online, reserved
-    // address as the primary — that is the one worth SSH-ing.
+    // address as the primary. That is the one worth SSH-ing.
     //
     // Only merge when a suffix was actually stripped from at least one side.
     // Two genuinely different devices can share a name (a pair of identical
-    // air purifiers, say); those are separate machines and must not be folded
+    // air purifiers, say). Those are separate machines and must not be folded
     // together just because the strings match.
     const stripped = machineKey(device.name, g.interfaceSuffixes);
     const hadSuffix = stripped !== device.name;
@@ -669,8 +670,8 @@ async function syncDevices(
 
   const deviceCount = handles.length;
 
-  // One resource per machine. This is what the SSH fleet is generated from —
-  // never the raw device list, which double-counts multi-homed hosts.
+  // One resource per machine. This is what the SSH fleet is generated from.
+  // Never the raw device list, which double-counts multi-homed hosts.
   let sshCandidates = 0;
   for (const m of machines.values()) {
     if (m.sshCandidate) sshCandidates++;
@@ -723,11 +724,11 @@ async function syncDevices(
     }, { tags: { total: String(counted), deep: String(deep) } }),
   );
 
-  // Prune devices the firewall no longer reports. Only safe on a full sync —
-  // a filtered sync legitimately sees a subset and must not delete the rest.
+  // Prune devices the firewall no longer reports. Only safe on a full sync.
+  // A filtered sync legitimately sees a subset and must not delete the rest.
   // `findAllForModel` is the only way to enumerate this model instance's own
   // prior resources (`readResource` takes a single instance name, not a
-  // listing); the actual delete then goes through `deleteResource`, the
+  // listing). The actual delete then goes through `deleteResource`, the
   // documented API for removing a named resource, rather than reaching for
   // `dataRepository.delete` a second time.
   if (args.tier === "all" && !args.network) {
@@ -762,7 +763,7 @@ async function syncDevices(
     }
   } else {
     ctx.logger.info(
-      "filtered sync — skipping prune so unmatched devices are preserved",
+      "filtered sync: skipping prune so unmatched devices are preserved",
     );
   }
 
@@ -805,7 +806,7 @@ export const model = {
       description:
         "A full sync (no tier or network filter) deletes any stored " +
         "device or machine record the firewall no longer reports. This " +
-        "check always passes — its purpose is to make that destructive " +
+        "check always passes. Its purpose is to make that destructive " +
         "deletion policy visible before the method runs and give it a " +
         "name that can be skipped (--skip-check) when investigating " +
         "suspected data loss, not to gate on the specific args of a " +

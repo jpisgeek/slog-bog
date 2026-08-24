@@ -3,7 +3,8 @@ types:
   - "@jpisgeek/firewalla"
 purpose: >-
   Device and machine inventory from the Firewalla MSP API. The firewall is the
-  authoritative view of a network — it knows every device it has ever seen,
+  authoritative view of a network. It sits at the mouth of the swamp and
+  knows every device it has ever seen,
   including ones offline right now. One `device` resource per device, one
   `machine` per deduplicated host (NICs collapsed), one `inventory` roll-up.
 example: |
@@ -28,10 +29,10 @@ caveats: >-
   SSH fleet.
 security: >-
   `mspDomain` is parsed as a URL and must be a bare `*.firewalla.net`
-  hostname — no path, query, fragment, port, or userinfo — because that is
-  where the token is sent; the request always goes to `https://<hostname>`.
+  hostname (no path, query, fragment, port, or userinfo) because that is
+  where the token is sent. The request always goes to `https://<hostname>`.
   The token is marked sensitive, sent in the `Token` header, and redacted from
   any error body before it can reach a message. 429/503 retries honour
   `Retry-After` capped at 5 s and are cancellable. Written data is a personal
-  inventory of your network — device names, MAC addresses, IPs, vendors,
+  inventory of your network: device names, MAC addresses, IPs, vendors,
   networks, online state, traffic totals. Treat the datastore accordingly.

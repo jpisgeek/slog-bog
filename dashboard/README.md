@@ -81,19 +81,19 @@ globalArguments:
 
 The exception rules key off the literal source aliases `telemetry`, `nas`,
 `homelab`, `firewalla` (paired with `@jpisgeek/netdata`, `@jpisgeek/truenas`,
-`@swamp/ssh`, `@jpisgeek/firewalla`). A misspelled alias does not error — that
-source's exceptions just never evaluate — which is why the
-`known-source-aliases` check fails a run missing one of the four (skippable with
-`--skip-check`). This is the opinionated member of the family: a reference
-dashboard for that specific collector set, not a generic renderer. Delivery is
-out of scope — it writes a file; ship it with `@swamp/ssh copy` or similar.
+`@swamp/ssh`, `@jpisgeek/firewalla`). A misspelled alias does not error. That
+source's exceptions just never evaluate, which is why the `known-source-aliases`
+check fails a run missing one of the four (skippable with `--skip-check`). This
+is the opinionated member of the family: a reference dashboard for that specific
+collector set, not a generic renderer. Delivery is out of scope. It writes a
+file, ship it with `@swamp/ssh copy` or similar.
 
 ## Security
 
 No network, no credentials. Every interpolated value is HTML-escaped. The
 rendered page lists machine names, addresses, mounts, and certificate names from
-your collectors — if you publish it to a web server, put it behind
-authentication or on a trusted network.
+your collectors. If you publish it to a web server, put it behind authentication
+or on a trusted network.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

@@ -6,10 +6,10 @@
  * into this repository, or onto disk. `${{ vault.get('myvault', 'KEY') }}`
  * resolves live at run time.
  *
- * Secret key forms accepted by `get()` (placeholders — not real item names):
+ * Secret key forms accepted by `get()` (placeholders, not real item names):
  *   "Example Service/API Key"          -> item titled so, field = defaultField
  *   "Example Service/API Key/password" -> explicit field on that item
- *   "pass://SHARE_ID/ITEM_ID/FIELD"    -> stable URI; survives item renames
+ *   "pass://SHARE_ID/ITEM_ID/FIELD"    -> stable URI, survives item renames
  *
  * Prefer the URI form for anything long-lived: titles can be edited in the
  * Proton Pass UI, item IDs cannot.
@@ -220,7 +220,7 @@ export const vault = {
   name: "Proton Pass",
   description:
     "Reads secrets from Proton Pass via the official pass-cli. Secrets are " +
-    "never copied into swamp storage — every get() is a live lookup.",
+    "never copied into swamp storage. Every get() is a live lookup.",
   configSchema: ConfigSchema,
   createProvider: (name: string, config: Record<string, unknown>) => {
     const cfg = ConfigSchema.parse(config);
@@ -271,8 +271,8 @@ export const vault = {
        * Creates a NEW login item each call (pass-cli has no update-in-place
        * here), so repeated puts of the same key produce duplicates. The value
        * is passed as an argument to pass-cli, which is visible in the process
-       * list to other local users for the duration of the call -- do not use
-       * `put` on a shared multi-user host; prefer creating items in the
+       * list to other local users for the duration of the call. Do not use
+       * `put` on a shared multi-user host. Prefer creating items in the
        * Proton Pass UI and reading them with `get`.
        */
       put: async (secretKey: string, secretValue: string): Promise<void> => {

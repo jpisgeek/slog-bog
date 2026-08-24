@@ -12,10 +12,10 @@ One directory per extension at the repo root, self-contained
 ```
 <name>/manifest.yaml        publish manifest; repository: points at this directory
 <name>/<name>.ts            source (a vault: <name>.ts exporting `vault`)
-<name>/<name>_test.ts       tests beside the source (a *_test.ts file is correct —
+<name>/<name>_test.ts       tests beside the source (a *_test.ts file is correct,
                             the loader skips it as a model, which is what you want)
 <name>/readme.vars.yaml     the ONLY hand-written README input
-<name>/README.md            GENERATED — do not edit
+<name>/README.md            GENERATED, do not edit
 <name>/LICENSE              MIT
 ```
 
@@ -23,8 +23,8 @@ One directory per extension at the repo root, self-contained
 
 Do not write or edit any `<name>/README.md`, nor the extensions table in the root README. Edit
 `readme.vars.yaml` (purpose line, a placeholder example config, caveats) and
-run `scripts/gen-readme.ts`. Everything else in the README — type names,
-methods, argument and resource schemas, version — comes from the code via
+run `scripts/gen-readme.ts`. Everything else in the README (type names,
+methods, argument and resource schemas, version) comes from the code via
 `swamp model type describe`. CI fails if a committed README differs from the
 generated one. This is the rule because hand-written READMEs drifted from the
 code on every fix and a README is published surface.
@@ -40,12 +40,12 @@ scripts/gen-readme.ts --check
 scripts/scan-identifiers.sh <name>/
 ```
 
-No real hostnames, IPs, domains, vault item paths, account IDs, or local paths —
+No real hostnames, IPs, domains, vault item paths, account IDs, or local paths.
 not in code, comments, tests, or README examples. Use `<your-host>`,
 `example.com`, `YOUR_API_KEY`, `203.0.113.0/24`, `2001:db8::/32`.
 
 Pin every `npm:` import to an exact version. No new dependencies without
-discussion — the registry bundles them, and each one is a supply-chain surface.
+discussion. The registry bundles them, and each one is a supply-chain surface.
 
 ## Publishing
 

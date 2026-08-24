@@ -6,15 +6,15 @@
  * network. This extension is written for the public swamp registry, so
  * `baseUrl` is required config with no default -- point it at whatever
  * gateway, tunnel, or reverse proxy fronts the real inference host. Do not
- * add a same-machine or private-network default here even for convenience;
- * a registry-published extension with a private default is a footgun for
+ * add a same-machine or private-network default here even for convenience.
+ * A registry-published extension with a private default is a footgun for
  * every consumer who is not on this network, and it fails the publish-time
  * boundary check.
  *
  * `models` and `health` answer two different operator questions and are kept
  * separate on purpose:
- *   models — what is actually loaded right now, and did the token work.
- *   health — is the endpoint even reachable, independent of what it serves.
+ *   models = what is actually loaded right now, and did the token work.
+ *   health = is the endpoint even reachable, independent of what it serves.
  * A host that is up but rejects the token, and a host that is simply down,
  * require different fixes and must not collapse into one "failed" bucket.
  *

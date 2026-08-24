@@ -2,7 +2,7 @@
 
 Public [swamp](https://github.com/swamp-club/swamp) extensions, published to the
 registry as `@jpisgeek/*`. Thin, unopinionated building blocks for workflows
-that run over a homelab or small fleet — the opinions (thresholds, node lists,
+that run over a homelab or small fleet. The opinions (thresholds, node lists,
 dashboards) belong in your own models, not here.
 
 <!-- extensions:start -->
@@ -19,7 +19,7 @@ dashboards) belong in your own models, not here.
 <!-- extensions:end -->
 
 Each extension lives in its own directory with its manifest, source, tests,
-LICENSE, and a README generated from the source — that README is the reference
+LICENSE, and a README generated from the source. That README is the reference
 for arguments, methods, and data written.
 
 ## Using one

@@ -2,7 +2,7 @@ package: "@jpisgeek/proton-pass"
 types: []
 purpose: >-
   Proton Pass as a swamp vault provider. `${{ vault.get('<vault>', 'KEY') }}`
-  resolves live through the official `pass-cli` at run time — secrets stay in
+  resolves live through the official `pass-cli` at run time. Secrets stay in
   Proton Pass and are never copied into swamp storage, this repository, or
   disk. For people who keep their lives in the Proton ecosystem and want
   swamp to read credentials from the same place everything else does.
@@ -25,17 +25,17 @@ caveats: >-
   Requires the Proton Pass CLI (`brew install proton-pass-cli`) and a usable
   session (`pass-cli login`, or a personal access token for unattended runs).
   On macOS the CLI's database key lives in the login Keychain, so `get()` works
-  from a GUI login session or a LaunchAgent in that session — not over plain
+  from a GUI login session or a LaunchAgent in that session, not over plain
   ssh, from a LaunchDaemon, or from cron. Item titles can be edited in the
   Proton Pass UI; item IDs cannot, so prefer `pass://` URIs for anything that
   must not break when someone renames an item. `put()` creates a new login
   item each call (no update-in-place) and passes the value as a CLI argument,
   which is visible in the process list to other local users for the duration
-  of the call — prefer creating items in the Proton Pass UI and reading them
+  of the call. Prefer creating items in the Proton Pass UI and reading them
   with `get()`.
 security: >-
   Every `get()` is a live lookup; no value is cached, logged, or persisted.
   pass-cli is invoked with `Deno.Command` (never a shell), so there is no
   argv injection. Error messages carry pass-cli's stderr or its `Error:`
-  lines only — raw stdout (which for `item view` is the whole item, secret
+  lines only. Raw stdout (which for `item view` is the whole item, secret
   included) is never placed in an exception. Written data: none.

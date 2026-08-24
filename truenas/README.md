@@ -4,8 +4,8 @@
 
 Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket
 API: system identity, ZFS pools, physical disks, active alerts, and certificate
-expiry — each its own addressable resource, so a workflow can gate on any one of
-them.
+expiry. Each is its own addressable resource, so a workflow can gate on any one
+of them. The NAS is the deep end of the swamp, and this is the depth gauge.
 
 **Version** `2026.08.23.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/truenas
@@ -45,7 +45,7 @@ No arguments.
 | `system`      | infinite | `hostname`, `version`, `model`, `cores`, `physmemBytes`, `uptimeSeconds`, `loadavg`                                                                                                               | Host identity, version, CPU, memory, uptime, load.                                                                                                                    |
 | `pool`        | infinite | `name`, `status`, `healthy`, `allocatedBytes`, `freeBytes`, `sizeBytes`, `usedPercent`, `fragmentationPercent`                                                                                    | One record per ZFS pool with status, health, capacity, fragmentation.                                                                                                 |
 | `disk`        | infinite | `name`, `serial`, `model`, `sizeBytes`, `type`, `pool`                                                                                                                                            | One record per physical disk and its pool membership.                                                                                                                 |
-| `alert`       | infinite | `id`, `klass`, `level`, `formatted`, `dismissed`, `silenced`                                                                                                                                      | One record per active TrueNAS alert. `silenced` marks alerts that were dismissed in the UI — still true, just no longer visible there.                                |
+| `alert`       | infinite | `id`, `klass`, `level`, `formatted`, `dismissed`, `silenced`                                                                                                                                      | One record per active TrueNAS alert. `silenced` marks alerts that were dismissed in the UI. Still true, just no longer visible there.                                 |
 | `certificate` | infinite | `name`, `commonName`, `notAfter`, `daysRemaining`, `expiryKnown`, `expiringSoon`, `expired`                                                                                                       | One record per certificate with days remaining, tracked independently of TrueNAS alert state so a dismissed expiry warning cannot hide a cert that is about to lapse. |
 | `summary`     | infinite | `hostname`, `version`, `pools`, `poolsUnhealthy`, `disks`, `alerts`, `alertsSilenced`, `certificates`, `certificatesExpiringSoon`, `certificatesExpired`, `certificatesWithoutExpiry`, `syncedAt` | Single roll-up of the most recent discover.                                                                                                                           |
 
@@ -65,20 +65,21 @@ globalArguments:
 ## Caveats
 
 Discovery only: there is no write path to TrueNAS anywhere in this model.
-Certificate expiry is computed independently of TrueNAS's own alert state — a
-`CertificateIsExpiring` alert dismissed in the UI is still reported with
-`silenced: true`. `expiryKnown` must be checked before `daysRemaining` (a CSR
-has no expiry). Verified against SCALE 25.10; `auth.login_with_api_key` is
-scheduled for removal in TrueNAS 27 and the model warns when it connects to a
-host that new. If a scheduled run fails to connect while the same call works
-from a shell on the same Mac, suspect macOS Local Network privacy.
+Certificate expiry is computed independently of TrueNAS's own alert state. A
+`CertificateIsExpiring` alert dismissed in the UI is still reported, with
+`silenced: true`. Dismissing an alert does not renew a certificate, we checked.
+`expiryKnown` must be checked before `daysRemaining` (a CSR has no expiry).
+Verified against SCALE 25.10. `auth.login_with_api_key` is scheduled for removal
+in TrueNAS 27 and the model warns when it connects to a host that new. If a
+scheduled run fails to connect while the same call works from a shell on the
+same Mac, suspect macOS Local Network privacy.
 
 ## Security
 
 The API key is marked sensitive, sent once over the authenticated WebSocket, and
 never logged. `baseUrl` must be `https://` (→ `wss://`) and must not embed
 userinfo. `allowInsecureHttp: true` permits `http://` → `ws://` with the key in
-cleartext — off by default, for trusted loopback/VPN paths only. Written data:
+cleartext. Off by default, for trusted loopback/VPN paths only. Written data:
 hostname, version, pool names and health, disk models and serial numbers, alert
 text, certificate names and CNs.
 

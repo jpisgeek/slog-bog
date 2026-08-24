@@ -4,8 +4,9 @@
 
 State truth across a set of standalone Netdata agents: which nodes answer, what
 they are, which alarms are firing, and how much filesystem headroom is left.
-Deliberately not a metrics collector — Netdata already stores the telemetry and
-runs the health engine; this records the verdicts so a workflow can act on them.
+Deliberately not a metrics collector. Netdata already stores the telemetry and
+runs the health engine. This model just wades in, records the verdicts, and
+hands them to whatever workflow needs to act on them.
 
 **Version** `2026.08.23.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/netdata
@@ -52,7 +53,7 @@ sub-fetch failed) keeps its last known detail instead of being zeroed or pruned.
 | resource  | lifetime | fields                                                                                                                                                                                                                      | description                                                                                                                                                                                                                                                                                                                                                                                                             |
 | --------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `node`    | infinite | `name`, `url`, `reachable`, `error`, `transport`, `version`, `hostname`, `osName`, `osVersion`, `cores`, `collectors`, `charts`, `alarmsActive`, `alarmsCritical`, `alarmsWarning`, `claimedToCloud`, `mountsOverThreshold` | One record per Netdata node: identity, version, reachability, alarm counts, and whether it streams to Netdata Cloud. An unreachable node is recorded with reachable:false, not skipped. Identity and count fields carry forward the last known values when a poll can't refresh them; consumers should treat `reachable` and the per-node record's freshness (not a zeroed field) as the signal that something changed. |
-| `alarm`   | infinite | `node`, `name`, `chart`, `status`, `value`, `units`, `info`                                                                                                                                                                 | One record per active Netdata alarm. Thresholds are Netdata's own health engine — swamp records the verdict, it does not re-derive it.                                                                                                                                                                                                                                                                                  |
+| `alarm`   | infinite | `node`, `name`, `chart`, `status`, `value`, `units`, `info`                                                                                                                                                                 | One record per active Netdata alarm. Thresholds are Netdata's own health engine. Swamp records the verdict, it does not re-derive it.                                                                                                                                                                                                                                                                                   |
 | `mount`   | infinite | `node`, `mount`, `availGiB`, `usedGiB`, `totalGiB`, `usedPercent`, `overThreshold`                                                                                                                                          | One record per filesystem, discovered from the agent's chart list rather than assumed chart names, since these differ per platform.                                                                                                                                                                                                                                                                                     |
 | `summary` | infinite | `nodes`, `nodesReachable`, `nodesUnreachable`, `nodesDegraded`, `alarmsActive`, `alarmsCritical`, `mountsOverThreshold`, `syncedAt`                                                                                         | Single roll-up of the most recent sweep.                                                                                                                                                                                                                                                                                                                                                                                |
 
@@ -78,28 +79,28 @@ globalArguments:
 
 ## Caveats
 
-An unreachable node is data, not an error: it is written with `reachable: false`
-and the sweep continues. A node that answers only partially (alarms or chart
-data timed out) keeps its last known detail instead of being zeroed. Pruning of
-departed records happens only on a full sweep; a single-node run
-(`--input node=<name>`) never deletes anything. Instance names for alarms and
-mounts carry a hash suffix — look them up with `swamp data list <model>` rather
-than constructing them.
+An unreachable node is data, not an error. It is written with `reachable: false`
+and the sweep continues. Something in the swamp is always powered off. A node
+that answers only partially (alarms or chart data timed out) keeps its last
+known detail instead of being zeroed. Pruning of departed records happens only
+on a full sweep. A single-node run (`--input node=<name>`) never deletes
+anything. Instance names for alarms and mounts carry a hash suffix, so look them
+up with `swamp data list <model>` rather than constructing them.
 
 ## Security
 
-Plain HTTP to the agent API is accepted because the API carries no credential —
-but HTTP is unauthenticated in both directions: an on-path party can not only
-read the hostnames, OS/version, alarm text and mount paths in transit but
-rewrite the responses (e.g. return no alarms so a firing critical reads as
-cleared, or inject text into the stored `error`/`info` fields). Prefer the SSH
-transport, or HTTPS for anything off a trusted LAN. `url` is restricted to
-`http(s)` and rejected if it embeds userinfo; it is persisted verbatim as
-non-sensitive data. The SSH transport uses `BatchMode=yes` (unknown host keys
-fail closed) and never assembles a local shell command. Written data: node URL,
-hostname, OS, Netdata version, alarm names/values, mount paths and capacity,
-plus a free-text `error` field on unreachable nodes (a classified failure
-message; `user@host` and stderr stay in the log, not the resource).
+Plain HTTP to the agent API is accepted because the API carries no credential.
+HTTP is still unauthenticated in both directions: an on-path party can read the
+hostnames, OS/version, alarm text and mount paths in transit, and can rewrite
+the responses too (return no alarms so a firing critical reads as cleared, or
+inject text into the stored `error`/`info` fields). Prefer the SSH transport, or
+HTTPS for anything off a trusted LAN. `url` is restricted to `http(s)` and
+rejected if it embeds userinfo, and it is persisted verbatim as non-sensitive
+data. The SSH transport uses `BatchMode=yes` (unknown host keys fail closed) and
+never assembles a local shell command. Written data: node URL, hostname, OS,
+Netdata version, alarm names/values, mount paths and capacity, plus a free-text
+`error` field on unreachable nodes (a classified failure message, `user@host`
+and stderr stay in the log, not the resource).
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

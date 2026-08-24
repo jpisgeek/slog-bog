@@ -10,7 +10,7 @@ within a week.
 ## What these extensions touch
 
 Every extension here talks to something that holds credentials or describes a
-private environment — a monitoring agent, a NAS, a firewall, a password
+private environment: a monitoring agent, a NAS, a firewall, a password
 manager, a local LLM server. The design rules below exist because of that.
 
 - **Secrets are never published.** No credential, hostname, IP, vault item
@@ -30,9 +30,9 @@ manager, a local LLM server. The design rules below exist because of that.
 Nothing is published to the swamp registry until, in order:
 
 1. `swamp extension fmt --check`, tests, `swamp extension quality`
-2. `scripts/gen-readme.ts --check` — the committed README equals the one
+2. `scripts/gen-readme.ts --check`: the committed README equals the one
    generated from the code
-3. `scripts/scan-identifiers.sh` — mechanical scan for private identifiers
+3. `scripts/scan-identifiers.sh`: mechanical scan for private identifiers
    and secret-shaped strings over the full published surface
 4. A **secrets & security review** by a frontier model using the fixed prompt in
    `review/secrets-security-pass.md`. The verdict is committed under

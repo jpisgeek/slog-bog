@@ -3,9 +3,10 @@
 # @jpisgeek/firewalla
 
 Device and machine inventory from the Firewalla MSP API. The firewall is the
-authoritative view of a network — it knows every device it has ever seen,
-including ones offline right now. One `device` resource per device, one
-`machine` per deduplicated host (NICs collapsed), one `inventory` roll-up.
+authoritative view of a network. It sits at the mouth of the swamp and knows
+every device it has ever seen, including ones offline right now. One `device`
+resource per device, one `machine` per deduplicated host (NICs collapsed), one
+`inventory` roll-up.
 
 **Version** `2026.08.22.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/firewalla
@@ -20,18 +21,18 @@ swamp extension pull @jpisgeek/firewalla
 
 ### Arguments
 
-| argument            | type            | required | default                                              | description                                                                                                                                                                                                                                             |
-| ------------------- | --------------- | -------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mspDomain`         | string          | yes      |                                                      | MSP domain, e.g. example-msp.firewalla.net (scheme optional). Must resolve under firewalla.net — the token is sent here.                                                                                                                                |
-| `token`             | string          | yes      |                                                      | MSP personal access token; source it from a vault expression                                                                                                                                                                                            |
-| `deepCheckTypes`    | array of string | no       | `["desktop","nas&server","switch","goldpro","fwap"]` | deviceType values (prefix match) that belong to the deep tier                                                                                                                                                                                           |
-| `timeoutSec`        | integer         | no       | `30`                                                 | HTTP timeout for MSP API calls                                                                                                                                                                                                                          |
-| `wiredSuffixes`     | array of string | no       | `["eth","lan","en0"]`                                | Interface suffixes considered wired. A wired address wins the primaryIp race — it is the more reliable path to monitor over.                                                                                                                            |
-| `interfaceSuffixes` | array of string | no       | `["eth","wifi","wl","awg","lan","en0"]`              | Trailing name segments that denote a NIC rather than a distinct machine. 'example-host-eth' and 'example-host-wifi' collapse to one machine, 'example-host'.                                                                                            |
-| `apiManaged`        | array of string | no       | `[]`                                                 | Machines reached through their own API rather than SSH. They stay in the inventory but are never SSH fleet candidates. The Firewalla itself is handled automatically; add hosts like a TrueNAS box here.                                                |
-| `excludeNetworks`   | array of string | no       | `[]`                                                 | Firewalla networks that are off limits entirely. Devices on these are skipped before anything is written — not collected, not counted, not stored. Use for VLANs outside the scope of this automation (a work network, a guest network you do not own). |
-| `exclude`           | array of string | no       | `[]`                                                 | Device names that must never be treated as machines, even if their deviceType lands them in the deep tier. Supports a trailing '*'. Thunderbolt docks are the motivating case: they hold a MAC and take an IP, so Firewalla reports them as 'desktop'.  |
-| `dependencies`      | object          | no       | `{}`                                                 | machine -> machine it runs on or depends upon. A dependent being unreachable while its parent is down is a consequence, not a separate incident; downstream alerting can suppress on this.                                                              |
+| argument            | type            | required | default                                              | description                                                                                                                                                                                                                                            |
+| ------------------- | --------------- | -------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `mspDomain`         | string          | yes      |                                                      | MSP domain, e.g. example-msp.firewalla.net (scheme optional). Must resolve under firewalla.net. The token is sent here.                                                                                                                                |
+| `token`             | string          | yes      |                                                      | MSP personal access token; source it from a vault expression                                                                                                                                                                                           |
+| `deepCheckTypes`    | array of string | no       | `["desktop","nas&server","switch","goldpro","fwap"]` | deviceType values (prefix match) that belong to the deep tier                                                                                                                                                                                          |
+| `timeoutSec`        | integer         | no       | `30`                                                 | HTTP timeout for MSP API calls                                                                                                                                                                                                                         |
+| `wiredSuffixes`     | array of string | no       | `["eth","lan","en0"]`                                | Interface suffixes considered wired. A wired address wins the primaryIp race. It is the more reliable path to monitor over.                                                                                                                            |
+| `interfaceSuffixes` | array of string | no       | `["eth","wifi","wl","awg","lan","en0"]`              | Trailing name segments that denote a NIC rather than a distinct machine. 'example-host-eth' and 'example-host-wifi' collapse to one machine, 'example-host'.                                                                                           |
+| `apiManaged`        | array of string | no       | `[]`                                                 | Machines reached through their own API rather than SSH. They stay in the inventory but are never SSH fleet candidates. The Firewalla itself is handled automatically; add hosts like a TrueNAS box here.                                               |
+| `excludeNetworks`   | array of string | no       | `[]`                                                 | Firewalla networks that are off limits entirely. Devices on these are skipped before anything is written. Not collected, not counted, not stored. Use for VLANs outside the scope of this automation (a work network, a guest network you do not own). |
+| `exclude`           | array of string | no       | `[]`                                                 | Device names that must never be treated as machines, even if their deviceType lands them in the deep tier. Supports a trailing '*'. Thunderbolt docks are the motivating case: they hold a MAC and take an IP, so Firewalla reports them as 'desktop'. |
+| `dependencies`      | object          | no       | `{}`                                                 | machine -> machine it runs on or depends upon. A dependent being unreachable while its parent is down is a consequence, not a separate incident; downstream alerting can suppress on this.                                                             |
 
 ### Methods
 
@@ -83,12 +84,12 @@ list, is the correct source for generating an SSH fleet.
 
 ## Security
 
-`mspDomain` is parsed as a URL and must be a bare `*.firewalla.net` hostname —
-no path, query, fragment, port, or userinfo — because that is where the token is
-sent; the request always goes to `https://<hostname>`. The token is marked
+`mspDomain` is parsed as a URL and must be a bare `*.firewalla.net` hostname (no
+path, query, fragment, port, or userinfo) because that is where the token is
+sent. The request always goes to `https://<hostname>`. The token is marked
 sensitive, sent in the `Token` header, and redacted from any error body before
 it can reach a message. 429/503 retries honour `Retry-After` capped at 5 s and
-are cancellable. Written data is a personal inventory of your network — device
+are cancellable. Written data is a personal inventory of your network: device
 names, MAC addresses, IPs, vendors, networks, online state, traffic totals.
 Treat the datastore accordingly.
 

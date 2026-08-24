@@ -3,7 +3,7 @@
  *
  * Built in-house rather than pulling a community extension: this model holds a
  * TrueNAS API key at runtime, and the decision was to keep that inside code we
- * control. It is deliberately narrow — read-only discovery of the things a
+ * control. It is deliberately narrow. Read-only discovery of the things a
  * homelab baseline actually needs. It does not manage datasets, shares, or
  * services.
  *
@@ -145,7 +145,7 @@ const CertificateSchema = z.object({
   notAfter: z.string(),
   daysRemaining: z.number(),
   /**
-   * False for objects with no expiry at all — a CSR, for instance. Without
+   * False for objects with no expiry at all, a CSR for instance. Without
    * this, the sentinel daysRemaining reads as a real (and alarming) number.
    * Consumers must check this before comparing daysRemaining.
    */
@@ -171,11 +171,11 @@ const SummarySchema = z.object({
 
 /**
  * Raw TrueNAS response shapes for the fields this model actually reads.
- * `.passthrough()` here is correct and intentional — unlike the resource
+ * `.passthrough()` here is correct and intentional. Unlike the resource
  * schemas above (which gate CEL and must be strict), these validate an
  * untrusted third-party payload where extra fields we don't use are
  * expected and harmless. What matters is that the fields we *do* rely on
- * are actually present and typed as expected; if TrueNAS's contract has
+ * are actually present and typed as expected. If TrueNAS's contract has
  * drifted, `.parse()` throws here instead of the mapping code silently
  * writing placeholder 0/""/[] values as if they were real data.
  */
@@ -280,8 +280,8 @@ function instanceName(prefix: string, ...identity: string[]): string {
   // node name ahead of the alarm name, so every alarm on one node rendered as
   // `alarm-<node>-<hash>` and differed only in an opaque hash. Unique, but
   // `swamp data list` became unreadable -- the whole reason for a readable part.
-  // Capped so an unusually long identity cannot produce an unbounded name; the
-  // hash still covers the full raw identity, so uniqueness never depends on
+  // Capped so an unusually long identity cannot produce an unbounded name.
+  // The hash still covers the full raw identity, so uniqueness never depends on
   // what survives truncation.
   const parts = identity.filter((s) => s !== "").map(slug).filter((s) =>
     s !== ""
@@ -321,7 +321,7 @@ function toIso(value: unknown): string {
 
 /**
  * `auth.login_with_api_key` is deprecated and scheduled for removal in
- * TrueNAS 27; `auth.login_ex` with the API_KEY_PLAIN mechanism is the
+ * TrueNAS 27. `auth.login_ex` with the API_KEY_PLAIN mechanism is the
  * replacement, but it also requires a `username`, which this model does
  * not currently collect. Rather than guess at an untested auth path against
  * infrastructure this review has no access to, this caps support
@@ -396,7 +396,7 @@ class TrueNasRpc {
         // contents are not guaranteed to redact call arguments -- and one
         // call, auth.login_with_api_key, takes the API key as its only
         // argument. Stringifying `data` into an error that can reach a swamp
-        // log would risk persisting the key, so it is dropped; a failing call
+        // log would risk persisting the key, so it is dropped. A failing call
         // is still identified by its RPC error code + message.
         waiter.reject(
           new Error(
@@ -780,10 +780,10 @@ async function discover(_args: unknown, ctx: {
   );
   live.add("summary");
 
-  // Prune anything the box no longer reports — resolved alerts especially.
+  // Prune anything the box no longer reports, resolved alerts especially.
   // This uses dataRepository.findAllForModel/delete directly rather than
-  // context.readResource because readResource addresses one named instance;
-  // there is no "list every stored instance for this model" call in the
+  // context.readResource because readResource addresses one named instance.
+  // There is no "list every stored instance for this model" call in the
   // readResource surface, and bulk stale-resource pruning genuinely needs
   // one. This mirrors @swamp/ssh's own `apply` method (see
   // .swamp/pulled-extensions/@swamp/ssh/models/_lib/operations.ts), which
@@ -849,7 +849,7 @@ export const model = {
     alert: {
       description:
         "One record per active TrueNAS alert. `silenced` marks alerts that " +
-        "were dismissed in the UI — still true, just no longer visible there.",
+        "were dismissed in the UI. Still true, just no longer visible there.",
       schema: AlertSchema,
       lifetime: "infinite" as const,
       garbageCollection: 50,

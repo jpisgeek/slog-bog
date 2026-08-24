@@ -2,21 +2,22 @@
  * Netdata standalone agent state, across a set of nodes.
  *
  * Deliberately NOT a metrics collector. Netdata already stores high-resolution
- * telemetry on each node and runs its own health engine; duplicating either in
- * swamp would be worse and slower. What this model records is *state truth*:
- * which nodes answer, what they are, which alarms are firing, and how much
- * capacity is left — the things you correlate against inventory and act on.
+ * telemetry on each node and runs its own health engine. Duplicating either
+ * in swamp would be slower and worse. What this model hauls out of the bog is
+ * state truth: which nodes answer, what they are, which alarms are firing,
+ * and how much headroom is left. The stuff you correlate against inventory
+ * and actually act on.
  *
  * Chart names are platform-specific (macOS has no `system.cpu` and does have
- * `macos.gpu_*`; Linux differs again), so mount discovery reads the agent's
+ * `macos.gpu_*`, Linux differs again), so mount discovery reads the agent's
  * own chart list rather than assuming names. Alarm thresholds are Netdata's,
  * not ours.
  *
- * A node that does not answer is data, not an error: `reachable: false` is
- * written and the sweep continues. A homelab always has something powered off.
- * A node that *did* answer before but only partially answers this round
- * (alarms or chart data timed out, say) keeps its last known detail instead
- * of being zeroed out or pruned — see the discover() comments below.
+ * A node that does not answer is data, not an error. It gets written with
+ * `reachable: false` and the sweep moves on. A homelab always has something
+ * powered off. A node that answered before but only partially answers this
+ * round (alarms or chart data timed out, say) keeps its last known detail
+ * instead of being zeroed out or pruned. See the discover() comments below.
  */
 import { z } from "npm:zod@4";
 
@@ -29,9 +30,9 @@ const NodeSchema = z.object({
         try {
           const u = new URL(v);
           // http/https only: Deno fetch will honour a file: URL, and the
-          // remote curl honours the file:, ftp:, dict: (etc.) schemes — an
+          // remote curl honours the file:, ftp:, dict: (etc.) schemes. An
           // unrestricted scheme is an SSRF / local-read footgun. No userinfo
-          // (persisted verbatim; would leak if present). No
+          // (persisted verbatim, so it would leak if present). No
           // single quote: over the ssh transport the URL is interpolated into
           // a single-quoted remote command and a quote would break out of it.
           return (u.protocol === "http:" || u.protocol === "https:") &&
@@ -53,7 +54,7 @@ const NodeSchema = z.object({
     ),
   ssh: z
     .object({
-      // host/user become the positional `user@host` argument to ssh; a value
+      // host/user become the positional `user@host` argument to ssh. A value
       // starting with "-" would be parsed as an ssh option (-oProxyCommand=…).
       host: z.string().min(1).refine((v) => !v.startsWith("-"), {
         message: "ssh.host must not start with '-'",
@@ -203,8 +204,8 @@ function instanceName(prefix: string, ...identity: string[]): string {
   // `alarm-<node>-<hash>` and differed only in an opaque hash. Names were
   // unique, but `swamp data list` became unreadable -- which is the entire
   // reason for having a readable part at all.
-  // Capped so an unusually long identity cannot produce an unbounded name; the
-  // hash still covers the full raw identity, so uniqueness never depends on
+  // Capped so an unusually long identity cannot produce an unbounded name.
+  // The hash still covers the full raw identity, so uniqueness never depends on
   // what survives truncation.
   const parts = identity.filter((s) => s !== "").map(slug).filter((s) =>
     s !== ""
@@ -215,10 +216,11 @@ function instanceName(prefix: string, ...identity: string[]): string {
 
 /**
  * A node-level failure message safe to PERSIST in the `error` resource field.
- * The full detail (ssh `user@host`, ssh stderr — which can echo local key
- * paths — and any HTTP response body) belongs in the log line, never in stored
- * data. This collapses a raw failure to a class with no transport target or
- * remote output. Keep the raw message for `logger.warning`; store this.
+ * The full detail belongs in the log line, never in stored data. That means
+ * ssh `user@host`, ssh stderr (which can echo local key paths) and any HTTP
+ * response body. This collapses a raw failure to a class with no transport
+ * target or remote output. Keep the raw message for `logger.warning`. Store
+ * this.
  */
 function sanitizeNodeError(raw: string): string {
   const ssh = raw.match(/^ssh to \S+ failed: ([\s\S]*)$/);
@@ -344,7 +346,7 @@ async function pollNode(
   const getViaSsh = async (path: string): Promise<unknown> => {
     const ssh = node.ssh!;
     // Single remote command string so the remote shell keeps the query
-    // string intact; never assembled through a local shell.
+    // string intact. Never assembled through a local shell.
     // No newline before the marker: curl's -w output is appended straight
     // after the body with no separator, and the marker string is
     // distinctive enough that a plain concatenation is unambiguous to
@@ -436,7 +438,7 @@ async function pollNode(
         string,
         unknown
       >;
-      // /api/v1/info carries no hostname; the alarms payload does.
+      // /api/v1/info carries no hostname. The alarms payload does.
       if (!info.hostname && typeof al.hostname === "string") {
         result.info = { ...info, hostname: al.hostname };
       }
@@ -533,8 +535,8 @@ async function pollNode(
     // Unreachable is a normal homelab state, recorded rather than thrown --
     // but still worth a structured warning so a degraded fleet is visible
     // in logs, not just in stored data someone has to go query. The FULL
-    // detail (ssh user@host, ssh stderr, HTTP body) goes to the log; the
-    // stored `error` gets only a sanitized class -- see sanitizeNodeError.
+    // detail (ssh user@host, ssh stderr, HTTP body) goes to the log. The
+    // stored `error` gets only a sanitized class, see sanitizeNodeError.
     const rawMsg = (e as Error).message;
     result.error = sanitizeNodeError(rawMsg);
     logger.warning(
@@ -709,8 +711,8 @@ async function discover(
     // /api/v1/info (and, for charts/alarms counts, the relevant sub-fetch).
     // When that didn't happen this round, carry forward the last stored
     // values instead of writing blank/zeroed placeholders that would read
-    // as "this host has no version" or "zero alarms" -- neither of which is
-    // true; the node simply didn't answer (or answer fully) this time.
+    // as "this host has no version" or "zero alarms", neither of which is
+    // true. The node simply didn't answer (or answer fully) this time.
     const prevNode = (!r.reachable || !r.alarmsOk || !r.chartsOk)
       ? await ctx.readResource(nn)
       : null;
@@ -803,7 +805,7 @@ async function discover(
   );
   live.add("summary");
 
-  // Prune only on a full sweep — a single-node run legitimately sees a
+  // Prune only on a full sweep. A single-node run legitimately sees a
   // subset. Skip anything explicitly protected this round (see above) even
   // though it isn't in `live`, and skip anything already in `live`.
   if (!args.node) {
@@ -863,7 +865,7 @@ export const model = {
     alarm: {
       description:
         "One record per active Netdata alarm. Thresholds are Netdata's own " +
-        "health engine — swamp records the verdict, it does not re-derive it.",
+        "health engine. Swamp records the verdict, it does not re-derive it.",
       schema: AlarmSchema,
       lifetime: "infinite" as const,
       garbageCollection: 50,

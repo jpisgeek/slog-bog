@@ -226,7 +226,7 @@ const CapabilityProbeSchema = z.object({
    * without this, `emitsReasoning: false` on a failed battery is
    * indistinguishable from `emitsReasoning: false` because a complete battery
    * genuinely found no reasoning. Only the first `checksCompleted` boolean
-   * fields (in the order above) reflect a real measurement; the rest are
+   * fields (in the order above) reflect a real measurement. The rest are
    * left at their default `false` and must not be read as findings.
    */
   checksCompleted: z.number().int().min(0).max(3),
@@ -261,7 +261,7 @@ function slug(value: string): string {
  * -- e.g. `qwen/qwen3-4b` -- so two distinct ids (`foo/bar` and `foo-bar`)
  * can slugify to the same string and silently overwrite each other's
  * resource on every subsequent run. `slug()` stays in the name for
- * readability in `swamp data list`; the hash suffix, derived from the full
+ * readability in `swamp data list`. The hash suffix, derived from the full
  * un-normalized id, is what actually guarantees uniqueness. The same model
  * id always hashes to the same suffix, so reruns against the same model
  * still overwrite the same instance -- this only separates ids that were
@@ -768,7 +768,7 @@ async function completion(
   // the requested cap forced the stop -- in practice, almost always the
   // context window. If generation ran all the way to the requested cap,
   // that is a genuine max_tokens cutoff, not context exhaustion. This is an
-  // inference from one call's usage numbers, not a guarantee; an endpoint
+  // inference from one call's usage numbers, not a guarantee. An endpoint
   // that exposes real context-length metadata would let this be tightened.
   const hitLength = result.ok && result.finishReason === "length";
   const maxTokensHit = hitLength && result.completionTokens >= a.maxTokens;
