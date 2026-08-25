@@ -1,0 +1,63 @@
+# Hand-written inputs for scripts/gen-readme.ts. Everything else in README.md
+# comes from the code. Placeholders only, never a real host, path, or vault item.
+package: "@jpisgeek/mise"
+purpose: >-
+  Toolchain state across a fleet, as measured rather than as assumed. Records
+  which tool versions each host is actually running and where that parts ways
+  with the host's own config: asked for but never installed, installed but not
+  active, declared in a config that never took, or simply behind. Installs
+  nothing and upgrades nothing. mise already does that job. This one wades
+  through the fleet, writes down what it finds, and leaves the acting to
+  whatever workflow wants it.
+example: |
+  globalArguments:
+    nodes:
+      - name: workstation
+        dir: /srv/project
+      - name: builder
+        dir: /srv/project
+        ssh:
+          host: builder.example.com
+          user: toolchain-reader
+          port: 22
+        # A non-login shell usually has no ~/.local/bin on PATH, and that is
+        # exactly where mise tends to live.
+        misePath: /usr/local/bin/mise
+    timeoutSec: 15
+    maxConcurrency: 8
+    expect:
+      node: "22"
+      python: "3.12"
+caveats: >-
+  A host that does not answer is recorded as unmeasured, and its counts stay
+  null rather than dropping to zero. This matters more than it sounds: mise is
+  routinely missing from a non-login shell's PATH, and a zero tool count from a
+  host that never ran mise is indistinguishable from a host that is genuinely
+  clean. Set `misePath` when a host reports unmeasured with a not-found error.
+  mise config is directory-scoped, so `dir` decides which config is being
+  judged. Leave it off and you measure the swamp working directory locally and
+  the login directory over SSH, which is rarely the question you meant to ask.
+  Trust is recorded but never treated as drift. A plain `[tools]` file reports
+  as untrusted while applying perfectly, because mise only demands trust for
+  configs that can execute something. Node, tool, and config resource names
+  all carry a hash suffix, so find them with `swamp data list <model>` rather
+  than building the name by hand.
+security: >-
+  Read-only throughout. The model runs `ls --current`, `config ls`, `outdated`,
+  `trust --show`, and `--version`, and nothing else. It never calls
+  `mise install`, `mise upgrade`, `mise token`, `mise settings`, or `mise
+  trust` without `--show`, so it cannot change a host or surface a credential.
+  Local hosts are invoked as an argv array that never reaches a shell. Over
+  SSH, two operator-supplied values reach the remote command: `dir`,
+  single-quoted, and `misePath`, unquoted. Each is safe because its schema
+  refuses at parse time any value containing a character a shell would act on,
+  rather than repairing it: a half-fixed path that measures the wrong
+  directory silently is worse than a config error. `ssh.host` and `ssh.user`
+  are refused on the same grounds, so neither can be read as an ssh option
+  such as `-oProxyCommand=`. SSH uses `BatchMode=yes`, so an unknown host key
+  fails closed instead of prompting. Errors quote stderr only, never stdout,
+  because stdout carries config contents and error strings reach swamp run
+  logs. Written data: host labels, the measured directory, mise version, tool
+  names and versions, install paths, and config file paths. Install and config
+  paths embed the remote account's home directory and real project directory
+  names, so treat the datastore as infrastructure detail.
