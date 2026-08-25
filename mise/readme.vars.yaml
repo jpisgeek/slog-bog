@@ -87,7 +87,11 @@ security: >-
   Each occupies a single argv element handed straight to `ssh`, so the only
   thing their schema has to refuse is a leading dash, which would otherwise
   let either be read as an ssh option such as `-oProxyCommand=`. They carry
-  no charset rule and do not need one. SSH uses `BatchMode=yes`, so an
+  no shell charset rule and do not need one. Node labels refuse terminal
+  controls at parse time. Every string returned by a host is made printable
+  before it reaches a resource field, tag, or log parameter. C0 and C1 bytes,
+  including ESC, are written as visible `\uNNNN` text instead of being handed
+  to a terminal. SSH uses `BatchMode=yes`, so an
   unknown host key
   fails closed instead of prompting. Errors quote stderr only, never stdout,
   because stdout carries config contents and error strings reach swamp run

@@ -143,13 +143,17 @@ config error. `ssh.host` and `ssh.user` are a different case, and a stronger
 one. Neither reaches a shell at all. Each occupies a single argv element handed
 straight to `ssh`, so the only thing their schema has to refuse is a leading
 dash, which would otherwise let either be read as an ssh option such as
-`-oProxyCommand=`. They carry no charset rule and do not need one. SSH uses
-`BatchMode=yes`, so an unknown host key fails closed instead of prompting.
-Errors quote stderr only, never stdout, because stdout carries config contents
-and error strings reach swamp run logs. Written data: host labels, the measured
-directory, mise version, tool names and versions, install paths, and config file
-paths. Install and config paths embed the remote account's home directory and
-real project directory names, so treat the datastore as infrastructure detail.
+`-oProxyCommand=`. They carry no shell charset rule and do not need one. Node
+labels refuse terminal controls at parse time. Every string returned by a host
+is made printable before it reaches a resource field, tag, or log parameter. C0
+and C1 bytes, including ESC, are written as visible `\uNNNN` text instead of
+being handed to a terminal. SSH uses `BatchMode=yes`, so an unknown host key
+fails closed instead of prompting. Errors quote stderr only, never stdout,
+because stdout carries config contents and error strings reach swamp run logs.
+Written data: host labels, the measured directory, mise version, tool names and
+versions, install paths, and config file paths. Install and config paths embed
+the remote account's home directory and real project directory names, so treat
+the datastore as infrastructure detail.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

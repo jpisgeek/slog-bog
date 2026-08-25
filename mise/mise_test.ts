@@ -39,6 +39,20 @@ import {
 
 const okNode = { name: "workstation" };
 
+function assertNoControlCharacters(value: unknown): void {
+  if (typeof value === "string") {
+    assertEquals(/[\u0000-\u001f\u007f-\u009f]/.test(value), false);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) assertNoControlCharacters(entry);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const entry of Object.values(value)) assertNoControlCharacters(entry);
+  }
+}
+
 Deno.test("dir must be absolute and free of traversal", () => {
   const bad = [
     "relative/path",
@@ -90,6 +104,13 @@ Deno.test("duplicate node names are rejected", () => {
     nodes: [{ name: "workstation" }, { name: "workstation" }],
   });
   assertEquals(r.success, false, "two nodes cannot share a name");
+});
+
+Deno.test("node names cannot carry terminal control characters", () => {
+  const r = GlobalArgsSchema.safeParse({
+    nodes: [{ name: "builder\u001b[31m" }],
+  });
+  assertEquals(r.success, false);
 });
 
 Deno.test("expect matches on whole version segments, never string prefix", () => {
@@ -321,6 +342,28 @@ Deno.test("stdout is withheld from the error on a failed run", async () => {
   }
 });
 
+Deno.test("stderr control characters never reach a run error", async () => {
+  const m = await fakeMise({
+    stderr: "\u001b[31merror:\u0007 could not read config\u009b0m",
+    exit: 1,
+  });
+  try {
+    const r = await runMise(
+      { name: "local", misePath: m.path },
+      ["ls", "--current", "--json"],
+      15,
+      new AbortController().signal,
+    );
+    assertEquals(r.ok, false);
+    assertEquals(
+      !r.ok && /[\u0000-\u001f\u007f-\u009f]/.test(r.error),
+      false,
+    );
+  } finally {
+    await m.cleanup();
+  }
+});
+
 const LS_CURRENT = JSON.stringify({
   node: [{
     version: "22.23.2",
@@ -398,6 +441,54 @@ Deno.test("trust --show parses the path-colon-status lines", () => {
   assertEquals(parseTrustShow(""), {});
 });
 
+Deno.test("remote fields are stored without control characters", () => {
+  const hasControl = (v: string | null) =>
+    v !== null && /[\u0000-\u001f\u007f-\u009f]/.test(v);
+  const ls = parseLsCurrent(JSON.stringify({
+    "node\u001b[31m": [{
+      version: "22.23.2\u0007",
+      requested_version: "22\u0085",
+      install_path: "/srv/install\u007f",
+      source: {
+        type: "mise.toml\u0000",
+        path: "/srv/project\u001b/mise.toml",
+      },
+      installed: true,
+      active: true,
+    }],
+  }));
+  assertEquals(ls.length, 1);
+  for (
+    const value of [
+      ls[0].tool,
+      ls[0].resolvedVersion,
+      ls[0].requestedVersion,
+      ls[0].installPath,
+      ls[0].sourceType,
+      ls[0].sourcePath,
+    ]
+  ) {
+    assertEquals(hasControl(value), false);
+  }
+
+  const configs = parseConfigLs(JSON.stringify([{
+    path: "/srv/project\u001b/mise.toml",
+    tools: ["node\u0007"],
+  }]));
+  assertEquals(hasControl(configs[0].path), false);
+  assertEquals(hasControl(configs[0].tools[0]), false);
+
+  const outdated = parseOutdated(JSON.stringify({
+    "node\u001b": { latest: "24.1.0\u009b" },
+  }));
+  const outdatedKey = Object.keys(outdated)[0];
+  assertEquals(hasControl(outdatedKey), false);
+  assertEquals(hasControl(outdated[outdatedKey]), false);
+
+  const trust = parseTrustShow("/srv/project\u001b: trusted\n");
+  assertEquals(hasControl(Object.keys(trust)[0]), false);
+});
+
 Deno.test("maps keyed by remote names have nothing behind them", () => {
   // A miss on a plain object walks up to Object.prototype, so a tool named
   // "constructor" reads back a function from a map whose type says string.
@@ -440,7 +531,7 @@ function mockCtx(
   globalArgs: Json,
   opts: {
     existing?: string[];
-    throwOnFirstWarning?: boolean;
+    throwOnFirstWarning?: boolean | string;
     signal?: AbortSignal;
   } = {},
 ) {
@@ -448,10 +539,12 @@ function mockCtx(
     { spec: string; name: string; data: Json; opts: Json }
   > = [];
   const deleted: string[] = [];
+  const logs: Array<{ level: string; values: Json }> = [];
   let warnings = 0;
   return {
     written,
     deleted,
+    logs,
     // deno-lint-ignore no-explicit-any
     ctx: {
       signal: opts.signal ?? new AbortController().signal,
@@ -459,11 +552,18 @@ function mockCtx(
       modelType: "@jpisgeek/mise",
       modelId: "m1",
       logger: {
-        info: () => {},
-        warning: () => {
+        info: (_message: string, values: Json) => {
+          logs.push({ level: "info", values });
+        },
+        warning: (_message: string, values: Json) => {
+          logs.push({ level: "warning", values });
           warnings++;
           if (opts.throwOnFirstWarning && warnings === 1) {
-            throw new Error("logger exploded");
+            throw new Error(
+              typeof opts.throwOnFirstWarning === "string"
+                ? opts.throwOnFirstWarning
+                : "logger exploded",
+            );
           }
         },
       },
@@ -585,6 +685,46 @@ Deno.test("a clean host writes tool rows with no drift", async () => {
       "local",
       "node resource must be tagged with its transport",
     );
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("remote controls never reach resource fields or tags", async () => {
+  const toolName = "node\u001b[31m";
+  const m = await fakeMiseSuite({
+    ls: JSON.stringify({
+      [toolName]: [{
+        version: "22.23.2\u0007",
+        requested_version: "22\u0085",
+        install_path: "/srv/install\u007f",
+        source: {
+          type: "mise.toml\u0000",
+          path: "/srv/project\u001b/mise.toml",
+        },
+        installed: true,
+        active: true,
+      }],
+    }),
+    config: JSON.stringify([{
+      path: "/srv/project\u001b/mise.toml",
+      tools: [toolName],
+    }]),
+    outdated: JSON.stringify({
+      [toolName]: { latest: "24.1.0\u009b" },
+    }),
+    trust: "/srv/project\u001b/mise.toml: trusted",
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    for (const write of c.written) {
+      assertNoControlCharacters(write.data);
+      assertNoControlCharacters(write.opts);
+    }
+    for (const log of c.logs) {
+      assertNoControlCharacters(log.values);
+    }
   } finally {
     await m.cleanup();
   }
@@ -1100,7 +1240,7 @@ Deno.test("one node's exception never discards the fleet", async () => {
         { name: "gone", misePath: "/nonexistent/mise" },
         { name: "workstation", misePath: m.path },
       ],
-    }, { throwOnFirstWarning: true });
+    }, { throwOnFirstWarning: "\u001b[31mlogger\u0007 exploded" });
     await model.methods.discover.execute({}, c.ctx);
     const nodes = c.written.filter((w) => w.spec === "node");
     assertEquals(nodes.length, 2, "the healthy host must still be written");
@@ -1108,7 +1248,14 @@ Deno.test("one node's exception never discards the fleet", async () => {
     assertEquals(workstation.measured, true);
     const gone = nodes.find((n) => n.data.name === "gone")!.data;
     assertEquals(gone.measured, false);
-    assertStringIncludes(String(gone.error), "logger exploded");
+    assertEquals(
+      /[\u0000-\u001f\u007f-\u009f]/.test(String(gone.error)),
+      false,
+    );
+    assertStringIncludes(String(gone.error), "logger");
+    for (const log of c.logs) {
+      assertNoControlCharacters(log.values);
+    }
     assertEquals(gone.drift, ["unmeasured"]);
   } finally {
     await m.cleanup();

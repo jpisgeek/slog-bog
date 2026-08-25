@@ -1,5 +1,13 @@
 # @jpisgeek/mise Implementation Plan
 
+## Lifecycle Status
+
+- **Phase:** REVIEW (fresh hash-bound Fable verdict pending)
+- **Spec:** `docs/design/2026-08-24-mise-extension.md`
+- **Plan:** this file
+- **Blockers:** Fable session limit resets 2026-08-25 12:30 America/New_York; private denylist path is not present in this shell; current `swamp` needs `DENO_TLS_CA_STORE=mozilla`
+- **Last updated:** 2026-08-25
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship `@jpisgeek/mise`, a read-only swamp model that sweeps mise toolchain state across a fleet and records where each host disagrees with its own config.

@@ -27,6 +27,28 @@ import { z } from "npm:zod@4";
 const SAFE_ABS_PATH = /^\/[A-Za-z0-9._/-]*$/;
 /** Same character class, but a bare command name like `mise` is also fine. */
 const SAFE_BIN_PATH = /^[A-Za-z0-9._/-]+$/;
+/**
+ * Make process-controlled text printable before it reaches data, tags, or
+ * logs. Escaping instead of dropping the byte keeps two hostile names from
+ * collapsing into one identity and leaves a visible record of what the host
+ * actually returned. The resulting text is plain ASCII at every control-byte
+ * position, including ESC, so a terminal never gets a sequence to act on.
+ */
+function printableRemoteText(value: string): string {
+  let printable = "";
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    printable += code <= 0x1f || (code >= 0x7f && code <= 0x9f)
+      ? `\\u${code.toString(16).padStart(4, "0")}`
+      : char;
+  }
+  return printable;
+}
+
+/** A bounded printable excerpt for resource errors and logger parameters. */
+function remoteError(value: string): string {
+  return printableRemoteText(value).slice(0, 160);
+}
 
 const SshSchema = z.object({
   // host/user become the positional `user@host` argument to ssh. A value
@@ -48,7 +70,13 @@ const SshSchema = z.object({
  * operator-supplied fleet config turns into command text.
  */
 export const NodeSchema = z.object({
-  name: z.string().min(1).describe("Label for this host in the written data"),
+  name: z
+    .string()
+    .min(1)
+    .refine((v) => printableRemoteText(v) === v, {
+      message: "name must not contain terminal control characters",
+    })
+    .describe("Label for this host in the written data"),
   ssh: SshSchema.optional().describe(
     "Reach this host over SSH. Omit for the machine swamp is running on.",
   ),
@@ -367,7 +395,7 @@ export async function runMise(
       return {
         ok: false,
         kind: classifyFailure(out.code, stderr),
-        error: stderr.slice(0, 160) || `exit ${out.code}`,
+        error: remoteError(stderr) || `exit ${out.code}`,
       };
     }
     return { ok: true, stdout: new TextDecoder().decode(out.stdout) };
@@ -384,7 +412,7 @@ export async function runMise(
       kind: e instanceof Deno.errors.NotFound
         ? "notfound"
         : classifyFailure(-1, msg),
-      error: msg.slice(0, 160),
+      error: remoteError(msg),
     };
   }
 }
@@ -467,7 +495,7 @@ function parseJson<T>(raw: string, fallback: T): T {
 }
 
 const str = (v: unknown): string | null =>
-  typeof v === "string" && v !== "" ? v : null;
+  typeof v === "string" && v !== "" ? printableRemoteText(v) : null;
 
 /**
  * `mise ls --current --json` is keyed by tool name, each holding an array of
@@ -484,7 +512,7 @@ export function parseLsCurrent(json: string): ToolRow[] {
     if (!e || typeof e !== "object") continue;
     const source = (e.source ?? {}) as Record<string, unknown>;
     rows.push({
-      tool,
+      tool: printableRemoteText(tool),
       requestedVersion: str(e.requested_version),
       resolvedVersion: str(e.version),
       installPath: str(e.install_path),
@@ -516,7 +544,9 @@ export function parseConfigLs(
     const c = raw as Record<string, unknown>;
     const path = str(c?.path);
     if (!path) continue;
-    const tools = Array.isArray(c.tools) ? c.tools.map((t) => String(t)) : [];
+    const tools = Array.isArray(c.tools)
+      ? c.tools.map((t) => printableRemoteText(String(t)))
+      : [];
     out.push({ path, tools });
   }
   return out;
@@ -539,7 +569,7 @@ export function parseOutdated(json: string): Record<string, string | null> {
   const out: Record<string, string | null> = Object.create(null);
   for (const [tool, v] of Object.entries(obj)) {
     const rec = v as Record<string, unknown>;
-    out[tool] = str(rec?.latest);
+    out[printableRemoteText(tool)] = str(rec?.latest);
   }
   return out;
 }
@@ -557,7 +587,7 @@ export function parseTrustShow(text: string): Record<string, boolean> {
   for (const line of text.split("\n")) {
     const idx = line.lastIndexOf(": ");
     if (idx === -1) continue;
-    const path = line.slice(0, idx).trim();
+    const path = printableRemoteText(line.slice(0, idx).trim());
     const status = line.slice(idx + 2).trim();
     if (!path) continue;
     if (status === "trusted") out[path] = true;
@@ -749,7 +779,7 @@ function nodePrefix(prefix: string, node: string): string {
  */
 function currentDir(): string | null {
   try {
-    return Deno.cwd();
+    return printableRemoteText(Deno.cwd());
   } catch {
     return null;
   }
@@ -1006,7 +1036,8 @@ export const model = {
                   ? `part measured, no answer from: ${failed.join(", ")}`
                   : null,
                 miseVersion: ver.ok
-                  ? (ver.stdout.trim().split(" ")[0] || null)
+                  ? (printableRemoteText(ver.stdout.trim().split(" ")[0]) ||
+                    null)
                   : null,
                 dir,
                 // Zero configs is a measurement. No answer from config ls is
@@ -1025,7 +1056,9 @@ export const model = {
               // from. The workers run under Promise.all, so an escaping
               // error would take the whole sweep with it and nothing at all
               // would be written, including for every host that answered.
-              const msg = (e as Error)?.message ?? String(e);
+              const msg = remoteError(
+                (e as Error)?.message ?? String(e),
+              );
               // Record first, log second. The logger is the one thing in here
               // that reaches outside this model, so it is also the one thing
               // that can throw on the way out and take the record with it.
@@ -1037,7 +1070,7 @@ export const model = {
                 // Nothing here says mise was absent. The sweep broke.
                 failureKind: "failed",
                 transport,
-                error: msg.slice(0, 160),
+                error: msg,
                 miseVersion: null,
                 dir,
                 configCount: null,
