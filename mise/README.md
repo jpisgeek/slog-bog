@@ -22,19 +22,19 @@ swamp extension pull @jpisgeek/mise
 
 ### Arguments
 
-| argument           | type            | required | default  | description                                                                                                                                                                                                                       |
-| ------------------ | --------------- | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `nodes`            | array of object | yes      |          |                                                                                                                                                                                                                                   |
-| `nodes[].name`     | string          | yes      |          | Label for this host in the written data                                                                                                                                                                                           |
-| `nodes[].ssh`      | object          | no       |          | Reach this host over SSH. Omit for the machine swamp is running on.                                                                                                                                                               |
-| `nodes[].ssh.host` | string          | yes      |          |                                                                                                                                                                                                                                   |
-| `nodes[].ssh.user` | string          | yes      |          |                                                                                                                                                                                                                                   |
-| `nodes[].ssh.port` | integer         | no       | `22`     |                                                                                                                                                                                                                                   |
-| `nodes[].dir`      | string          | no       |          | Which directory's config to evaluate. mise config is directory-scoped, so without this the question has no fixed answer. Defaults to the swamp working directory locally and the login directory over SSH.                        |
-| `nodes[].misePath` | string          | no       | `"mise"` | Path to the mise binary. Worth setting for SSH hosts: a non-login shell often has no ~/.local/bin on PATH, and mise lives there.                                                                                                  |
-| `timeoutSec`       | integer         | no       | `15`     |                                                                                                                                                                                                                                   |
-| `maxConcurrency`   | integer         | no       | `8`      | How many hosts to poll at once. A long nodes list otherwise spawns an unbounded pile of ssh processes at the same time.                                                                                                           |
-| `expect`           | object          | no       | `{}`     | Optional fleet-wide expectation, e.g. {node: '22'}. A version matches when its dot-separated segments start with these, so '22' accepts 22.23.2 but '22.2' does not. Omit it and each host is judged only against its own config. |
+| argument           | type            | required | default  | description                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------------ | --------------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `nodes`            | array of object | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `nodes[].name`     | string          | yes      |          | Label for this host in the written data                                                                                                                                                                                                                                                                                                                                                                                   |
+| `nodes[].ssh`      | object          | no       |          | Reach this host over SSH. Omit for the machine swamp is running on.                                                                                                                                                                                                                                                                                                                                                       |
+| `nodes[].ssh.host` | string          | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `nodes[].ssh.user` | string          | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `nodes[].ssh.port` | integer         | no       | `22`     |                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `nodes[].dir`      | string          | no       |          | Which directory's config to evaluate. mise config is directory-scoped, so without this the question has no fixed answer. Defaults to the swamp working directory locally and the login directory over SSH.                                                                                                                                                                                                                |
+| `nodes[].misePath` | string          | no       | `"mise"` | Path to the mise binary. Worth setting for SSH hosts: a non-login shell often has no ~/.local/bin on PATH, and mise lives there.                                                                                                                                                                                                                                                                                          |
+| `timeoutSec`       | integer         | no       | `15`     |                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `maxConcurrency`   | integer         | no       | `8`      | How many hosts to poll at once. A long nodes list otherwise spawns an unbounded pile of ssh processes at the same time.                                                                                                                                                                                                                                                                                                   |
+| `expect`           | object          | no       | `{}`     | Optional fleet-wide expectation, e.g. {node: '22'}. A version matches when its dot-separated segments start with these, so '22' accepts 22.23.2 but '22.2' does not. It judges only the tools a host's own config declares. A host whose config never mentions the tool cannot fail the expectation, and shows up under notinstalled or notineffect instead. Omit it and each host is judged only against its own config. |
 
 ### Methods
 
@@ -42,10 +42,11 @@ swamp extension pull @jpisgeek/mise
 
 Ask every configured host what toolchain it is running and write down where that
 disagrees with its own config. Read-only: nothing is installed, upgraded, or
-trusted. A full sweep prunes tool and config records that have departed. A
-single-node run never deletes anything, and neither does a host that came back
-unmeasured or only part measured, which keeps its stored rows rather than having
-them read as gone.
+trusted. A full sweep deletes every stored record it did not write this time,
+which includes the node record of a host dropped from the config, not only
+departed tool and config rows. A single-node run never deletes anything, and
+neither does a host that came back unmeasured or only part measured, which keeps
+its stored rows rather than having them read as gone.
 
 | argument | type   | required | default | description                 |
 | -------- | ------ | -------- | ------- | --------------------------- |
@@ -107,9 +108,14 @@ rarely the question you meant to ask. The node record's `dir` field names the
 directory the reading actually came from, so what a sweep judged is never left
 to guesswork. Trust is recorded but never treated as drift. A plain `[tools]`
 file reports as untrusted while applying perfectly, because mise only demands
-trust for configs that can execute something. Node, tool, and config resource
-names all carry a hash suffix, so find them with `swamp data list <model>`
-rather than building the name by hand.
+trust for configs that can execute something. `expect` judges only the tools a
+host's own config declares. Hold the fleet to `{node: "22"}` and a host whose
+config never mentions node records no `expected` drift at all, which is not the
+same as passing. That host turns up under `notinstalled` or `notineffect`
+instead. A full sweep deletes every stored record it did not write that time, so
+dropping a host from `nodes` removes its node record along with its tool and
+config rows. Node, tool, and config resource names all carry a hash suffix, so
+find them with `swamp data list <model>` rather than building the name by hand.
 
 ## Security
 

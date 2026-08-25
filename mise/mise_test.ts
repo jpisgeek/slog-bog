@@ -13,7 +13,12 @@
  *
  * Requires --allow-run --allow-write --allow-read (fake binary in a temp dir).
  */
-import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
+import {
+  assertEquals,
+  assertMatch,
+  assertRejects,
+  assertStringIncludes,
+} from "jsr:@std/assert@1";
 import {
   classifyFailure,
   classifyTool,
@@ -414,7 +419,11 @@ type Json = Record<string, unknown>;
  */
 function mockCtx(
   globalArgs: Json,
-  opts: { existing?: string[]; throwOnFirstWarning?: boolean } = {},
+  opts: {
+    existing?: string[];
+    throwOnFirstWarning?: boolean;
+    signal?: AbortSignal;
+  } = {},
 ) {
   const written: Array<
     { spec: string; name: string; data: Json; opts: Json }
@@ -426,7 +435,7 @@ function mockCtx(
     deleted,
     // deno-lint-ignore no-explicit-any
     ctx: {
-      signal: new AbortController().signal,
+      signal: opts.signal ?? new AbortController().signal,
       globalArgs,
       modelType: "@jpisgeek/mise",
       modelId: "m1",
@@ -886,6 +895,147 @@ Deno.test("a tool row carries its host's degraded flag", async () => {
   }
 });
 
+// ---- cancellation is not a host failure ----------------------------------
+
+Deno.test("a cancelled sweep writes nothing at all", async () => {
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const ac = new AbortController();
+    ac.abort();
+    const c = mockCtx(
+      {
+        nodes: [
+          { name: "studio", misePath: m.path },
+          { name: "builder", misePath: m.path },
+        ],
+      },
+      { existing: ["tool-studio-go-1234abcd"], signal: ac.signal },
+    );
+    await assertRejects(() => model.methods.discover.execute({}, c.ctx));
+    // The caller took the run away. Writing a fleet of failure records for
+    // hosts that were never asked would replace a good sweep with a lie, and
+    // the prune would then delete whatever was not in it.
+    assertEquals(c.written, []);
+    assertEquals(c.deleted, []);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+/**
+ * A fake mise that sits there, so a sweep can be cancelled while it is
+ * genuinely in flight. This is the case that matters: Deno does not throw
+ * when a signal aborts a running command, it kills the child and returns
+ * success: false with SIGTERM, which reads as an ordinary host failure.
+ */
+async function slowFakeMise(
+  seconds: number,
+): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const dir = await Deno.makeTempDir();
+  const path = `${dir}/mise`;
+  await Deno.writeTextFile(path, `#!/bin/sh\nsleep ${seconds}\necho '{}'\n`);
+  await Deno.chmod(path, 0o755);
+  return { path, cleanup: () => Deno.remove(dir, { recursive: true }) };
+}
+
+Deno.test("a caller abort mid-run is a cancellation, not a dead host", async () => {
+  const m = await slowFakeMise(5);
+  try {
+    const ac = new AbortController();
+    const p = runMise(
+      { name: "studio", misePath: m.path },
+      SUB_LS,
+      15,
+      ac.signal,
+    );
+    setTimeout(() => ac.abort(), 50);
+    // Without the check on the caller's signal this resolves to a tidy
+    // { ok: false, kind: "failed" } and the host takes the blame for the
+    // caller's decision.
+    await assertRejects(() => p);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a sweep cancelled mid-run writes nothing either", async () => {
+  const m = await slowFakeMise(5);
+  try {
+    const ac = new AbortController();
+    const c = mockCtx(
+      { nodes: [{ name: "studio", misePath: m.path }] },
+      { existing: ["tool-studio-go-1234abcd"], signal: ac.signal },
+    );
+    const run = model.methods.discover.execute({}, c.ctx);
+    setTimeout(() => ac.abort(), 50);
+    await assertRejects(() => run);
+    assertEquals(c.written, []);
+    assertEquals(c.deleted, []);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("cancellation is rethrown, never classified as a host failure", async () => {
+  // The branch inside runMise, on its own. misePath does not exist, so
+  // without the caller-signal check this returns a tidy notfound result and
+  // the sweep files a failure against a host it never spoke to.
+  const ac = new AbortController();
+  ac.abort();
+  await assertRejects(() =>
+    runMise(
+      { name: "studio", misePath: "/nonexistent/mise" },
+      SUB_LS,
+      15,
+      ac.signal,
+    )
+  );
+});
+
+Deno.test("a per-command timeout is still a host failure", async () => {
+  // The caller's signal and this model's own hard kill are composed with
+  // AbortSignal.any and raise the same shape of error, so only the caller's
+  // signal may be treated as cancellation. A host that ran out of time did
+  // fail to answer. timeoutSec is a plain parameter here, so a negative one
+  // makes the kill fire at once instead of making this test wait out the
+  // real eleven seconds.
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const caller = new AbortController();
+    const r = await runMise(
+      { name: "studio", misePath: m.path },
+      SUB_LS,
+      -10,
+      caller.signal,
+    );
+    assertEquals(r.ok, false);
+    assertEquals(!r.ok && r.kind, "failed", "a timeout is not a cancellation");
+    assertEquals(caller.signal.aborted, false, "the caller never cancelled");
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a host that ran mise and failed is recorded, not thrown", async () => {
+  // The other half of the timeout case, at the level where it gets written
+  // down: a run that failed for any reason other than the caller leaving
+  // still produces an unmeasured record with failureKind "failed".
+  const m = await fakeMise({
+    stderr: "error: config file is invalid toml",
+    exit: 1,
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.measured, false);
+    assertEquals(node.failureKind, "failed");
+    assertEquals(node.drift, ["unmeasured"]);
+  } finally {
+    await m.cleanup();
+  }
+});
+
 // ---- untrusted keys from a remote host -----------------------------------
 
 Deno.test("a hostile tool name cannot reach the prototype chain", async () => {
@@ -1080,6 +1230,27 @@ Deno.test("a host that could not be measured keeps its history", async () => {
 });
 
 // ---- schema discipline ----------------------------------------------------
+
+Deno.test("resource names carry sixty-four bits of hash", async () => {
+  // Tool names come off a remote host, and slugPart collapses punctuation
+  // runs, so the readable half hides a lot of variation. Thirty-two bits was
+  // a cheap search for a host looking to land on another host's record.
+  const m = await fakeMiseSuite({
+    ls: LS_CURRENT_CLEAN,
+    config: '[{"path":"/srv/project/mise.toml","tools":["node"]}]',
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const names = c.written
+      .filter((w) => w.spec !== "summary")
+      .map((w) => w.name);
+    assertEquals(names.length, 3, "one node, one tool, one config");
+    for (const n of names) assertMatch(n, /-[0-9a-f]{16}$/);
+  } finally {
+    await m.cleanup();
+  }
+});
 
 Deno.test("a misspelled drift class never reaches stored data", () => {
   const row = {

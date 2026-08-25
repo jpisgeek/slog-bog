@@ -115,8 +115,11 @@ export const GlobalArgsSchema = z.object({
     .describe(
       "Optional fleet-wide expectation, e.g. {node: '22'}. A version matches " +
         "when its dot-separated segments start with these, so '22' accepts " +
-        "22.23.2 but '22.2' does not. Omit it and each host is judged only " +
-        "against its own config.",
+        "22.23.2 but '22.2' does not. It judges only the tools a host's own " +
+        "config declares. A host whose config never mentions the tool cannot " +
+        "fail the expectation, and shows up under notinstalled or " +
+        "notineffect instead. Omit it and each host is judged only against " +
+        "its own config.",
     ),
 });
 
@@ -308,6 +311,10 @@ export type ParsedNode = z.infer<typeof NodeSchema>;
  * Only stderr is quoted back into the error. mise prints config contents on
  * stdout, and error strings end up in swamp run logs and reports, so stdout
  * stays out of them.
+ *
+ * Every host problem comes back as a RunResult. The one thing this throws is
+ * the caller's own cancellation, which is not an observation about the host
+ * at all and must never be written down as one.
  */
 export async function runMise(
   node: ParsedNode,
@@ -344,6 +351,17 @@ export async function runMise(
 
   try {
     const out = await cmd.output();
+    // Deno does not throw when a signal aborts a running command. It kills
+    // the child and hands back success: false with SIGTERM, which is the
+    // same shape as a host whose mise fell over on its own. So the caller's
+    // signal is asked here, before anything gets classified, and the throw
+    // goes straight back out through the catch below. Our own per-command
+    // kill is composed into the same signal with AbortSignal.any and cannot
+    // be told apart from the result, so only the caller's signal counts. A
+    // host that ran out of time did fail to answer, and stays a failure.
+    if (signal.aborted) {
+      throw signal.reason ?? new Error("run cancelled by the caller");
+    }
     const stderr = new TextDecoder().decode(out.stderr).trim();
     if (!out.success) {
       return {
@@ -354,6 +372,10 @@ export async function runMise(
     }
     return { ok: true, stdout: new TextDecoder().decode(out.stdout) };
   } catch (e) {
+    // Cancellation leaves by this door, whether it was raised just above or
+    // thrown by a spawn that never got off the ground. The caller pulling
+    // the run away says nothing about this host, so it is never classified.
+    if (signal.aborted) throw e;
     // Deno throws NotFound when the local binary itself is absent, which is
     // the same fact as a shell's 127 and must classify the same way.
     const msg = (e as Error).message;
@@ -618,14 +640,28 @@ const SummarySchema = z.object({
   sweptAt: z.string(),
 });
 
-/** Deterministic 32-bit FNV-1a, eight lowercase hex characters. */
+/**
+ * Deterministic 64-bit FNV-1a, sixteen lowercase hex characters.
+ *
+ * Sixty-four bits rather than thirty-two because tool names and config paths
+ * arrive from remote hosts, and slugPart collapses punctuation runs, so a
+ * compromised host can vary punctuation invisibly to the readable half of a
+ * name and hunt for a hash that lands on another host's record. Searching
+ * 2^32 for that is cheap. Searching 2^64 is not.
+ *
+ * BigInt keeps the whole thing synchronous and free of any import, which
+ * matters for an extension whose dependency list is deliberately empty. Each
+ * round is masked back to 64 bits, since BigInt itself has no width.
+ */
 function fnv1a(s: string): string {
-  let h = 0x811c9dc5;
+  const prime = 1099511628211n;
+  const mask = 0xffffffffffffffffn;
+  let h = 14695981039346656037n;
   for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
+    h ^= BigInt(s.charCodeAt(i));
+    h = (h * prime) & mask;
   }
-  return (h >>> 0).toString(16).padStart(8, "0");
+  return h.toString(16).padStart(16, "0");
 }
 
 /**
@@ -641,14 +677,17 @@ function identityKey(parts: string[]): string {
 }
 
 /**
- * Collision-safe resource name. Normalising alone is not injective: node
+ * Resource name built to resist collision. Normalising alone is not
+ * injective: node
  * "nas-01" with tool "go" and node "nas" with tool "01-go" flatten to the
  * same string, and the second write would quietly overwrite the first. mise
  * also keys backend-prefixed tools like "npm:prettier" and
  * "go:github.com/x/y", so a raw name can carry a path separator straight
  * into a resource name. The hash is taken over the raw parts, length-prefixed
- * so two different identities stay two different resources however alike
- * they look once flattened.
+ * so two different identities stay two different inputs however alike they
+ * look once flattened. Sixty-four bits of it makes an accidental collision
+ * negligible and puts a deliberate one out of casual reach. It is not a
+ * guarantee, and it is not a security boundary.
  */
 function resourceName(prefix: string, ...parts: string[]): string {
   const flat = parts.map(slugPart).join("-");
@@ -744,11 +783,13 @@ export const model = {
       description:
         "Ask every configured host what toolchain it is running and write " +
         "down where that disagrees with its own config. Read-only: nothing " +
-        "is installed, upgraded, or trusted. A full sweep prunes tool and " +
-        "config records that have departed. A single-node run never deletes " +
-        "anything, and neither does a host that came back unmeasured or only " +
-        "part measured, which keeps its stored rows rather than having them " +
-        "read as gone.",
+        "is installed, upgraded, or trusted. A full sweep deletes every " +
+        "stored record it did not write this time, which includes the node " +
+        "record of a host dropped from the config, not only departed tool " +
+        "and config rows. A single-node run never deletes anything, and " +
+        "neither does a host that came back unmeasured or only part " +
+        "measured, which keeps its stored rows rather than having them read " +
+        "as gone.",
       arguments: z.object({
         node: z.string().optional().describe("Limit the sweep to one node"),
       }),
@@ -780,6 +821,10 @@ export const model = {
         const queue = [...targets];
         const worker = async () => {
           for (;;) {
+            // A cancelled run stops taking hosts off the queue. Churning
+            // through the rest of the fleet only to throw the results away
+            // wastes ssh connections on a run nobody is waiting for.
+            if (ctx.signal.aborted) return;
             const node = queue.shift();
             if (!node) return;
             const transport = node.ssh ? "ssh" : "local";
@@ -946,10 +991,15 @@ export const model = {
                 drift: [...nodeDrift],
               });
             } catch (e) {
-              // One host's unexpected throw must not discard the fleet. The
-              // workers run under Promise.all, so an escaping error would
-              // take the whole sweep with it and nothing at all would be
-              // written, including for every host that answered.
+              // Cancellation is the caller taking the run away, not a fact
+              // about this host. It is the one throw that is allowed back
+              // out, so no record is invented for a host that was never
+              // given the chance to answer.
+              if (ctx.signal.aborted) throw e;
+              // Every other unexpected throw stays with the host it came
+              // from. The workers run under Promise.all, so an escaping
+              // error would take the whole sweep with it and nothing at all
+              // would be written, including for every host that answered.
               const msg = (e as Error)?.message ?? String(e);
               // Record first, log second. The logger is the one thing in here
               // that reaches outside this model, so it is also the one thing
@@ -982,6 +1032,16 @@ export const model = {
             worker,
           ),
         );
+
+        // The single choke point. Every write below this line happens after
+        // the whole fleet has been asked, so a run cancelled at any point up
+        // to here leaves the last good sweep exactly as it was. Writing now
+        // would replace it with a partial fleet, or with failure records for
+        // hosts that were never given a chance to answer.
+        if (ctx.signal.aborted) {
+          throw ctx.signal.reason ??
+            new Error("sweep cancelled before anything was written");
+        }
 
         // Every name written this sweep, and the names that must survive the
         // prune anyway. A host that could not be measured, or that answered
