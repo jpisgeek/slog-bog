@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-13 complete; Task 14 pending
+- **Phase:** VERIFY complete — Tasks 1-14 complete; REVIEW not started
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
-- **Build:** in progress
-- **Completed tasks:** 13 of 16
+- **Build:** complete
+- **Completed tasks:** 14 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 
@@ -64,7 +64,7 @@ Names are provisional until Task 1 proves the supported packaging shape.
 | `openai-usage` / `@jpisgeek/openai-usage`                   | model plus report      | Local OpenAI organization usage and cost                                                   |
 | `anthropic-usage` / `@jpisgeek/anthropic-usage`             | model plus report      | Local Anthropic organization/enterprise usage                                              |
 | `subscription-metadata` / `@jpisgeek/subscription-metadata` | model plus report      | Explicit plan metadata without invented quota                                              |
-| `lmstudio` / `@jpisgeek/lmstudio/daemon`                   | model                  | LM Studio headless-daemon state and loaded-model inventory                                 |
+| `lmstudio` / `@jpisgeek/lmstudio/daemon`                    | model                  | LM Studio headless-daemon state and loaded-model inventory                                 |
 | `dashboard-compose` / `@jpisgeek/dashboard-compose`         | workflow               | Optional composition of only user-selected pieces                                          |
 
 No package above may make every other package an installation dependency. The
@@ -297,12 +297,12 @@ generation tooling and without private host defaults.
 - Extend the local `@jpisgeek/lmstudio` package with an independently usable
   daemon model.
 - Use the supported `lms ps --json` surface on the llmster host, with optional
-  explicit `--host` remote mode, timeout, cancellation, and an argv-only
-  process invocation.
+  explicit `--host` remote mode, timeout, cancellation, and an argv-only process
+  invocation.
 - Preserve daemon reachability, exact loaded-model inventory, malformed output,
   missing CLI, and timeout as distinct states.
-- Declare point-in-time inventory coverage and never infer aggregate requests
-  or token accounting.
+- Declare point-in-time inventory coverage and never infer aggregate requests or
+  token accounting.
 - Normalize through `@jpisgeek/dashboard-lmstudio` into the existing local
   inference bundle shape.
 
@@ -330,6 +330,9 @@ omit at least one optional domain.
 ## P2 — whole-family verification and release preparation
 
 ### Task 14: Verify migration and family-level behavior
+
+**Status:** complete — the passing evidence and deferred release gates are
+recorded in [VERIFY.md](VERIFY.md).
 
 **Goal:** prove the implementation meets DEFINE as a coherent system.
 
