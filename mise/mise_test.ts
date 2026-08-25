@@ -388,7 +388,9 @@ type Json = Record<string, unknown>;
 
 /** Mock ctx capturing writeResource calls, as the dashboard tests do. */
 function mockCtx(globalArgs: Json) {
-  const written: Array<{ spec: string; name: string; data: Json }> = [];
+  const written: Array<
+    { spec: string; name: string; data: Json; opts: Json }
+  > = [];
   return {
     written,
     // deno-lint-ignore no-explicit-any
@@ -398,8 +400,8 @@ function mockCtx(globalArgs: Json) {
       modelType: "@jpisgeek/mise",
       modelId: "m1",
       logger: { info: () => {}, warning: () => {} },
-      writeResource: (spec: string, name: string, data: Json) => {
-        written.push({ spec, name, data });
+      writeResource: (spec: string, name: string, data: Json, opts?: Json) => {
+        written.push({ spec, name, data, opts: opts ?? {} });
         return Promise.resolve({});
       },
       deleteResource: () => Promise.resolve(),
@@ -457,6 +459,19 @@ Deno.test("a clean host writes tool rows with no drift", async () => {
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.measured, true);
     assertEquals(node.toolCount, 1);
+    const nodeWrite = c.written.find((w) => w.spec === "node")!;
+    const nodeTags =
+      (nodeWrite.opts as { tags?: Record<string, string> }).tags ?? {};
+    assertEquals(
+      nodeTags.measured,
+      "true",
+      "node resource must be tagged measured",
+    );
+    assertEquals(
+      nodeTags.transport,
+      "local",
+      "node resource must be tagged with its transport",
+    );
   } finally {
     await m.cleanup();
   }

@@ -457,7 +457,7 @@ const SummarySchema = z.object({
   tools: z.number(),
   notinstalled: z.number(),
   notactive: z.number(),
-  notineffect: z.number(),
+  configsNotInEffect: z.number(),
   outdated: z.number(),
   expected: z.number(),
   sweptAt: z.string(),
@@ -474,16 +474,23 @@ function fnv1a(s: string): string {
 }
 
 /**
- * Resource-name fragment for a config path. The hash is taken over the raw
- * path, so two paths that normalise to the same slug still land on different
- * resources instead of overwriting each other.
+ * Collision-safe resource name. Normalising alone is not injective: node
+ * "nas-01" with tool "go" and node "nas" with tool "01-go" flatten to the
+ * same string, and the second write would quietly overwrite the first. mise
+ * also keys backend-prefixed tools like "npm:prettier" and
+ * "go:github.com/x/y", so a raw name can carry a path separator straight
+ * into a resource name. The hash is taken over the raw parts joined by a
+ * separator that cannot occur inside them, so two different identities stay
+ * two different resources however alike they look once flattened.
  */
-function slug(path: string): string {
-  const s = path.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase().replace(
-    /^-+|-+$/g,
-    "",
-  );
-  return `${s || "config"}-${fnv1a(path)}`;
+function resourceName(prefix: string, ...parts: string[]): string {
+  const flat = parts
+    .map((p) =>
+      p.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase().replace(/^-+|-+$/g, "")
+    )
+    .filter((p) => p !== "")
+    .join("-");
+  return `${prefix}-${flat || "id"}-${fnv1a(parts.join(""))}`;
 }
 
 export const model = {
@@ -537,6 +544,13 @@ export const model = {
         const targets = args.node
           ? g.nodes.filter((n) => n.name === args.node)
           : g.nodes;
+        if (targets.length === 0) {
+          throw new Error(
+            `No node named '${args.node}'. Known: ${
+              g.nodes.map((n) => n.name).join(", ")
+            }`,
+          );
+        }
 
         ctx.logger.info("sweeping {n} host(s) for mise state", {
           n: targets.length,
@@ -572,7 +586,7 @@ export const model = {
                 // Deliberately false even when ssh itself connected and only
                 // mise was missing. The schema has no field for "answered but
                 // could not be measured", so `measured` carries that signal
-                // and `error` keeps the kind. See the plan's self-review note.
+                // and `error` keeps the kind.
                 reachable: false,
                 transport,
                 error: ls.error,
@@ -646,7 +660,9 @@ export const model = {
               reachable: true,
               transport,
               error: null,
-              miseVersion: ver.ok ? ver.stdout.trim().split(" ")[0] : null,
+              miseVersion: ver.ok
+                ? (ver.stdout.trim().split(" ")[0] || null)
+                : null,
               dir: node.dir ?? null,
               configCount: configs.length,
               toolCount: rows.length,
@@ -663,23 +679,40 @@ export const model = {
 
         for (const n of nodeStates) {
           handles.push(
-            await ctx.writeResource("node", `node-${n.name}`, n, {
-              tags: { measured: String(n.measured), transport: n.transport },
-            }),
+            await ctx.writeResource(
+              "node",
+              resourceName("node", n.name),
+              n,
+              {
+                tags: {
+                  measured: String(n.measured),
+                  transport: n.transport,
+                },
+              },
+            ),
           );
         }
         for (const t of toolStates) {
           handles.push(
-            await ctx.writeResource("tool", `tool-${t.node}-${t.tool}`, t, {
-              tags: { node: t.node, tool: t.tool, drift: t.drift.join(",") },
-            }),
+            await ctx.writeResource(
+              "tool",
+              resourceName("tool", t.node, t.tool),
+              t,
+              {
+                tags: {
+                  node: t.node,
+                  tool: t.tool,
+                  drift: t.drift.join(","),
+                },
+              },
+            ),
           );
         }
         for (const c of configStates) {
           handles.push(
             await ctx.writeResource(
               "config",
-              `config-${c.node}-${slug(c.path)}`,
+              resourceName("config", c.node, c.path),
               c,
               { tags: { node: c.node } },
             ),
@@ -696,7 +729,7 @@ export const model = {
             tools: toolStates.length,
             notinstalled: count("notinstalled"),
             notactive: count("notactive"),
-            notineffect: configStates.filter((c) =>
+            configsNotInEffect: configStates.filter((c) =>
               c.toolsNotInEffect.length > 0
             ).length,
             outdated: count("outdated"),
