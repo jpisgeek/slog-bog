@@ -9,7 +9,7 @@ dashboards) belong in your own models, not here.
 
 | Extension                     | Version        | Source                                     | What it is                                                                                                              |
 | ----------------------------- | -------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `@jpisgeek/dashboard`         | `2026.08.22.2` | [`dashboard/`](dashboard/)                 | Renders a self-contained HTML status page from resources other collector models have already written.                   |
+| `@jpisgeek/dashboard`         | `2026.08.25.1` | [`dashboard/`](dashboard/)                 | Renders explicit provider-neutral dashboard bundle v1 inputs as a self-contained, exceptions-first HTML status page.    |
 | `@jpisgeek/dashboard-homelab` | `2026.08.25.1` | [`dashboard-homelab/`](dashboard-homelab/) | Provider-neutral dashboard bundle adapter for the local Netdata, TrueNAS, and Firewalla collector contracts.            |
 | `@jpisgeek/firewalla`         | `2026.08.22.2` | [`firewalla/`](firewalla/)                 | Device and machine inventory from the Firewalla MSP API.                                                                |
 | `@jpisgeek/lmstudio`          | `2026.08.23.1` | [`lmstudio/`](lmstudio/)                   | Probe and validate an OpenAI-compatible inference endpoint before you trust it.                                         |

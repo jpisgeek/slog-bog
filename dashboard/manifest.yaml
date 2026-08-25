@@ -1,8 +1,8 @@
 manifestVersion: 1
 name: "@jpisgeek/dashboard"
-version: 2026.08.22.2
+version: 2026.08.25.1
 description: >
-  Renders a self-contained HTML status page from resources other collector models have already written. Collects nothing itself and reaches no network. If a source model has not run, the page says so rather than inventing a value.
+  Renders explicit provider-neutral dashboard bundle v1 inputs as a self-contained, exceptions-first HTML status page. Performs no source discovery and reaches no network. Missing, invalid, stale, partial, unsupported, and unauthorized coverage remains visible.
 repository: https://github.com/jpisgeek/slog-bog/tree/main/dashboard
 paths:
   base: manifest
@@ -23,5 +23,5 @@ labels:
   - dashboard
   - html
   - reporting
-  - homelab
+  - bundles
 dependencies: []

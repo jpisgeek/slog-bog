@@ -2,45 +2,30 @@ package: "@jpisgeek/dashboard"
 types:
   - "@jpisgeek/dashboard"
 purpose: >-
-  Renders one self-contained, exceptions-first HTML status page from resources
-  other collector models have already written. Collects nothing, reaches no
-  network; if a source has never run, the page says so instead of inventing a
-  value. Each exception is also written back as a resource so alerting can be
-  built on the same evaluation.
+  Renders explicit provider-neutral dashboard bundle v1 values as one
+  self-contained, exceptions-first HTML status page. It performs no provider
+  discovery and reaches no network. Missing, invalid, stale, partial,
+  unsupported, and unauthorized inputs remain visible. Each exception is also
+  written as a queryable resource.
 example: |
   globalArguments:
-    title: Homelab
-    sources:
-      - name: telemetry
-        type: '@jpisgeek/netdata'
-        id: <id from `swamp model get <your-netdata-model> --json`>
-      - name: nas
-        type: '@jpisgeek/truenas'
-        id: <id from `swamp model get <your-truenas-model> --json`>
-      - name: firewalla
-        type: '@jpisgeek/firewalla'
-        id: <id from `swamp model get <your-firewalla-model> --json`>
-      - name: homelab
-        type: '@swamp/ssh'
-        id: <id from `swamp model get <your-ssh-fleet-model> --json`>
+    title: Operations
+    bundles:
+      - ${{ data.latest("netdata", "report-jpisgeek-dashboard-homelab-json").attributes }}
+      - ${{ data.latest("truenas", "report-jpisgeek-dashboard-homelab-json").attributes }}
+      - ${{ data.latest("firewalla", "report-jpisgeek-dashboard-homelab-json").attributes }}
     outputPath: ./dashboard/index.html
-    diskWarnPercent: 85
-    certWarnDays: 30
     suppress:
-      - id: unreachable:printer
-        reason: powered off outside business hours, expected
+      - id: condition:accepted-maintenance
+        reason: approved maintenance window
 caveats: >-
-  The exception rules key off the literal source aliases `telemetry`, `nas`,
-  `homelab`, `firewalla` (paired with `@jpisgeek/netdata`, `@jpisgeek/truenas`,
-  `@swamp/ssh`, `@jpisgeek/firewalla`). A misspelled alias does not error.
-  That source's exceptions just never evaluate, which is why the
-  `known-source-aliases` check fails a run missing one of the four (skippable
-  with `--skip-check`). This is the opinionated member of the family: a
-  reference dashboard for that specific collector set, not a generic renderer.
-  Delivery is out of scope. It writes a file, ship it with `@swamp/ssh copy`
-  or similar.
+  The renderer accepts bundle v1 only. Unsupported major versions and invalid
+  values render as visible coverage exceptions instead of aborting or becoming
+  healthy. It does not enumerate models or infer which adapters are installed.
+  Delivery remains separate: compose the generated file with the transport
+  model appropriate for the deployment.
 security: >-
-  No network, no credentials. Every interpolated value is HTML-escaped. The
-  rendered page lists machine names, addresses, mounts, and certificate names
-  from your collectors. If you publish it to a web server, put it behind
-  authentication or on a trusted network.
+  No network, credentials, vault, process, environment, or cross-model
+  repository access. Every bundle-derived string is HTML-escaped. Bundle
+  sensitivity metadata does not itself enforce access control; protect any
+  published dashboard according to the operational data it contains.
