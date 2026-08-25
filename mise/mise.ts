@@ -522,10 +522,21 @@ export function parseConfigLs(
   return out;
 }
 
-/** Tool name to its latest version, for whatever mise reports as behind. */
+/**
+ * Tool name to its latest version, for whatever mise reports as behind.
+ *
+ * The accumulator is built with no prototype, because every key in it is a
+ * tool name a remote host chose. On a plain object, a lookup that misses
+ * walks up to Object.prototype and hands back a function for "constructor"
+ * or "toString", which is how a remote tool name gets something other than a
+ * version out of a map typed as versions. With no prototype there is nowhere
+ * for a lookup to walk, so anything read back is something this parser put
+ * there. Callers still use Object.hasOwn, and now they are not the only
+ * thing standing in the way.
+ */
 export function parseOutdated(json: string): Record<string, string | null> {
   const obj = parseJson<Record<string, unknown>>(json, {});
-  const out: Record<string, string | null> = {};
+  const out: Record<string, string | null> = Object.create(null);
   for (const [tool, v] of Object.entries(obj)) {
     const rec = v as Record<string, unknown>;
     out[tool] = str(rec?.latest);
@@ -539,7 +550,10 @@ export function parseOutdated(json: string): Record<string, string | null> {
  * applies, so trust is never a drift trigger on its own.
  */
 export function parseTrustShow(text: string): Record<string, boolean> {
-  const out: Record<string, boolean> = {};
+  // No prototype here either. These keys are config paths from the same
+  // remote host, so a lookup that misses must come back empty rather than
+  // walking up to Object.prototype and finding a function.
+  const out: Record<string, boolean> = Object.create(null);
   for (const line of text.split("\n")) {
     const idx = line.lastIndexOf(": ");
     if (idx === -1) continue;
@@ -589,7 +603,12 @@ const NodeStateSchema = z.object({
   transport: z.string(),
   error: z.string().nullable(),
   miseVersion: z.string().nullable(),
-  /** The directory the reading came from. null means wherever an ssh login lands. */
+  /**
+   * The directory the reading came from. null has two causes: an ssh node
+   * with no dir set, where the reading comes from wherever the login lands,
+   * and a local node whose working directory could not be read, which
+   * happens when the directory swamp started in has since been deleted.
+   */
   dir: z.string().nullable(),
   configCount: z.number().nullable(),
   toolCount: z.number().nullable(),
@@ -679,9 +698,9 @@ function identityKey(parts: string[]): string {
 
 /**
  * Resource name built to resist collision. Normalising alone is not
- * injective: node
- * "nas-01" with tool "go" and node "nas" with tool "01-go" flatten to the
- * same string, and the second write would quietly overwrite the first. mise
+ * injective: node "builder-01" with tool "go" and node "builder" with tool
+ * "01-go" flatten to the same string, and the second write would quietly
+ * overwrite the first. mise
  * also keys backend-prefixed tools like "npm:prettier" and
  * "go:github.com/x/y", so a raw name can carry a path separator straight
  * into a resource name. The hash is taken over the raw parts, length-prefixed
@@ -753,8 +772,9 @@ export const model = {
       description:
         "One record per host: whether mise answered at all, whether it " +
         "answered in full, which directory the reading came from, and how " +
-        "much drift was found there. A null dir means an ssh node with no " +
-        "dir set, where the reading comes from wherever the login lands.",
+        "much drift was found there. A null dir is either an ssh node with " +
+        "no dir set, where the reading comes from wherever the login lands, " +
+        "or a local node whose working directory could not be read.",
       schema: NodeStateSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
@@ -793,7 +813,8 @@ export const model = {
         "and config rows. A single-node run never deletes anything, and " +
         "neither does a host that came back unmeasured or only part " +
         "measured, which keeps its stored rows rather than having them read " +
-        "as gone.",
+        "as gone, and which does not rewrite the fleet summary from one " +
+        "host's worth of data.",
       arguments: z.object({
         node: z.string().optional().describe("Limit the sweep to one node"),
       }),
@@ -1117,32 +1138,41 @@ export const model = {
           );
         }
 
-        const count = (d: Drift) =>
-          toolStates.filter((t) => t.drift.includes(d)).length;
-        const degradedCount = nodeStates.filter((n) => n.degraded).length;
-        handles.push(
-          await ctx.writeResource("summary", "summary", {
-            nodes: nodeStates.length,
-            nodesMeasured: nodeStates.filter((n) => n.measured).length,
-            nodesUnmeasured: nodeStates.filter((n) => !n.measured).length,
-            nodesDegraded: degradedCount,
-            tools: toolStates.length,
-            notinstalled: count("notinstalled"),
-            notactive: count("notactive"),
-            configsNotInEffect: configStates.filter((c) =>
-              c.toolsNotInEffect.length > 0
-            ).length,
-            outdated: count("outdated"),
-            expected: count("expected"),
-            sweptAt: new Date().toISOString(),
-          }, {
-            tags: {
-              nodes: String(nodeStates.length),
-              nodesDegraded: String(degradedCount),
-            },
-          }),
-        );
-        live.add("summary");
+        // The summary is a fleet record under a fixed name, so only a sweep
+        // of the whole fleet may write it. A targeted run is a diagnostic
+        // that touches the host it names and nothing else, the same reason
+        // it prunes nothing. One host's totals filed under a fleet name read
+        // as the fleet, and only `nodes: 1` would hint otherwise. Leaving the
+        // standing record alone keeps its own sweptAt on show, which says how
+        // old it is plainly enough.
+        if (!args.node) {
+          const count = (d: Drift) =>
+            toolStates.filter((t) => t.drift.includes(d)).length;
+          const degradedCount = nodeStates.filter((n) => n.degraded).length;
+          handles.push(
+            await ctx.writeResource("summary", "summary", {
+              nodes: nodeStates.length,
+              nodesMeasured: nodeStates.filter((n) => n.measured).length,
+              nodesUnmeasured: nodeStates.filter((n) => !n.measured).length,
+              nodesDegraded: degradedCount,
+              tools: toolStates.length,
+              notinstalled: count("notinstalled"),
+              notactive: count("notactive"),
+              configsNotInEffect: configStates.filter((c) =>
+                c.toolsNotInEffect.length > 0
+              ).length,
+              outdated: count("outdated"),
+              expected: count("expected"),
+              sweptAt: new Date().toISOString(),
+            }, {
+              tags: {
+                nodes: String(nodeStates.length),
+                nodesDegraded: String(degradedCount),
+              },
+            }),
+          );
+          live.add("summary");
+        }
 
         // Prune only on a full sweep. A single-node run legitimately sees one
         // host's worth of resources, so it deletes nothing. Without this the

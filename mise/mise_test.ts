@@ -398,6 +398,25 @@ Deno.test("trust --show parses the path-colon-status lines", () => {
   assertEquals(parseTrustShow(""), {});
 });
 
+Deno.test("maps keyed by remote names have nothing behind them", () => {
+  // A miss on a plain object walks up to Object.prototype, so a tool named
+  // "constructor" reads back a function from a map whose type says string.
+  // These maps are keyed entirely by names a remote host chose, so they are
+  // built with no prototype and a miss is a miss.
+  const o = parseOutdated('{"node":{"latest":"24.1.0"}}');
+  assertEquals(Object.getPrototypeOf(o), null);
+  assertEquals(o["constructor"], undefined);
+  assertEquals(o.node, "24.1.0");
+  const t = parseTrustShow("/srv/project: untrusted\n");
+  assertEquals(Object.getPrototypeOf(t), null);
+  assertEquals(t["constructor"], undefined);
+  assertEquals(t["/srv/project"], false);
+  // a key literally named __proto__ is recorded as a key, not acted on
+  const p = parseOutdated('{"__proto__":{"latest":"9.9.9"}}');
+  assertEquals(Object.hasOwn(p, "__proto__"), true);
+  assertEquals(({} as Record<string, unknown>).latest, undefined);
+});
+
 Deno.test("a declared tool absent from ls --current is notineffect", () => {
   // the config asks for three, mise reports two: the third never took
   assertEquals(
@@ -1196,6 +1215,46 @@ Deno.test("a single-node run never deletes anything", async () => {
     );
     await model.methods.discover.execute({ node: "workstation" }, c.ctx);
     assertEquals(c.deleted, [], "a filtered run legitimately sees a subset");
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a single-node run leaves the fleet summary alone", async () => {
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const c = mockCtx({
+      nodes: [
+        { name: "workstation", misePath: m.path },
+        { name: "builder", misePath: m.path },
+      ],
+    });
+    await model.methods.discover.execute({ node: "workstation" }, c.ctx);
+    // summary sits under a fixed name and says "fleet". One host's totals
+    // written there read as the whole fleet, with only nodes: 1 to hint
+    // otherwise. The standing record keeps its own sweptAt instead.
+    assertEquals(
+      c.written.filter((w) => w.spec === "summary").length,
+      0,
+      "a targeted run must not rewrite a fleet record",
+    );
+    assertEquals(
+      c.written.filter((w) => w.spec === "node").length,
+      1,
+      "the host it named is still written",
+    );
+    assertEquals(c.written.filter((w) => w.spec === "tool").length, 1);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a full sweep still writes the fleet summary", async () => {
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    assertEquals(c.written.filter((w) => w.spec === "summary").length, 1);
   } finally {
     await m.cleanup();
   }

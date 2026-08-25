@@ -46,7 +46,8 @@ trusted. A full sweep deletes every stored record it did not write this time,
 which includes the node record of a host dropped from the config, not only
 departed tool and config rows. A single-node run never deletes anything, and
 neither does a host that came back unmeasured or only part measured, which keeps
-its stored rows rather than having them read as gone.
+its stored rows rather than having them read as gone, and which does not rewrite
+the fleet summary from one host's worth of data.
 
 | argument | type   | required | default | description                 |
 | -------- | ------ | -------- | ------- | --------------------------- |
@@ -54,12 +55,12 @@ its stored rows rather than having them read as gone.
 
 ### Data written
 
-| resource  | lifetime | fields                                                                                                                                                        | description                                                                                                                                                                                                                                                     |
-| --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `node`    | infinite | `name`, `measured`, `degraded`, `failedSubcommands`, `failureKind`, `transport`, `error`, `miseVersion`, `dir`, `configCount`, `toolCount`, `drift`           | One record per host: whether mise answered at all, whether it answered in full, which directory the reading came from, and how much drift was found there. A null dir means an ssh node with no dir set, where the reading comes from wherever the login lands. |
-| `tool`    | infinite | `node`, `tool`, `requestedVersion`, `resolvedVersion`, `installPath`, `sourceType`, `sourcePath`, `installed`, `active`, `outdated`, `latestVersion`, `drift` | One record per tool per host: what the config asked for, what the host resolved it to, and whether it is installed, active, or behind.                                                                                                                          |
-| `config`  | infinite | `node`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                               | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                                                                                                                                                      |
-| `summary` | infinite | `nodes`, `nodesMeasured`, `nodesUnmeasured`, `nodesDegraded`, `tools`, `notinstalled`, `notactive`, `configsNotInEffect`, `outdated`, `expected`, `sweptAt`   | Fleet totals for the most recent sweep.                                                                                                                                                                                                                         |
+| resource  | lifetime | fields                                                                                                                                                        | description                                                                                                                                                                                                                                                                                                                    |
+| --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `node`    | infinite | `name`, `measured`, `degraded`, `failedSubcommands`, `failureKind`, `transport`, `error`, `miseVersion`, `dir`, `configCount`, `toolCount`, `drift`           | One record per host: whether mise answered at all, whether it answered in full, which directory the reading came from, and how much drift was found there. A null dir is either an ssh node with no dir set, where the reading comes from wherever the login lands, or a local node whose working directory could not be read. |
+| `tool`    | infinite | `node`, `tool`, `requestedVersion`, `resolvedVersion`, `installPath`, `sourceType`, `sourcePath`, `installed`, `active`, `outdated`, `latestVersion`, `drift` | One record per tool per host: what the config asked for, what the host resolved it to, and whether it is installed, active, or behind.                                                                                                                                                                                         |
+| `config`  | infinite | `node`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                               | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                                                                                                                                                                                                                     |
+| `summary` | infinite | `nodes`, `nodesMeasured`, `nodesUnmeasured`, `nodesDegraded`, `tools`, `notinstalled`, `notactive`, `configsNotInEffect`, `outdated`, `expected`, `sweptAt`   | Fleet totals for the most recent sweep.                                                                                                                                                                                                                                                                                        |
 
 ## Example
 
@@ -106,17 +107,24 @@ so `dir` decides which config is being judged. Leave it off and you measure the
 swamp working directory locally and the login directory over SSH, which is
 rarely the question you meant to ask. The node record's `dir` field names the
 directory the reading actually came from, so what a sweep judged is never left
-to guesswork. Trust is recorded but never treated as drift. A plain `[tools]`
-file reports as untrusted while applying perfectly, because mise only demands
-trust for configs that can execute something. `expect` can only police tools a
-host's own config declares. Hold the fleet to `{node: "22"}` and a host whose
-config never mentions node records no `expected` drift at all, which is not the
-same as passing. A tool no config on that host declares produces no record for
-that host at all, so its absence is invisible in the drift counts rather than
-surfacing under some other class. To hold a host to a tool, the tool has to be
-in that host's config. A full sweep deletes every stored record it did not write
-that time, so dropping a host from `nodes` removes its node record along with
-its tool and config rows. Node, tool, and config resource names all carry a hash
+to guesswork. It is null in two cases: an ssh node with no `dir` set, where the
+reading comes from wherever the login lands, and a local node whose working
+directory could not be read, which is what a deleted working directory looks
+like. Trust is recorded but never treated as drift. A plain `[tools]` file
+reports as untrusted while applying perfectly, because mise only demands trust
+for configs that can execute something. `expect` can only police tools a host's
+own config declares. Hold the fleet to `{node: "22"}` and a host whose config
+never mentions node records no `expected` drift at all, which is not the same as
+passing. A tool no config on that host declares produces no record for that host
+at all, so its absence is invisible in the drift counts rather than surfacing
+under some other class. To hold a host to a tool, the tool has to be in that
+host's config. A full sweep deletes every stored record it did not write that
+time, so dropping a host from `nodes` removes its node record along with its
+tool and config rows. A run limited to one node with `--node` is a diagnostic
+and touches only that host. It deletes nothing, and it does not write the
+`summary` either, because one host's totals under a fleet-wide name would read
+as the fleet. The standing summary keeps its own `sweptAt`, which is the honest
+way to see how old it is. Node, tool, and config resource names all carry a hash
 suffix, so find them with `swamp data list <model>` rather than building the
 name by hand.
 
