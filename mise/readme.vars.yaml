@@ -53,11 +53,13 @@ caveats: >-
   from, so what a sweep judged is never left to guesswork.
   Trust is recorded but never treated as drift. A plain `[tools]` file reports
   as untrusted while applying perfectly, because mise only demands trust for
-  configs that can execute something. `expect` judges only the tools a host's
+  configs that can execute something. `expect` can only police tools a host's
   own config declares. Hold the fleet to `{node: "22"}` and a host whose
   config never mentions node records no `expected` drift at all, which is not
-  the same as passing. That host turns up under `notinstalled` or
-  `notineffect` instead. A full sweep deletes every stored record it did not
+  the same as passing. A tool no config on that host declares produces no
+  record for that host at all, so its absence is invisible in the drift
+  counts rather than surfacing under some other class. To hold a host to a
+  tool, the tool has to be in that host's config. A full sweep deletes every stored record it did not
   write that time, so dropping a host from `nodes` removes its node record
   along with its tool and config rows. Node, tool, and config resource names
   all carry a hash suffix, so find them with `swamp data list <model>` rather

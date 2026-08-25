@@ -1233,8 +1233,8 @@ Deno.test("a host that could not be measured keeps its history", async () => {
 
 Deno.test("resource names carry sixty-four bits of hash", async () => {
   // Tool names come off a remote host, and slugPart collapses punctuation
-  // runs, so the readable half hides a lot of variation. Thirty-two bits was
-  // a cheap search for a host looking to land on another host's record.
+  // runs, so the readable half hides a lot of variation. The hash is what
+  // keeps two of those apart.
   const m = await fakeMiseSuite({
     ls: LS_CURRENT_CLEAN,
     config: '[{"path":"/srv/project/mise.toml","tools":["node"]}]',
@@ -1247,6 +1247,67 @@ Deno.test("resource names carry sixty-four bits of hash", async () => {
       .map((w) => w.name);
     assertEquals(names.length, 3, "one node, one tool, one config");
     for (const n of names) assertMatch(n, /-[0-9a-f]{16}$/);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+/**
+ * Two tool names that flatten to the same readable text and collide under a
+ * short non-cryptographic hash. Found by searching punctuation variants
+ * against 32-bit FNV-1a, the hash this model shipped with first: both give
+ * c395a465 over their length-prefixed identity, so both wrote to the one
+ * resource name and the second sweep entry silently replaced the first.
+ * Exactly the trick a compromised host would use to bury another host's row.
+ */
+const COLLIDING_TOOLS = [
+  "npm.prettier.-plugin-.sort_imports__v2",
+  "npm--prettier._plugin__sort..imports_v2",
+];
+
+Deno.test("two identities that collide under a weak hash stay apart", async () => {
+  const entry = '[{"version":"3.6.2","requested_version":"3","installed":' +
+    'true,"active":true,"source":{"type":"mise.toml","path":' +
+    '"/srv/project/mise.toml"}}]';
+  const m = await fakeMiseSuite({
+    ls: `{${
+      COLLIDING_TOOLS.map((t) => `${JSON.stringify(t)}:${entry}`).join(",")
+    }}`,
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const tools = c.written.filter((w) => w.spec === "tool");
+    assertEquals(tools.length, 2, "both tools must be written");
+    // Same readable half by construction. Only the hash separates them, and
+    // under the old one it did not: one name, one surviving row, one tool
+    // quietly gone from the reading.
+    assertEquals(
+      new Set(tools.map((t) => t.name.replace(/-[0-9a-f]{16}$/, ""))).size,
+      1,
+      "the fixture is only meaningful if the readable halves match",
+    );
+    assertEquals(
+      new Set(tools.map((t) => t.name)).size,
+      2,
+      "two identities, two resource names",
+    );
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("the same identity always names the same resource", async () => {
+  // Collision resistance is worthless if the name wanders between sweeps.
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const names = [] as string[];
+    for (let i = 0; i < 2; i++) {
+      const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+      await model.methods.discover.execute({}, c.ctx);
+      names.push(c.written.find((w) => w.spec === "tool")!.name);
+    }
+    assertEquals(names[0], names[1]);
   } finally {
     await m.cleanup();
   }

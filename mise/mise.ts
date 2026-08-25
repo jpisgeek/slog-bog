@@ -115,11 +115,11 @@ export const GlobalArgsSchema = z.object({
     .describe(
       "Optional fleet-wide expectation, e.g. {node: '22'}. A version matches " +
         "when its dot-separated segments start with these, so '22' accepts " +
-        "22.23.2 but '22.2' does not. It judges only the tools a host's own " +
-        "config declares. A host whose config never mentions the tool cannot " +
-        "fail the expectation, and shows up under notinstalled or " +
-        "notineffect instead. Omit it and each host is judged only against " +
-        "its own config.",
+        "22.23.2 but '22.2' does not. It can only police tools a host's own " +
+        "config declares. A tool no config on that host mentions produces no " +
+        "record for that host at all, so expect never flags it and its " +
+        "absence is not visible in the drift counts. Omit it and each host " +
+        "is judged only against its own config.",
     ),
 });
 
@@ -641,27 +641,28 @@ const SummarySchema = z.object({
 });
 
 /**
- * Deterministic 64-bit FNV-1a, sixteen lowercase hex characters.
+ * The leading sixty-four bits of SHA-256, as sixteen lowercase hex
+ * characters.
  *
- * Sixty-four bits rather than thirty-two because tool names and config paths
- * arrive from remote hosts, and slugPart collapses punctuation runs, so a
- * compromised host can vary punctuation invisibly to the readable half of a
- * name and hunt for a hash that lands on another host's record. Searching
- * 2^32 for that is cheap. Searching 2^64 is not.
+ * Tool names and config paths arrive from remote hosts, and slugPart
+ * collapses punctuation runs, so a host can vary punctuation invisibly to the
+ * readable half of a name and go hunting for a hash that lands on another
+ * host's record. Against a short non-cryptographic hash that hunt is a
+ * feasible search. Against a truncated SHA-256 it is not, because there is no
+ * shortcut from a target digest back to an input.
  *
- * BigInt keeps the whole thing synchronous and free of any import, which
- * matters for an extension whose dependency list is deliberately empty. Each
- * round is masked back to 64 bits, since BigInt itself has no width.
+ * `crypto.subtle` is a global Web API, so this stays true to a dependency
+ * list that is deliberately empty. It is async, which is the only reason
+ * resourceName is.
  */
-function fnv1a(s: string): string {
-  const prime = 1099511628211n;
-  const mask = 0xffffffffffffffffn;
-  let h = 14695981039346656037n;
-  for (let i = 0; i < s.length; i++) {
-    h ^= BigInt(s.charCodeAt(i));
-    h = (h * prime) & mask;
-  }
-  return h.toString(16).padStart(16, "0");
+async function shortHash(s: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(s),
+  );
+  return Array.from(new Uint8Array(digest).subarray(0, 8))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 /**
@@ -685,13 +686,16 @@ function identityKey(parts: string[]): string {
  * "go:github.com/x/y", so a raw name can carry a path separator straight
  * into a resource name. The hash is taken over the raw parts, length-prefixed
  * so two different identities stay two different inputs however alike they
- * look once flattened. Sixty-four bits of it makes an accidental collision
- * negligible and puts a deliberate one out of casual reach. It is not a
- * guarantee, and it is not a security boundary.
+ * look once flattened, and it is collision-resistant, so two different
+ * inputs stay two different names even when a host is choosing its tool
+ * names to make them collide.
  */
-function resourceName(prefix: string, ...parts: string[]): string {
+async function resourceName(
+  prefix: string,
+  ...parts: string[]
+): Promise<string> {
   const flat = parts.map(slugPart).join("-");
-  return `${prefix}-${flat || "id"}-${fnv1a(identityKey(parts))}`;
+  return `${prefix}-${flat || "id"}-${await shortHash(identityKey(parts))}`;
 }
 
 /**
@@ -1051,7 +1055,7 @@ export const model = {
         const protectedPrefixes: string[] = [];
 
         for (const n of nodeStates) {
-          const name = resourceName("node", n.name);
+          const name = await resourceName("node", n.name);
           live.add(name);
           if (!n.measured || n.degraded) {
             protectedPrefixes.push(
@@ -1082,7 +1086,7 @@ export const model = {
           nodeStates.filter((n) => n.degraded).map((n) => n.name),
         );
         for (const t of toolStates) {
-          const name = resourceName("tool", t.node, t.tool);
+          const name = await resourceName("tool", t.node, t.tool);
           live.add(name);
           handles.push(
             await ctx.writeResource(
@@ -1101,7 +1105,7 @@ export const model = {
           );
         }
         for (const c of configStates) {
-          const name = resourceName("config", c.node, c.path);
+          const name = await resourceName("config", c.node, c.path);
           live.add(name);
           handles.push(
             await ctx.writeResource(
