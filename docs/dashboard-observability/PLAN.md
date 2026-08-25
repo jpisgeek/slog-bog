@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-11 complete; Task 12 pending
+- **Phase:** BUILD — Tasks 1-12 complete; Task 13 pending
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
 - **Build:** in progress
-- **Completed tasks:** 11 of 16
+- **Completed tasks:** 12 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 
@@ -64,7 +64,7 @@ Names are provisional until Task 1 proves the supported packaging shape.
 | `openai-usage` / `@jpisgeek/openai-usage`                   | model plus report      | Local OpenAI organization usage and cost                                                   |
 | `anthropic-usage` / `@jpisgeek/anthropic-usage`             | model plus report      | Local Anthropic organization/enterprise usage                                              |
 | `subscription-metadata` / `@jpisgeek/subscription-metadata` | model plus report      | Explicit plan metadata without invented quota                                              |
-| `ollama-observability` / `@jpisgeek/ollama-observability`   | model plus report      | Ollama health, inventory, request metrics, and coverage                                    |
+| `lmstudio` / `@jpisgeek/lmstudio/daemon`                   | model                  | LM Studio headless-daemon state and loaded-model inventory                                 |
 | `dashboard-compose` / `@jpisgeek/dashboard-compose`         | workflow               | Optional composition of only user-selected pieces                                          |
 
 No package above may make every other package an installation dependency. The
@@ -281,22 +281,34 @@ paginated, partial, and malformed responses.
 **Verify:** tests prove unknown limits remain absent, zero is preserved only
 when explicitly supplied, and plan price never becomes usage cost.
 
-### Task 12: Build local Ollama observability
+### Task 12: Build LM Studio headless-daemon observability
 
-**Goal:** fulfill the local inference contract for Ollama independently of
-generation tooling.
+**Status:** complete — implementation and evidence are recorded in
+[lmstudio-daemon.md](lmstudio-daemon.md).
 
-- Re-run registry/type search and inspect `@keeb/ollama` before coding.
-- Use supported Ollama APIs for health, model inventory, loaded models, and
-  per-request token/timing metrics that are actually reported.
-- Declare aggregation coverage; do not infer totals from unobserved traffic.
-- Extend the community type only if its exact runtime contract fits and doing so
-  does not force generation dependencies on dashboard-only users; otherwise
-  publish the local observability collector.
-- Normalize into the same local-inference bundle shape as LM Studio.
+**Plan amendment (operator directed 2026-08-25):** the active runtime is LM
+Studio on a remote Mac Studio, not Ollama. Keep Ollama first-class in the
+provider-neutral contract, but defer an Ollama-specific adapter until it is an
+actual operator requirement.
 
-**Verify:** mocked tests cover endpoint down, no models, load/unload state,
-successful inference metrics, malformed metrics, partial coverage, and timeout.
+**Goal:** observe the Mac Studio's LM Studio headless daemon independently of
+generation tooling and without private host defaults.
+
+- Extend the local `@jpisgeek/lmstudio` package with an independently usable
+  daemon model.
+- Use the supported `lms ps --json` surface on the llmster host, with optional
+  explicit `--host` remote mode, timeout, cancellation, and an argv-only
+  process invocation.
+- Preserve daemon reachability, exact loaded-model inventory, malformed output,
+  missing CLI, and timeout as distinct states.
+- Declare point-in-time inventory coverage and never infer aggregate requests
+  or token accounting.
+- Normalize through `@jpisgeek/dashboard-lmstudio` into the existing local
+  inference bundle shape.
+
+**Verify:** mocked tests cover remote daemon down, no loaded models, loaded
+models, malformed JSON, missing CLI, partial coverage, timeout, and caller
+cancellation. Do not contact the private Mac Studio during public BUILD.
 
 ### Task 13: Add optional composition workflows and examples
 

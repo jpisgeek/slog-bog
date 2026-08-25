@@ -1,9 +1,10 @@
 manifestVersion: 1
 name: "@jpisgeek/dashboard-lmstudio"
-version: 2026.08.25.1
+version: 2026.08.25.2
 description: >
-  Provider-neutral dashboard adapter for @jpisgeek/lmstudio endpoint and
-  per-request probes. Preserves reachability, authorization, model capability,
+  Provider-neutral dashboard adapter for @jpisgeek/lmstudio endpoint,
+  headless daemon, and per-request probes. Preserves reachability,
+  authorization, loaded models, model capability,
   finish reason, token usage, context exhaustion, output limits, and timing
   without presenting instrumented requests as aggregate accounting.
 repository: https://github.com/jpisgeek/slog-bog/tree/main/dashboard-lmstudio

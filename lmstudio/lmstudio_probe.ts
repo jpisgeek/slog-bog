@@ -998,7 +998,7 @@ async function capabilities(
  */
 export const model = {
   type: "@jpisgeek/lmstudio/probe",
-  version: "2026.08.23.1",
+  version: "2026.08.25.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {

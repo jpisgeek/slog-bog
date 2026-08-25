@@ -9,7 +9,7 @@ llama.cpp server, a gateway in front of one) before you trust it in a workflow.
 reasoning-budget and context-exhaustion diagnostics, and a short capability
 battery.
 
-**Version** `2026.08.23.1` · **License** MIT · **Source**
+**Version** `2026.08.25.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/lmstudio
 
 ## Install
@@ -119,6 +119,31 @@ remaining capabilities absent.
 | `completionProbe` | infinite | `model`, `latencyMs`, `httpStatus`, `finishReason`, `promptTokens`, `completionTokens`, `totalTokens`, `reasoningTokens`, `reasoningChars`, `contentChars`, `emptyContentWithReasoning`, `contextExhausted`, `maxTokensHit`, `errorKind`, `error`, `checkedAt` | One chat completion probe, with reasoningTokens/reasoningChars, emptyContentWithReasoning, and a heuristic contextExhausted flag that distinguishes a context-window stop from a genuine max_tokens cutoff -- see the schema comment for the heuristic's limits.                                                                                                                                                                                           |
 | `capabilityProbe` | infinite | `model`, `emitsReasoning`, `honorsResponseFormat`, `wrapsInCodeFences`, `checksCompleted`, `reasoningCheckTruncated`, `formatCheckTruncated`, `fenceCheckTruncated`, `latencyMs`, `errorKind`, `error`, `checkedAt`                                            | A short 3-call battery against one model: unprompted reasoning, honouring a requested response_format, and markdown code-fence wrapping. Fencing is recorded as a habit, never scored as a failure. checksCompleted and the per-check *Truncated flags let a reader tell a battery that ran clean and found a capability absent apart from one that stopped partway through or was capped by max_tokens before it could answer -- see the schema comments. |
 
+## `@jpisgeek/lmstudio/daemon`
+
+### Arguments
+
+| argument    | type    | required | default | description                                                                                           |
+| ----------- | ------- | -------- | ------- | ----------------------------------------------------------------------------------------------------- |
+| `lmsBinary` | string  | no       | `"lms"` | LM Studio CLI executable path or name                                                                 |
+| `timeoutMs` | integer | no       | `15000` | Maximum time for each lms command                                                                     |
+| `host`      | string  | no       |         | Optional remote LM Studio host accepted by lms ps --host; omit when running this model beside llmster |
+
+### Methods
+
+#### `observe`
+
+List models loaded by LM Studio with lms ps --json, optionally adding --host for
+an explicitly configured remote runtime.
+
+No arguments.
+
+### Data written
+
+| resource | lifetime | fields                                                                                                            | description                                                                                          |
+| -------- | -------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `daemon` | 30d      | `cliAvailable`, `daemonRunning`, `status`, `loadedModelCount`, `loadedModels`, `observedAt`, `errorKind`, `error` | Sanitized daemon status and models currently loaded in memory; missing measurements remain explicit. |
+
 ## Example
 
 ```yaml
@@ -135,6 +160,9 @@ globalArguments:
 #   swamp model method run my-probe embedding --input model=<model-id>
 #   swamp model method run my-probe completion --input model=<model-id> --input 'prompt=Say hello in one word.'
 #   swamp model method run my-probe capabilities --input model=<model-id>
+# On the host running llmster (for example, a headless Mac Studio):
+# swamp model create @jpisgeek/lmstudio/daemon my-daemon --json
+# swamp model method run my-daemon observe
 ```
 
 ## Caveats
@@ -146,7 +174,9 @@ CANCELLED); `endpoint.health` writes every endpoint-side outcome and throws only
 on caller cancellation; the three `probe` methods throw only on a bad token and
 cancellation and record everything else with an `errorKind`. `contextExhausted`
 is a heuristic (finish_reason "length" under the requested cap). Probe instance
-names are `<method>-<slug-of-model-id>-<hash>`, so look them up after a run.
+names are `<method>-<slug-of-model-id>-<hash>`, so look them up after a run. The
+daemon model runs `lms ps --json` beside llmster. Set its optional `host`
+argument only when deliberately using LM Studio's supported remote CLI mode.
 
 ## Security
 
@@ -157,6 +187,8 @@ errors have userinfo and query strings stripped. `http://` is accepted for
 endpoints behind an already-encrypted tunnel, with the caveat that the token
 then travels in cleartext on that hop. Written data: served model ids,
 latencies, token counts, and boolean findings. Caller prompts are not stored.
+Daemon observations retain loaded model identifiers, type, and architecture but
+discard model paths and raw command error output.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

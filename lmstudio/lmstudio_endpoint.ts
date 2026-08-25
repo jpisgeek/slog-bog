@@ -365,7 +365,7 @@ async function health(
  */
 export const model = {
   type: "@jpisgeek/lmstudio/endpoint",
-  version: "2026.08.23.1",
+  version: "2026.08.25.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {

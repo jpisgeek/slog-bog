@@ -2,13 +2,13 @@
 
 # @jpisgeek/dashboard-lmstudio
 
-Normalizes scoped @jpisgeek/lmstudio endpoint and request-probe output into
-dashboard bundle v1. Endpoint-down, token-rejected, missing model capability,
-context exhaustion, output-token limit, and reasoning-only empty output stay
-distinct. Token and timing values retain their actual units and one probe is
-never presented as aggregate runtime accounting.
+Normalizes scoped @jpisgeek/lmstudio endpoint, remote headless-daemon, and
+request-probe output into dashboard bundle v1. Endpoint-down, token-rejected,
+missing model capability, context exhaustion, output-token limit, and
+reasoning-only empty output stay distinct. Token and timing values retain their
+actual units and one probe is never presented as aggregate runtime accounting.
 
-**Version** `2026.08.25.1` · **License** MIT · **Source**
+**Version** `2026.08.25.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/dashboard-lmstudio
 
 ## Install
@@ -33,8 +33,8 @@ globalArguments:
 
 ## Caveats
 
-Each report describes exactly one endpoint or request-probe execution. A
-completion bundle uses observed-traffic coverage with accountingScope
+Each report describes exactly one endpoint, daemon, or request-probe execution.
+A completion bundle uses observed-traffic coverage with accountingScope
 single-request and aggregateAccounting false. It does not measure requests that
 bypass the probe. contextExhausted is the collector's documented heuristic:
 finish_reason length before the requested output cap. A complete runtime ledger

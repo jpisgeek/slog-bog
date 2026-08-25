@@ -458,6 +458,36 @@ const ModelsSchema = z.object({
   }
 });
 
+const DaemonSchema = z.object({
+  cliAvailable: z.boolean(),
+  daemonRunning: z.boolean(),
+  status: z.enum(["running", "not-running", "unknown"]),
+  loadedModelCount: z.number().int().nonnegative(),
+  loadedModels: z.array(z.object({
+    identifier: z.string().min(1),
+    type: z.string(),
+    architecture: z.string(),
+  })),
+  observedAt: z.iso.datetime(),
+  errorKind: z.enum([
+    "",
+    "cli-unavailable",
+    "unreachable",
+    "timeout",
+    "command-failed",
+    "invalid-response",
+  ]),
+  error: z.string(),
+}).superRefine((value, ctx) => {
+  if (value.loadedModelCount !== value.loadedModels.length) {
+    ctx.addIssue({
+      code: "custom",
+      message: "loadedModelCount must match loadedModels length",
+      path: ["loadedModelCount"],
+    });
+  }
+});
+
 const EmbeddingSchema = z.object({
   model: z.string(),
   servesEmbeddings: z.boolean(),
@@ -814,6 +844,89 @@ function modelsSection(value: z.infer<typeof ModelsSchema>) {
   );
 }
 
+function daemonSection(value: z.infer<typeof DaemonSchema>) {
+  const state: DashboardState = value.errorKind === "cli-unavailable"
+    ? "unsupported"
+    : value.errorKind === "unreachable" || value.errorKind === "timeout"
+    ? "critical"
+    : value.errorKind
+    ? "partial"
+    : value.loadedModelCount === 0
+    ? "degraded"
+    : "healthy";
+  const summary = value.error ||
+    (value.loadedModelCount > 0
+      ? `${value.loadedModelCount} model(s) loaded in LM Studio memory`
+      : "LM Studio is running with no models loaded");
+  const exceptions = state === "healthy" ? [] : [exception(
+    `lmstudio:daemon:${value.errorKind || "no-loaded-models"}`,
+    state === "critical" ? "critical" : "warning",
+    value.errorKind === "cli-unavailable"
+      ? "LM Studio CLI unavailable"
+      : value.errorKind === "unreachable"
+      ? "LM Studio runtime unavailable"
+      : value.errorKind === "timeout"
+      ? "LM Studio runtime timed out"
+      : value.errorKind
+      ? "LM Studio daemon observation incomplete"
+      : "No models loaded",
+    summary,
+  )];
+  return commonSection(
+    "lmstudio-daemon",
+    "LM Studio headless daemon",
+    state,
+    summary,
+    value.observedAt,
+    value.errorKind
+      ? {
+        state: "partial",
+        observed: 0,
+        expected: 1,
+        rejected: 1,
+        reason: summary,
+      }
+      : { state: "exact", observed: value.loadedModelCount, rejected: 0 },
+    value.errorKind
+      ? [unavailableMetric(
+        "loaded-models",
+        "Loaded models",
+        "count",
+        "lms ps did not return a valid inventory",
+      )]
+      : [observedMetric(
+        "loaded-models",
+        "Loaded models",
+        "count",
+        value.loadedModelCount,
+      )],
+    [
+      {
+        id: "daemon-running",
+        label: "Daemon running",
+        value: value.status === "unknown" ? null : value.daemonRunning,
+        confidence: value.status === "unknown" ? "unknown" : "exact",
+        sensitivity: "operational",
+      },
+      ...value.loadedModels.map((model, index) => ({
+        id: `loaded-model-${index}`,
+        label: `Loaded model ${index + 1}`,
+        value: model.identifier,
+        confidence: "exact",
+        sensitivity: "operational",
+      })),
+    ],
+    exceptions,
+    {
+      kind: value.errorKind ? "unknown" : "exact",
+      scope:
+        "models currently loaded in the configured LM Studio runtime as observed by lms ps",
+      notes:
+        "This is a point-in-time inventory, not aggregate request or token accounting.",
+    },
+  );
+}
+
 function embeddingSection(value: z.infer<typeof EmbeddingSchema>) {
   const state: DashboardState = value.errorKind
     ? failureState(value.errorKind)
@@ -1130,6 +1243,7 @@ export async function normalize(
     ![
       "@jpisgeek/lmstudio/endpoint",
       "@jpisgeek/lmstudio/probe",
+      "@jpisgeek/lmstudio/daemon",
     ].includes(modelType)
   ) {
     throw new Error(`unsupported LM Studio source ${modelType}`);
@@ -1141,6 +1255,11 @@ export async function normalize(
   } else {
     try {
       if (
+        modelType === "@jpisgeek/lmstudio/daemon" &&
+        ctx.methodName === "observe"
+      ) {
+        section = daemonSection(DaemonSchema.parse(record));
+      } else if (
         modelType === "@jpisgeek/lmstudio/endpoint" &&
         ctx.methodName === "health"
       ) {
@@ -1182,7 +1301,7 @@ export async function normalize(
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/dashboard-lmstudio",
-      extensionVersion: "2026.08.25.1",
+      extensionVersion: "2026.08.25.2",
       modelType,
       modelName: ctx.definition.name,
       modelId: ctx.modelId,

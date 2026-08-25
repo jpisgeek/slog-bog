@@ -35,6 +35,8 @@ const endpoint = (method: string, record: Json | null, overrides: Json = {}) =>
   context("@jpisgeek/lmstudio/endpoint", method, record, overrides);
 const probe = (method: string, record: Json | null, overrides: Json = {}) =>
   context("@jpisgeek/lmstudio/probe", method, record, overrides);
+const daemon = (record: Json | null, overrides: Json = {}) =>
+  context("@jpisgeek/lmstudio/daemon", "observe", record, overrides);
 
 function health(overrides: Json = {}): Json {
   return {
@@ -152,6 +154,64 @@ Deno.test("available models are inventory and an empty list is degraded", async 
     syncedAt: checkedAt,
   }));
   assertEquals(empty.state, "degraded");
+});
+
+Deno.test("remote daemon loaded inventory is exact but not accounting", async () => {
+  const bundle = await normalize(daemon({
+    cliAvailable: true,
+    daemonRunning: true,
+    status: "running",
+    loadedModelCount: 1,
+    loadedModels: [{
+      identifier: "example/chat",
+      type: "llm",
+      architecture: "example",
+    }],
+    observedAt: checkedAt,
+    errorKind: "",
+    error: "",
+  }));
+  assertEquals(bundle.state, "healthy");
+  assertEquals(bundle.sections[0].coverage.kind, "exact");
+  assertEquals(bundle.sections[0].metrics[0].value, 1);
+  assertEquals(bundle.extensions["jpisgeek/local-inference"], {
+    accountingScope: "not-applicable",
+    aggregateAccounting: false,
+  });
+});
+
+Deno.test("remote daemon empty, unreachable, and missing CLI stay distinct", async () => {
+  const base = {
+    cliAvailable: true,
+    daemonRunning: true,
+    status: "running",
+    loadedModelCount: 0,
+    loadedModels: [],
+    observedAt: checkedAt,
+    errorKind: "",
+    error: "",
+  };
+  assertEquals((await normalize(daemon(base))).state, "degraded");
+
+  const unreachable = await normalize(daemon({
+    ...base,
+    daemonRunning: false,
+    status: "unknown",
+    errorKind: "unreachable",
+    error: "The remote LM Studio daemon could not be reached",
+  }));
+  assertEquals(unreachable.state, "critical");
+  assertEquals(unreachable.sections[0].metrics[0].availability, "unknown");
+
+  const unsupported = await normalize(daemon({
+    ...base,
+    cliAvailable: false,
+    daemonRunning: false,
+    status: "unknown",
+    errorKind: "cli-unavailable",
+    error: "The lms CLI is not installed or executable",
+  }));
+  assertEquals(unsupported.sections[0].state, "unsupported");
 });
 
 Deno.test("embedding dimension is observed only when known", async () => {
