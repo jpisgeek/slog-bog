@@ -1,0 +1,45 @@
+[
+  {
+    "name": "observed metric missing numeric value",
+    "path": "sections.0.metrics.0",
+    "patch": {
+      "availability": "observed",
+      "id": "requests",
+      "label": "Requests",
+      "unit": "requests",
+      "confidence": "exact"
+    },
+    "valid": false
+  },
+  {
+    "name": "invalid empty metric unit",
+    "path": "sections.0.metrics.0",
+    "patch": {
+      "availability": "observed",
+      "id": "requests",
+      "label": "Requests",
+      "unit": "",
+      "confidence": "exact",
+      "value": 4
+    },
+    "valid": false
+  },
+  {
+    "name": "malformed generated timestamp",
+    "path": "generatedAt",
+    "patch": "yesterday",
+    "valid": false
+  },
+  {
+    "name": "HTML-bearing text remains data",
+    "path": "sections.0.summary",
+    "patch": "<img src=x onerror=alert(1)>",
+    "valid": true
+  },
+  {
+    "name": "extension details require a namespace",
+    "path": "extensions",
+    "patch": { "not-namespaced": { "value": 1 } },
+    "valid": false
+  }
+]

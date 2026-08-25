@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-2 complete; Task 3 pending
+- **Phase:** BUILD — Tasks 1-3 complete; Task 4 pending
 - **Spec:** this document
 - **Plan:** [PLAN.md](PLAN.md), approved 2026-08-25
-- **Build:** not started
+- **Build:** in progress
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 

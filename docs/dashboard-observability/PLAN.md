@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-2 complete; Task 3 pending
+- **Phase:** BUILD — Tasks 1-3 complete; Task 4 pending
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
-- **Build:** not started
-- **Completed tasks:** 2 of 16
+- **Build:** in progress
+- **Completed tasks:** 3 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 
@@ -122,7 +122,7 @@ status with reasons.
 
 ### Task 3: Build the bundle v1 contract package
 
-**Goal:** publishable, provider-neutral schemas before domain logic.
+**Goal:** provider-neutral canonical schemas before domain logic.
 
 - Define strict Zod schemas for identity, provenance, observation/coverage
   windows, completeness, state, severity, confidence, metrics/units, facts,
@@ -135,11 +135,12 @@ status with reasons.
   partial, unsupported, and unauthorized bundles.
 - Add adversarial fixtures for missing numeric values, invalid units, malformed
   timestamps, HTML-bearing strings, and invalid extension details.
-- Add manifest, README variables, generated README, and license.
+- Add package documentation and license. Keep the contract as statically bundled
+  source rather than an empty registry extension, as established by Task 1.
 
-**Verify:** type-check, unit tests, schema round trips, manifest format check,
-quality check, generated README check, and identifier scan pass for this
-package.
+**Verify:** formatting, type-check, lint, unit tests, schema round trips,
+static-import bundling evidence from Task 1, documentation, license, and
+identifier scan pass for this package.
 
 ### Task 4: Build the first local adapter using existing homelab collectors
 
