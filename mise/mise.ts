@@ -474,14 +474,26 @@ function fnv1a(s: string): string {
 }
 
 /**
+ * Hash input for a resource name. Each part is prefixed with its own length,
+ * so the encoding is reversible and two different identities can never
+ * produce the same string. Concatenating the parts directly would not manage
+ * that: node "a!" with tool "b" and node "a" with tool "!b" both concatenate
+ * to "a!b" and both flatten to "a-b", which is one resource name for two
+ * different things, and the second sweep would quietly overwrite the first.
+ */
+function identityKey(parts: string[]): string {
+  return parts.map((p) => `${p.length}:${p}`).join("");
+}
+
+/**
  * Collision-safe resource name. Normalising alone is not injective: node
  * "nas-01" with tool "go" and node "nas" with tool "01-go" flatten to the
  * same string, and the second write would quietly overwrite the first. mise
  * also keys backend-prefixed tools like "npm:prettier" and
  * "go:github.com/x/y", so a raw name can carry a path separator straight
- * into a resource name. The hash is taken over the raw parts joined by a
- * separator that cannot occur inside them, so two different identities stay
- * two different resources however alike they look once flattened.
+ * into a resource name. The hash is taken over the raw parts, length-prefixed
+ * so two different identities stay two different resources however alike
+ * they look once flattened.
  */
 function resourceName(prefix: string, ...parts: string[]): string {
   const flat = parts
@@ -490,7 +502,7 @@ function resourceName(prefix: string, ...parts: string[]): string {
     )
     .filter((p) => p !== "")
     .join("-");
-  return `${prefix}-${flat || "id"}-${fnv1a(parts.join(""))}`;
+  return `${prefix}-${flat || "id"}-${fnv1a(identityKey(parts))}`;
 }
 
 export const model = {
