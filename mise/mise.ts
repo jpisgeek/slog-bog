@@ -35,6 +35,13 @@ const SshSchema = z.object({
   port: z.number().int().positive().default(22),
 });
 
+/**
+ * One host to sweep: how to reach it, which directory's config to evaluate,
+ * and where the mise binary lives there. Every field that ends up
+ * interpolated into a shell command (ssh.host, ssh.user, dir, misePath)
+ * carries its own refinement, because this schema is the boundary where
+ * operator-supplied fleet config turns into command text.
+ */
 export const NodeSchema = z.object({
   name: z.string().min(1).describe("Label for this host in the written data"),
   ssh: SshSchema.optional().describe(
@@ -72,6 +79,13 @@ export const NodeSchema = z.object({
     ),
 });
 
+/**
+ * Everything an operator sets once for the whole sweep: which hosts to ask,
+ * how long to wait on each, how many to ask concurrently, and an optional
+ * fleet-wide version to hold every host to. Node names must be unique here
+ * because a name is also the resource identity each sweep writes to. Two
+ * hosts sharing a name would silently overwrite one another's record.
+ */
 export const GlobalArgsSchema = z.object({
   nodes: z
     .array(NodeSchema)
@@ -101,6 +115,13 @@ export const GlobalArgsSchema = z.object({
     ),
 });
 
+/**
+ * Every way a host's tools or config can diverge from what mise's own config
+ * asked for, plus "unmeasured" for a host that could not be asked at all. A
+ * flat union rather than one boolean per condition because a single tool can
+ * carry more than one at once, installed but outdated and also failing the
+ * fleet-wide expect, for instance.
+ */
 export type Drift =
   | "notinstalled"
   | "notactive"
@@ -109,6 +130,12 @@ export type Drift =
   | "expected"
   | "unmeasured";
 
+/**
+ * The only two facts classifyTool needs to place a tool on the
+ * install/active axis. Kept separate from ToolRow so classification cannot
+ * quietly grow a dependency on fields (versions, paths) that have nothing to
+ * do with whether a tool is installed or active.
+ */
 export type ToolEntry = { installed: boolean; active: boolean };
 
 /**
@@ -144,9 +171,13 @@ export function classifyTool(
 
 /** The read-only invocations this model ever makes. */
 export const SUB_LS = ["ls", "--current", "--json"];
+/** Which config files are in scope and what each declares, so a piece of drift can be traced back to the file that caused it. */
 export const SUB_CONFIG = ["config", "ls", "--json"];
+/** Installed tools mise considers behind latest, the source for the "outdated" drift flag. */
 export const SUB_OUTDATED = ["outdated", "--json"];
+/** Confirms mise answered at all and records which build ran, for the node record's miseVersion field. */
 export const SUB_VERSION = ["--version"];
+/** Per-config trust state, recorded for context only. See parseTrustShow for why it never drives drift on its own. */
 export const SUB_TRUST = ["trust", "--show"];
 
 /**
@@ -217,6 +248,13 @@ const CMD_NOT_FOUND_RE = /command not found/i;
 const SHELL_NO_SUCH_FILE_RE =
   /(?:^|\n)[^\n]*sh: [^\n]*No such file or directory/i;
 
+/**
+ * Turns an exit code and stderr into the two-way split the rest of the model
+ * acts on. "notfound" means mise itself was absent, the honesty case: no
+ * drift claim gets made. Anything else is "failed", a host that ran mise and
+ * hit a real problem. See the regex comments above for how that split is
+ * drawn.
+ */
 export function classifyFailure(
   code: number,
   stderr: string,
@@ -227,10 +265,21 @@ export function classifyFailure(
   return "failed";
 }
 
+/**
+ * What runMise hands back: either the raw stdout of a successful call, or a
+ * failure already classified into "notfound" versus "failed" so nothing
+ * downstream has to re-inspect stderr to know which honesty case applies.
+ */
 export type RunResult =
   | { ok: true; stdout: string }
   | { ok: false; kind: "notfound" | "failed"; error: string };
 
+/**
+ * NodeSchema after zod has run: defaults (misePath, ssh.port) are filled in
+ * and every refinement has already passed. runMise and its helpers take this
+ * rather than the raw config type because they depend on those defaults
+ * being present.
+ */
 export type ParsedNode = z.infer<typeof NodeSchema>;
 
 /**
@@ -298,6 +347,14 @@ export async function runMise(
   }
 }
 
+/**
+ * One tool's state as read out of `ls --current --json`, flattened from
+ * mise's per-tool array-of-entries shape down to the single entry the
+ * current config actually selects. `outdated`, `latestVersion`, and `drift`
+ * start at their empty defaults here because parseLsCurrent only knows what
+ * `ls --current` said. Those three fields are filled in later, once the
+ * outdated and expect comparisons run.
+ */
 export type ToolRow = {
   tool: string;
   requestedVersion: string | null;
@@ -356,6 +413,12 @@ export function parseLsCurrent(json: string): ToolRow[] {
   return rows;
 }
 
+/**
+ * `config ls --json` lists every mise config file in scope and the tools
+ * each one declares. Malformed entries are skipped rather than thrown on,
+ * the same choice parseLsCurrent makes, because this data also crosses a
+ * process boundary and nothing upstream guarantees its shape.
+ */
 export function parseConfigLs(
   json: string,
 ): { path: string; tools: string[] }[] {
@@ -505,6 +568,14 @@ function resourceName(prefix: string, ...parts: string[]): string {
   return `${prefix}-${flat || "id"}-${fnv1a(identityKey(parts))}`;
 }
 
+/**
+ * The `@jpisgeek/mise` model definition: a single `discover` method that
+ * sweeps every configured node and records node, tool, and config state as
+ * separate resources, so a report can filter or diff at whichever
+ * granularity the drift showed up at. See the module header above for why an
+ * unmeasured host is written down as unmeasured rather than folded into a
+ * zero count.
+ */
 export const model = {
   type: "@jpisgeek/mise",
   version: "2026.08.24.1",
