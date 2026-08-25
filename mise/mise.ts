@@ -298,6 +298,116 @@ export async function runMise(
   }
 }
 
+export type ToolRow = {
+  tool: string;
+  requestedVersion: string | null;
+  resolvedVersion: string | null;
+  installPath: string | null;
+  sourceType: string | null;
+  sourcePath: string | null;
+  installed: boolean;
+  active: boolean;
+  outdated: boolean;
+  latestVersion: string | null;
+  drift: Drift[];
+};
+
+/** JSON.parse that yields a fallback instead of throwing mid-sweep. */
+function parseJson<T>(raw: string, fallback: T): T {
+  try {
+    const v = JSON.parse(raw);
+    return v == null ? fallback : v as T;
+  } catch {
+    return fallback;
+  }
+}
+
+const str = (v: unknown): string | null =>
+  typeof v === "string" && v !== "" ? v : null;
+
+/**
+ * `mise ls --current --json` is keyed by tool name, each holding an array of
+ * entries. Only the first entry per tool is the one the config selected, so
+ * that is the row. Anything shaped unexpectedly is skipped rather than cast:
+ * this data crosses a process boundary and nothing validates it upstream.
+ */
+export function parseLsCurrent(json: string): ToolRow[] {
+  const obj = parseJson<Record<string, unknown>>(json, {});
+  const rows: ToolRow[] = [];
+  for (const [tool, entries] of Object.entries(obj)) {
+    if (!Array.isArray(entries) || entries.length === 0) continue;
+    const e = entries[0] as Record<string, unknown>;
+    if (!e || typeof e !== "object") continue;
+    const source = (e.source ?? {}) as Record<string, unknown>;
+    rows.push({
+      tool,
+      requestedVersion: str(e.requested_version),
+      resolvedVersion: str(e.version),
+      installPath: str(e.install_path),
+      sourceType: str(source.type),
+      sourcePath: str(source.path),
+      installed: e.installed === true,
+      active: e.active === true,
+      outdated: false,
+      latestVersion: null,
+      drift: [],
+    });
+  }
+  return rows;
+}
+
+export function parseConfigLs(
+  json: string,
+): { path: string; tools: string[] }[] {
+  const arr = parseJson<unknown[]>(json, []);
+  if (!Array.isArray(arr)) return [];
+  const out: { path: string; tools: string[] }[] = [];
+  for (const raw of arr) {
+    const c = raw as Record<string, unknown>;
+    const path = str(c?.path);
+    if (!path) continue;
+    const tools = Array.isArray(c.tools) ? c.tools.map((t) => String(t)) : [];
+    out.push({ path, tools });
+  }
+  return out;
+}
+
+/** Tool name to its latest version, for whatever mise reports as behind. */
+export function parseOutdated(json: string): Record<string, string | null> {
+  const obj = parseJson<Record<string, unknown>>(json, {});
+  const out: Record<string, string | null> = {};
+  for (const [tool, v] of Object.entries(obj)) {
+    const rec = v as Record<string, unknown>;
+    out[tool] = str(rec?.latest);
+  }
+  return out;
+}
+
+/**
+ * `trust --show` has no JSON output, so this parses its "<path>: <status>"
+ * lines. Recorded for context only. An untrusted plain [tools] config still
+ * applies, so trust is never a drift trigger on its own.
+ */
+export function parseTrustShow(text: string): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  for (const line of text.split("\n")) {
+    const idx = line.lastIndexOf(": ");
+    if (idx === -1) continue;
+    const path = line.slice(0, idx).trim();
+    const status = line.slice(idx + 2).trim();
+    if (!path) continue;
+    if (status === "trusted") out[path] = true;
+    else if (status === "untrusted") out[path] = false;
+  }
+  return out;
+}
+
+/** Tools a config declares that never appeared in `ls --current`. */
+export function notInEffect(declared: string[], present: string[]): string[] {
+  const have = new Set(present);
+  return declared.filter((t) => !have.has(t));
+}
+
 export const model = {
   type: "@jpisgeek/mise",
   version: "2026.08.24.1",

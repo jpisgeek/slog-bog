@@ -19,6 +19,11 @@ import {
   classifyTool,
   GlobalArgsSchema,
   localArgs,
+  notInEffect,
+  parseConfigLs,
+  parseLsCurrent,
+  parseOutdated,
+  parseTrustShow,
   remoteCommand,
   runMise,
   satisfiesExpect,
@@ -290,4 +295,79 @@ Deno.test("stdout is withheld from the error on a failed run", async () => {
   } finally {
     await m.cleanup();
   }
+});
+
+const LS_CURRENT = JSON.stringify({
+  node: [{
+    version: "22.23.2",
+    requested_version: "22",
+    install_path: "<home>/.local/share/mise/installs/node/22.23.2",
+    source: { type: "mise.toml", path: "/srv/project/mise.toml" },
+    installed: true,
+    active: true,
+  }],
+  python: [{
+    version: "3.12.14",
+    requested_version: "3.12",
+    install_path: "<home>/.local/share/mise/installs/python/3.12.14",
+    source: { type: "mise.toml", path: "/srv/project/mise.toml" },
+    installed: false,
+    active: false,
+  }],
+});
+
+Deno.test("ls --current becomes one flat row per tool", () => {
+  const rows = parseLsCurrent(LS_CURRENT);
+  assertEquals(rows.length, 2);
+  const node = rows.find((r) => r.tool === "node")!;
+  assertEquals(node.requestedVersion, "22");
+  assertEquals(node.resolvedVersion, "22.23.2");
+  assertEquals(node.sourcePath, "/srv/project/mise.toml");
+  assertEquals(node.installed, true);
+  assertEquals(node.active, true);
+  const py = rows.find((r) => r.tool === "python")!;
+  assertEquals(py.installed, false);
+});
+
+Deno.test("empty and malformed ls output yield no rows rather than throwing", () => {
+  assertEquals(parseLsCurrent("{}"), []);
+  assertEquals(parseLsCurrent(""), []);
+  assertEquals(parseLsCurrent("not json at all"), []);
+  // a tool key whose value is not an array must not crash the sweep
+  assertEquals(parseLsCurrent('{"node":"nonsense"}'), []);
+});
+
+Deno.test("config ls yields declared paths and their tools", () => {
+  const c = parseConfigLs(
+    '[{"path":"/srv/project/mise.toml","tools":["node","python"]}]',
+  );
+  assertEquals(c.length, 1);
+  assertEquals(c[0].tools, ["node", "python"]);
+  assertEquals(parseConfigLs("[]"), []);
+  assertEquals(parseConfigLs("garbage"), []);
+});
+
+Deno.test("outdated maps tool to its latest version", () => {
+  const o = parseOutdated('{"node":{"latest":"24.1.0"}}');
+  assertEquals(o.node, "24.1.0");
+  assertEquals(parseOutdated("{}"), {});
+  assertEquals(parseOutdated("garbage"), {});
+});
+
+Deno.test("trust --show parses the path-colon-status lines", () => {
+  const t = parseTrustShow(
+    "/srv/project: untrusted\n/srv/other: trusted\n",
+  );
+  assertEquals(t["/srv/project"], false);
+  assertEquals(t["/srv/other"], true);
+  assertEquals(parseTrustShow(""), {});
+});
+
+Deno.test("a declared tool absent from ls --current is notineffect", () => {
+  // the config asks for three, mise reports two: the third never took
+  assertEquals(
+    notInEffect(["node", "python", "go"], ["node", "python"]),
+    ["go"],
+  );
+  assertEquals(notInEffect(["node"], ["node"]), []);
 });
