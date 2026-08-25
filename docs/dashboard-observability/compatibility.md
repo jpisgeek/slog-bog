@@ -90,9 +90,15 @@ trusted, or installed.
 - **Unknown from registry metadata:** resource field schemas and units,
   pagination/truncation behavior, missing-dimension behavior, currency schema,
   timeouts/cancellation, redaction tests, dependency versions, and license.
-- **Decision:** **pending runtime evidence.** Do not install. Task 9 builds the
-  local typed profile first; only then may captured runtime resources qualify
-  this candidate as `fit` or `extend`.
+- **Task 9 re-check:** registry version `2026.06.29.1` still advertises only
+  opaque `usage` and `costs` resources with infinite retention. It exposes no
+  report and still provides no schema evidence for currency, partial pages,
+  missing dimensions, timeouts, cancellation, or sanitized failures. Local type
+  search returned no installed OpenAI type.
+- **Decision:** **reject as the Task 9 implementation dependency.** The local
+  package supplies the approved typed states, bounded retention, independent
+  pagination, and bundle normalization. Re-evaluate the community package only
+  if a future published contract closes every recorded gap.
 
 ### `@keeb/ollama`
 

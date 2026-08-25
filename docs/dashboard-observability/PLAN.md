@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-8 complete; Task 9 pending
+- **Phase:** BUILD — Tasks 1-9 complete; Task 10 pending
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
 - **Build:** in progress
-- **Completed tasks:** 8 of 16
+- **Completed tasks:** 9 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 
@@ -225,6 +225,9 @@ stale, empty-history, and unavailable-interface cases without false health.
 each distinct state and performance unit.
 
 ### Task 9: Build local OpenAI organization usage and cost collection
+
+**Status:** complete — implementation and evidence are recorded in
+[openai-usage.md](openai-usage.md).
 
 **Goal:** observe eligible OpenAI organization accounts through official APIs.
 
