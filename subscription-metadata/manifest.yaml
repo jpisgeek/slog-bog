@@ -1,0 +1,29 @@
+manifestVersion: 1
+name: "@jpisgeek/subscription-metadata"
+version: 2026.08.25.1
+description: >
+  Explicit operator-supplied subscription plan metadata normalized into
+  dashboard bundle v1 without scraping, quota inference, or fictional usage
+  cost.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/subscription-metadata
+paths:
+  base: manifest
+models:
+  - subscription_metadata.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports:
+  - dashboard_subscription.ts
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - dashboard
+  - subscription
+  - metadata
+dependencies: []

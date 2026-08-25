@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-10 complete; Task 11 pending
+- **Phase:** BUILD — Tasks 1-11 complete; Task 12 pending
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
 - **Build:** in progress
-- **Completed tasks:** 10 of 16
+- **Completed tasks:** 11 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 
@@ -265,6 +265,9 @@ official supported APIs.
 paginated, partial, and malformed responses.
 
 ### Task 11: Build explicit subscription metadata
+
+**Status:** complete — implementation and evidence are recorded in
+[subscription-metadata.md](subscription-metadata.md).
 
 **Goal:** represent plan facts without confusing them with API metering.
 
