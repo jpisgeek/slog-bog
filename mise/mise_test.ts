@@ -789,6 +789,53 @@ Deno.test("a valid empty ls payload is a reading of zero tools", async () => {
   }
 });
 
+Deno.test("an ls payload of the wrong shape is unmeasured too", async () => {
+  // Valid JSON, wrong type. Object.entries over an array finds nothing to
+  // report, or finds entries that every guard skips, and either way the
+  // payload evaporates into the shape of a host with nothing wrong.
+  for (const payload of ["[]", '[{"node":[]},"junk"]']) {
+    const m = await fakeMiseSuite({ ls: payload });
+    try {
+      const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+      await model.methods.discover.execute({}, c.ctx);
+      const node = c.written.find((w) => w.spec === "node")!.data;
+      assertEquals(
+        node.measured,
+        false,
+        `an array is not a tool list: ${payload}`,
+      );
+      assertEquals(node.failureKind, "unparseable");
+      assertEquals(node.toolCount, null);
+      assertEquals(node.drift, ["unmeasured"]);
+      assertEquals(c.written.filter((w) => w.spec === "tool").length, 0);
+    } finally {
+      await m.cleanup();
+    }
+  }
+});
+
+Deno.test("a probe that answers in the wrong shape did not answer", async () => {
+  // config ls promises a list of files. An object sails through a plain
+  // "is it JSON" check and then dissolves in the parser, leaving
+  // configCount: 0 on a probe that told us nothing.
+  const m = await fakeMiseSuite({
+    ls: LS_CURRENT_CLEAN,
+    config: '{"path":"/srv/project/mise.toml"}',
+    outdated: '[{"node":"24.1.0"}]',
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.measured, true, "the tool list itself was readable");
+    assertEquals(node.failedSubcommands, ["config", "outdated"]);
+    assertEquals(node.configCount, null, "zero configs was never measured");
+    assertEquals(c.written.filter((w) => w.spec === "config").length, 0);
+  } finally {
+    await m.cleanup();
+  }
+});
+
 Deno.test("a probe that exits zero with junk did not answer either", async () => {
   const m = await fakeMiseSuite({
     ls: LS_CURRENT_CLEAN,

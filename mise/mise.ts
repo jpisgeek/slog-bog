@@ -390,35 +390,48 @@ export type ToolRow = {
 };
 
 /**
- * Did this payload come back as JSON at all?
- *
- * A remote login shell that prints anything to stdout, a banner or a stray
- * echo in ~/.bashrc, glues its own text to the front of mise's output, and
- * ssh reports the whole thing as exit 0. Handed to the tolerant parsers below
- * that payload becomes an empty result, which is exactly the shape of a host
- * with nothing wrong. So the payload is checked before it is parsed.
- *
- * A valid empty object is not a failure. `{}` from `ls --current` says the
- * config in that directory declares no tools, which is a reading and stays
- * one. Only text that will not parse, or that parses to something other than
- * an object or an array, counts as no answer.
+ * What a subcommand promises at the top level. `ls --current` and `outdated`
+ * are keyed by tool name, `config ls` is a list of files, and the two are not
+ * interchangeable.
  */
-function isJsonPayload(raw: string): boolean {
+type JsonShape = "object" | "array";
+
+/**
+ * Did this payload come back as the shape its subcommand promises?
+ *
+ * Two ways to get an answer that is not one. A remote login shell that prints
+ * anything to stdout, a banner or a stray echo in ~/.bashrc, glues its own
+ * text to the front of the output, and ssh reports the whole thing as exit 0.
+ * Or the payload is valid JSON of the wrong top-level type.
+ *
+ * Both end in the same place, and it is the place this model exists to avoid.
+ * The parsers below are total by design, so an array handed to the tool
+ * parser yields no rows and an object handed to the config parser yields no
+ * files. The payload evaporates into an empty result, and an empty result is
+ * exactly what a host with nothing wrong looks like. So the shape is checked
+ * here, before anything tolerant gets hold of it.
+ *
+ * A valid empty result of the right shape is not a failure. `{}` from
+ * `ls --current` says the config in that directory declares no tools, and
+ * that is a reading rather than the absence of one.
+ */
+function isJsonPayload(raw: string, shape: JsonShape): boolean {
   try {
     const v = JSON.parse(raw);
-    return typeof v === "object" && v !== null;
+    if (v === null || typeof v !== "object") return false;
+    return shape === "array" ? Array.isArray(v) : !Array.isArray(v);
   } catch {
     return false;
   }
 }
 
 /**
- * The stdout of a run that both succeeded and answered in JSON, or null when
- * either half of that failed. From a consumer's side those two are one fact:
- * the probe did not answer, so nothing may be claimed from it.
+ * The stdout of a run that both succeeded and answered in the promised shape,
+ * or null when any part of that failed. From a consumer's side those are one
+ * fact: the probe did not answer, so nothing may be claimed from it.
  */
-function jsonStdout(r: RunResult): string | null {
-  return r.ok && isJsonPayload(r.stdout) ? r.stdout : null;
+function jsonStdout(r: RunResult, shape: JsonShape): string | null {
+  return r.ok && isJsonPayload(r.stdout, shape) ? r.stdout : null;
 }
 
 /** JSON.parse that yields a fallback instead of throwing mid-sweep. */
@@ -544,10 +557,11 @@ const NodeStateSchema = z.object({
   /**
    * How an unmeasured host failed. "notfound" when mise itself was absent,
    * "failed" when mise ran and hit a real problem, and "unparseable" when the
-   * host exited zero and handed back something that is not JSON, which is
-   * usually a login shell printing over the top of the answer. null on a host
-   * that answered. Each wants a different errand, and a not-found host in
-   * particular wants misePath set rather than a look at the network.
+   * host exited zero and handed back something other than the JSON that
+   * subcommand promises, usually a login shell printing over the top of the
+   * answer. null on a host that answered. Each wants a different errand, and
+   * a not-found host in particular wants misePath set rather than a look at
+   * the network.
    */
   failureKind: z.string().nullable(),
   transport: z.string(),
@@ -778,15 +792,17 @@ export const model = {
                 runMise(node, sub, g.timeoutSec, ctx.signal);
 
               const ls = await run(SUB_LS);
-              // Two ways to learn nothing, and they take the same exit. mise
-              // never ran, or mise exited zero behind a shell that printed
-              // over the answer. Parsing the second on the tolerant path
-              // would have written a clean host with no tools.
-              const lsJson = jsonStdout(ls);
+              // Two ways to learn nothing, and they take the same exit.
+              // mise never ran, or mise exited zero without the tool object
+              // it promises, whether a shell printed over the answer or the
+              // payload came back as some other shape entirely. Parsed on
+              // the tolerant path the second one writes a clean host with no
+              // tools.
+              const lsJson = jsonStdout(ls, "object");
               if (lsJson === null) {
                 const kind = ls.ok ? "unparseable" : ls.kind;
                 const err = ls.ok
-                  ? "mise exited zero with output that is not JSON"
+                  ? "mise exited zero without the JSON object it promises"
                   : ls.error;
                 // The honesty case. Counts stay null so that "we could not
                 // ask" never reads downstream as "there was nothing to find".
@@ -827,12 +843,13 @@ export const model = {
               // its drift probe timed out is the single thing this model
               // exists to prevent. Every hole is named here instead.
               //
-              // The two JSON probes are held to the payload rule as well as
-              // the exit code. `trust --show` and `--version` are plain text
-              // with no JSON shape to fail, so an exit code is all there is
-              // to judge them on.
-              const cfgJson = jsonStdout(cfg);
-              const outdJson = jsonStdout(outd);
+              // The two JSON probes are held to their promised shape as
+              // well as to the exit code, and the shapes differ: config ls
+              // lists files, outdated is keyed by tool. `trust --show` and
+              // `--version` are plain text with no shape to fail, so an exit
+              // code is all there is to judge them on.
+              const cfgJson = jsonStdout(cfg, "array");
+              const outdJson = jsonStdout(outd, "object");
               const failed: string[] = [];
               if (cfgJson === null) failed.push("config");
               if (outdJson === null) failed.push("outdated");
