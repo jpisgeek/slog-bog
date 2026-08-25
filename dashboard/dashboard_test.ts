@@ -11,7 +11,7 @@
  * that never ran must be disclosed rather than silently omitted, and a
  * suppressed exception must stay visible rather than disappear.
  */
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import { model } from "./dashboard.ts";
 
 type Json = Record<string, unknown>;
@@ -27,7 +27,11 @@ const SOURCES = [
  * Mock context whose datastore returns `rows` keyed by source id. Renders to a
  * temp file so the assertion runs against the real emitted HTML.
  */
-function ctxFor(rowsById: Record<string, Array<[string, Json]>>, out: string) {
+function ctxFor(
+  rowsById: Record<string, Array<[string, Json]>>,
+  out: string,
+  failReads = new Set<string>(),
+) {
   const written: Array<{ spec: string; name: string; data: Json }> = [];
   return {
     written,
@@ -47,6 +51,9 @@ function ctxFor(rowsById: Record<string, Array<[string, Json]>>, out: string) {
         findAllForModel: (_t: string, id: string) =>
           Promise.resolve((rowsById[id] ?? []).map(([name]) => ({ name }))),
         getContent: (_t: string, id: string, name: string) => {
+          if (failReads.has(name)) {
+            return Promise.reject(new Error(`synthetic read failure: ${name}`));
+          }
           const hit = (rowsById[id] ?? []).find(([n]) => n === name);
           return Promise.resolve(hit ? JSON.stringify(hit[1]) : null);
         },
@@ -56,14 +63,20 @@ function ctxFor(rowsById: Record<string, Array<[string, Json]>>, out: string) {
   };
 }
 
-async function render(rowsById: Record<string, Array<[string, Json]>>) {
+async function render(
+  rowsById: Record<string, Array<[string, Json]>>,
+  failReads = new Set<string>(),
+) {
   const dir = await Deno.makeTempDir();
   const out = `${dir}/index.html`;
-  const m = ctxFor(rowsById, out);
-  await model.methods.render.execute({}, m.ctx);
-  const html = await Deno.readTextFile(out);
-  await Deno.remove(dir, { recursive: true });
-  return { html, written: m.written };
+  const m = ctxFor(rowsById, out, failReads);
+  try {
+    await model.methods.render.execute({}, m.ctx);
+    const html = await Deno.readTextFile(out);
+    return { html, written: m.written };
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,4 +228,115 @@ Deno.test("exception schema: truncation is disclosed on the record", () => {
     model.resources.exception.schema.safeParse(without).success,
     false,
   );
+});
+
+// ---------------------------------------------------------------------------
+// migration baseline: known legacy defects
+//
+// These characterization tests intentionally assert the current broken
+// behavior recorded by the exact-content review. They prevent the migration
+// from silently changing its starting point. Tasks 4 and 5 must replace each
+// assertion with the honest bundle-v1 behavior named in the test comment.
+// ---------------------------------------------------------------------------
+
+Deno.test("baseline defect: a partial read is not disclosed", async () => {
+  const { html, written } = await render({
+    t1: [
+      ["node-alpha", { name: "alpha", reachable: true }],
+      ["alarm-lost", {
+        node: "alpha",
+        name: "load",
+        status: "CRITICAL",
+      }],
+    ],
+  }, new Set(["alarm-lost"]));
+  const result = written.find((w) => w.spec === "render")!.data;
+  assertEquals(
+    (result.sourcesStale as string[]).includes("telemetry"),
+    false,
+    "legacy baseline: partial telemetry is omitted from stale coverage",
+  );
+  assertEquals(
+    html.includes("Nothing needs you"),
+    true,
+    "legacy baseline: surviving healthy rows permit a false all-clear",
+  );
+});
+
+Deno.test("baseline defect: missing disk usage renders as zero", async () => {
+  const { html, written } = await render({
+    t1: [["mount-root", {
+      node: "alpha",
+      mount: "/",
+      usedGiB: 4,
+      totalGiB: 10,
+    }]],
+  });
+  assertEquals(html.includes('<td class="num">0%</td>'), true);
+  assertEquals(
+    written.some((w) =>
+      w.spec === "exception" && String(w.data.id).startsWith("disk:")
+    ),
+    false,
+    "legacy baseline: absent usedPercent creates no unknown-data exception",
+  );
+});
+
+Deno.test("baseline defect: a certificate alert matches the first cert", async () => {
+  const { written } = await render({
+    n1: [
+      ["cert-alpha", {
+        name: "alpha",
+        expiryKnown: true,
+        expired: false,
+        expiringSoon: true,
+        daysRemaining: 5,
+        commonName: "alpha.example.test",
+      }],
+      ["alert-beta", {
+        id: "beta-alert",
+        klass: "CertificateIsExpiring",
+        level: "WARNING",
+        formatted: "Certificate beta expires soon",
+        silenced: false,
+      }],
+    ],
+  });
+  const ids = written.filter((w) => w.spec === "exception").map((w) =>
+    String(w.data.id)
+  );
+  assertEquals(ids, ["cert:alpha"]);
+});
+
+Deno.test("baseline defect: non-array networks abort rendering", async () => {
+  await assertRejects(
+    () =>
+      render({
+        f1: [["machine-alpha", {
+          name: "alpha",
+          primaryIp: "192.0.2.10",
+          deviceType: "computer",
+          networks: "lan",
+          online: true,
+        }]],
+      }),
+    TypeError,
+  );
+});
+
+Deno.test("synthetic baseline preserves the accepted visual structure", async () => {
+  const fixture = JSON.parse(
+    await Deno.readTextFile(
+      new URL("./fixtures/legacy-dashboard-baseline.json", import.meta.url),
+    ),
+  ) as Record<string, Array<[string, Json]>>;
+  const { html, written } = await render(fixture);
+  for (const label of ["Nodes", "Storage", "Certificates", "Machines"]) {
+    assertEquals(html.includes(`<summary>${label}`), true, label);
+  }
+  assertEquals(html.includes("Nothing needs you"), true);
+  const result = written.find((w) => w.spec === "render")!.data;
+  assertEquals(result.exceptions, 0);
+  assertEquals(result.sourcesRead, 4);
+  assertEquals(result.sourcesStale, []);
 });

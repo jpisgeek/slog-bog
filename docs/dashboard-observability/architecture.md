@@ -43,8 +43,8 @@ entry point's standalone bundle.
 
 Therefore:
 
-- `dashboard-contract` is a source and conformance boundary, not a runtime
-  Swamp extension dependency;
+- `dashboard-contract` is a source and conformance boundary, not a runtime Swamp
+  extension dependency;
 - each collector adapter and renderer remains independently installable;
 - consumers do not need a mandatory contract extension installed at runtime;
 - `dependencies:` stays empty unless a package truly requires another Swamp
@@ -62,13 +62,13 @@ imports are automatically resolved and included.
 ## Live proof
 
 The proof ran in the disposable repository
-`/private/tmp/dashboard-observability-proof-20260825`. It contained:
+`<temporary-directory>/dashboard-observability-proof-20260825`. It contained:
 
 - a producer model writing a strict synthetic resource;
 - a method-scope report validating that resource with a shared Zod schema and
   returning the same bundle as JSON;
-- a consumer model importing the same schema and accepting the report JSON as
-  a declared global argument;
+- a consumer model importing the same schema and accepting the report JSON as a
+  declared global argument;
 - separate producer and consumer manifests with no extension dependencies.
 
 ### Report persistence
@@ -153,12 +153,11 @@ must use that exact name rather than deriving it differently.
 
 ## Query observation
 
-`swamp data get` and `data.latest()` both resolved the report JSON correctly.
-A separate CLI query using `tags.type == "report"` unexpectedly returned no
-rows even though `data get` showed the `type=report` tag. This does not affect
-the selected explicit handoff path. Treat tag-wide report discovery as
-unverified and do not use it for renderer inputs unless a later task proves its
-behavior.
+`swamp data get` and `data.latest()` both resolved the report JSON correctly. A
+separate CLI query using `tags.type == "report"` unexpectedly returned no rows
+even though `data get` showed the `type=report` tag. This does not affect the
+selected explicit handoff path. Treat tag-wide report discovery as unverified
+and do not use it for renderer inputs unless a later task proves its behavior.
 
 ## Repository enrollment decision
 

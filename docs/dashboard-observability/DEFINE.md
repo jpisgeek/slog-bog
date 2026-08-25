@@ -2,7 +2,7 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Task 1 complete; Task 2 pending
+- **Phase:** BUILD — Tasks 1-2 complete; Task 3 pending
 - **Spec:** this document
 - **Plan:** [PLAN.md](PLAN.md), approved 2026-08-25
 - **Build:** not started
@@ -12,12 +12,11 @@
 ## Purpose
 
 Turn the existing `@jpisgeek/dashboard` into a public, provider-neutral family
-of independently installable Swamp extensions for operational monitoring,
-Swamp observability, hosted AI usage, subscription metadata, and local LLM
-operations.
+of independently installable Swamp extensions for operational monitoring, Swamp
+observability, hosted AI usage, subscription metadata, and local LLM operations.
 
-The existing visual direction remains the baseline. The project changes the
-data contract and operational depth, not the dashboard's visual identity.
+The existing visual direction remains the baseline. The project changes the data
+contract and operational depth, not the dashboard's visual identity.
 
 ## Users
 
@@ -42,11 +41,11 @@ runtimes, or any subset of those domains.
 3. **Independently installable pieces.** Installing the renderer or one domain
    adapter must not install unrelated collectors.
 4. **Provider-neutral core.** The renderer consumes a versioned normalized
-   bundle. It does not import collector implementations or key on provider
-   names and literal source aliases.
+   bundle. It does not import collector implementations or key on provider names
+   and literal source aliases.
 5. **Missing is not zero. Unknown is not healthy.** Missing, stale, partial,
-   rejected, unsupported, unauthorized, and failed observations remain
-   distinct and visible.
+   rejected, unsupported, unauthorized, and failed observations remain distinct
+   and visible.
 6. **Collect once, compose through Swamp.** Collectors produce typed resources,
    reports normalize and analyze them, workflows compose model methods, and CEL
    passes explicit data references between stages.
@@ -92,8 +91,8 @@ Evolve `@jpisgeek/dashboard` into a presentation-only extension that:
 
 - accepts explicit normalized bundle references through supported CEL wiring;
 - has no hidden cross-model repository scans;
-- has no knowledge of Netdata, TrueNAS, Firewalla, Swamp, OpenAI, Anthropic,
-  LM Studio, Ollama, or any other provider;
+- has no knowledge of Netdata, TrueNAS, Firewalla, Swamp, OpenAI, Anthropic, LM
+  Studio, Ollama, or any other provider;
 - renders partial, stale, unknown, and unauthorized coverage prominently;
 - preserves exceptions-first presentation and visible suppressions;
 - safely renders untrusted bundle content;
@@ -154,8 +153,8 @@ Community extensions are compatibility candidates, not default dependencies:
 
 During PLAN, each candidate's actual resources must be captured and validated
 against the local adapter profile. A candidate may be used directly, wrapped by
-a local normalization report, extended, or rejected. No implementation is
-chosen merely from registry description text.
+a local normalization report, extended, or rejected. No implementation is chosen
+merely from registry description text.
 
 ### 6. Subscription metadata
 
@@ -199,13 +198,13 @@ APIs. Either result must normalize to the same provider-neutral contract.
 The intended family has these logical packages. PLAN may refine names but not
 collapse the independence boundary without new DEFINE approval.
 
-| Package class | Responsibility | May depend on |
-| --- | --- | --- |
-| Contract | Versioned schemas and conformance fixtures | Zod only |
-| Renderer | Render explicit normalized bundles | Contract |
-| Domain adapter | Normalize one source contract | Contract and that source |
-| Collector | Observe one provider/runtime/service | Its API and vault refs |
-| Composition workflow | Run selected collectors/adapters/renderer | Only selected pieces |
+| Package class        | Responsibility                             | May depend on            |
+| -------------------- | ------------------------------------------ | ------------------------ |
+| Contract             | Versioned schemas and conformance fixtures | Zod only                 |
+| Renderer             | Render explicit normalized bundles         | Contract                 |
+| Domain adapter       | Normalize one source contract              | Contract and that source |
+| Collector            | Observe one provider/runtime/service       | Its API and vault refs   |
+| Composition workflow | Run selected collectors/adapters/renderer  | Only selected pieces     |
 
 There is no mandatory meta-package. An optional convenience bundle may be
 considered later, but the piece-by-piece installation path is authoritative.
@@ -241,8 +240,8 @@ Every adapter and renderer must enforce these rules:
 - Network clients use supported typed models, TLS verification, timeouts, and
   cancellation. Raw CLI wrappers and `command/shell` integrations are not used.
 - Every string rendered into HTML is treated as untrusted.
-- Bundles declare potentially identifying fields so operators can choose what
-  to publish.
+- Bundles declare potentially identifying fields so operators can choose what to
+  publish.
 - Public examples use synthetic identifiers only.
 - Generated dashboards are operational inventory and must be served behind
   suitable access control when they contain sensitive details.

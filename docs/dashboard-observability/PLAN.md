@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Task 1 complete; Task 2 pending
+- **Phase:** BUILD — Tasks 1-2 complete; Task 3 pending
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
 - **Build:** not started
-- **Completed tasks:** 1 of 16
+- **Completed tasks:** 2 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 
@@ -54,18 +54,18 @@ routed by the Swamp architecture guide:
 
 Names are provisional until Task 1 proves the supported packaging shape.
 
-| Provisional directory/package | Kind | Responsibility |
-| --- | --- | --- |
-| `dashboard-contract` | source contract module | Bundle v1 schemas, helpers, and conformance fixtures; statically bundled into each package |
-| `dashboard` / `@jpisgeek/dashboard` | model | Provider-neutral HTML renderer |
-| `dashboard-homelab` / `@jpisgeek/dashboard-homelab` | report or model | Normalize Netdata, TrueNAS, and Firewalla data |
-| `dashboard-lmstudio` / `@jpisgeek/dashboard-lmstudio` | report or model | Normalize LM Studio endpoint and probe data |
-| `swamp-observability` / `@jpisgeek/swamp-observability` | model plus report | Observe and normalize Swamp operational state |
-| `openai-usage` / `@jpisgeek/openai-usage` | model plus report | Local OpenAI organization usage and cost |
-| `anthropic-usage` / `@jpisgeek/anthropic-usage` | model plus report | Local Anthropic organization/enterprise usage |
-| `subscription-metadata` / `@jpisgeek/subscription-metadata` | model plus report | Explicit plan metadata without invented quota |
-| `ollama-observability` / `@jpisgeek/ollama-observability` | model plus report | Ollama health, inventory, request metrics, and coverage |
-| `dashboard-compose` / `@jpisgeek/dashboard-compose` | workflow | Optional composition of only user-selected pieces |
+| Provisional directory/package                               | Kind                   | Responsibility                                                                             |
+| ----------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------ |
+| `dashboard-contract`                                        | source contract module | Bundle v1 schemas, helpers, and conformance fixtures; statically bundled into each package |
+| `dashboard` / `@jpisgeek/dashboard`                         | model                  | Provider-neutral HTML renderer                                                             |
+| `dashboard-homelab` / `@jpisgeek/dashboard-homelab`         | report or model        | Normalize Netdata, TrueNAS, and Firewalla data                                             |
+| `dashboard-lmstudio` / `@jpisgeek/dashboard-lmstudio`       | report or model        | Normalize LM Studio endpoint and probe data                                                |
+| `swamp-observability` / `@jpisgeek/swamp-observability`     | model plus report      | Observe and normalize Swamp operational state                                              |
+| `openai-usage` / `@jpisgeek/openai-usage`                   | model plus report      | Local OpenAI organization usage and cost                                                   |
+| `anthropic-usage` / `@jpisgeek/anthropic-usage`             | model plus report      | Local Anthropic organization/enterprise usage                                              |
+| `subscription-metadata` / `@jpisgeek/subscription-metadata` | model plus report      | Explicit plan metadata without invented quota                                              |
+| `ollama-observability` / `@jpisgeek/ollama-observability`   | model plus report      | Ollama health, inventory, request metrics, and coverage                                    |
+| `dashboard-compose` / `@jpisgeek/dashboard-compose`         | workflow               | Optional composition of only user-selected pieces                                          |
 
 No package above may make every other package an installation dependency. The
 contract dependency is the only common dependency permitted by default.
@@ -98,6 +98,9 @@ contract dependency is the only common dependency permitted by default.
 Swamp, and the architecture document identifies only public supported APIs.
 
 ### Task 2: Define the compatibility profile and capture baselines
+
+**Status:** complete — profile, decisions, and baseline evidence are recorded in
+[compatibility.md](compatibility.md).
 
 **Goal:** make local-first reuse decisions repeatable and preserve migration
 evidence.
@@ -135,7 +138,8 @@ status with reasons.
 - Add manifest, README variables, generated README, and license.
 
 **Verify:** type-check, unit tests, schema round trips, manifest format check,
-quality check, generated README check, and identifier scan pass for this package.
+quality check, generated README check, and identifier scan pass for this
+package.
 
 ### Task 4: Build the first local adapter using existing homelab collectors
 
@@ -169,8 +173,8 @@ preserving the accepted visual direction.
 - Update manifest, README variables, generated README, and tests.
 
 **Verify:** renderer tests prove it contains no provider names or hidden source
-reads; visual snapshot comparison shows the accepted direction is preserved;
-all adversarial content is escaped.
+reads; visual snapshot comparison shows the accepted direction is preserved; all
+adversarial content is escaped.
 
 ### Task 6: Compose and verify the first end-to-end vertical slice
 
@@ -216,8 +220,8 @@ stale, empty-history, and unavailable-interface cases without false health.
 - Preserve the distinction between endpoint down, token rejected, context
   exhausted, output-token limit reached, and reasoning-only empty output.
 
-**Verify:** existing LM Studio tests plus new bundle conformance tests cover each
-distinct state and performance unit.
+**Verify:** existing LM Studio tests plus new bundle conformance tests cover
+each distinct state and performance unit.
 
 ### Task 9: Build local OpenAI organization usage and cost collection
 
@@ -344,8 +348,8 @@ correctness finding; changing any published byte invalidates the gate.
   approved package.
 - Record exact package versions, content hashes, dependencies, dry-run output,
   and any registry warnings in the REVIEW artifact.
-- Confirm no private checkout, inventory, workflow, secret, or fixture is in
-  the payload.
+- Confirm no private checkout, inventory, workflow, secret, or fixture is in the
+  payload.
 - Present the release set and any deferred adapters to the user.
 - Stop before `swamp extension push`, Git push, deployment, or production
   configuration.
@@ -374,19 +378,19 @@ sequential during BUILD so each slice finishes and verifies independently.
 
 ## Risks and planned controls
 
-| Risk | Control |
-| --- | --- |
-| Reports are not CEL-addressable as normalized data | Resolve in Task 1; use a typed normalization model if required |
-| Shared contract packaging creates hidden install coupling | Prove bundling and independent installation in Tasks 1 and 3 |
-| Community output differs from registry metadata | Require captured runtime resources before adoption |
-| Provider APIs require unavailable account privileges | Render `unauthorized` or `unsupported`; keep mock verification separate from live eligibility |
-| Per-request local metrics look like complete totals | Carry explicit coverage kind and observed-traffic scope |
-| Migration drops legacy exceptions | Baseline and parity checks in Tasks 2, 4, 5, and 14 |
-| Invalid data crashes rendering or looks healthy | Strict source validation plus conformance and adversarial fixtures |
-| Package family becomes monolithic | Enforce dependency matrix and independent install tests |
-| Review PASS hides correctness findings | Require findings resolved, content regenerated, and fresh exact-hash review |
-| Public artifacts leak private topology | Synthetic fixtures plus generic/private identifier scans before review |
-| Original `mise-extension` work is disturbed | Limit every command and edit to this Paseo worktree |
+| Risk                                                      | Control                                                                                       |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Reports are not CEL-addressable as normalized data        | Resolve in Task 1; use a typed normalization model if required                                |
+| Shared contract packaging creates hidden install coupling | Prove bundling and independent installation in Tasks 1 and 3                                  |
+| Community output differs from registry metadata           | Require captured runtime resources before adoption                                            |
+| Provider APIs require unavailable account privileges      | Render `unauthorized` or `unsupported`; keep mock verification separate from live eligibility |
+| Per-request local metrics look like complete totals       | Carry explicit coverage kind and observed-traffic scope                                       |
+| Migration drops legacy exceptions                         | Baseline and parity checks in Tasks 2, 4, 5, and 14                                           |
+| Invalid data crashes rendering or looks healthy           | Strict source validation plus conformance and adversarial fixtures                            |
+| Package family becomes monolithic                         | Enforce dependency matrix and independent install tests                                       |
+| Review PASS hides correctness findings                    | Require findings resolved, content regenerated, and fresh exact-hash review                   |
+| Public artifacts leak private topology                    | Synthetic fixtures plus generic/private identifier scans before review                        |
+| Original `mise-extension` work is disturbed               | Limit every command and edit to this Paseo worktree                                           |
 
 ## PLAN approval gate
 
