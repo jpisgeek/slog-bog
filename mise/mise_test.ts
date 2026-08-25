@@ -15,10 +15,12 @@
  */
 import { assertEquals } from "jsr:@std/assert@1";
 import {
+  classifyFailure,
   classifyTool,
   GlobalArgsSchema,
   localArgs,
   remoteCommand,
+  runMise,
   satisfiesExpect,
   sshArgs,
   SUB_LS,
@@ -182,4 +184,95 @@ Deno.test("connect timeout is capped at ten seconds", () => {
   assertEquals(args[3], "ConnectTimeout=10");
   const quick = sshArgs({ host: "h.example.com", user: "u", port: 22 }, 5, "x");
   assertEquals(quick[3], "ConnectTimeout=5");
+});
+
+/** Write an executable fake mise emitting the given stdout/stderr/exit. */
+async function fakeMise(
+  opts: { stdout?: string; stderr?: string; exit?: number },
+): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const dir = await Deno.makeTempDir();
+  const path = `${dir}/mise`;
+  const script = [
+    "#!/bin/sh",
+    opts.stdout ? `cat <<'STDOUT_EOF'\n${opts.stdout}\nSTDOUT_EOF` : "",
+    opts.stderr ? `cat >&2 <<'STDERR_EOF'\n${opts.stderr}\nSTDERR_EOF` : "",
+    `exit ${opts.exit ?? 0}`,
+  ].join("\n");
+  await Deno.writeTextFile(path, script);
+  await Deno.chmod(path, 0o755);
+  return { path, cleanup: () => Deno.remove(dir, { recursive: true }) };
+}
+
+Deno.test("exit 127 is a missing binary, not an empty result", () => {
+  assertEquals(classifyFailure(127, ""), "notfound");
+});
+
+Deno.test("a command-not-found stderr is recognised whatever the exit code", () => {
+  // some shells report 126 or 1 for this depending on how mise was invoked
+  assertEquals(classifyFailure(1, "sh: mise: command not found"), "notfound");
+  assertEquals(
+    classifyFailure(126, "bash: line 1: mise: No such file or directory"),
+    "notfound",
+  );
+});
+
+Deno.test("an ordinary failure is not mistaken for a missing binary", () => {
+  assertEquals(
+    classifyFailure(1, "error: config file is invalid toml"),
+    "failed",
+  );
+});
+
+Deno.test("a successful run returns stdout", async () => {
+  const m = await fakeMise({ stdout: '{"node":[]}' });
+  try {
+    const r = await runMise(
+      { name: "local", misePath: m.path },
+      ["ls", "--current", "--json"],
+      15,
+      new AbortController().signal,
+    );
+    assertEquals(r.ok, true);
+    assertEquals(r.ok && r.stdout.trim(), '{"node":[]}');
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a missing binary reports notfound rather than an empty tool list", async () => {
+  const r = await runMise(
+    { name: "local", misePath: "/nonexistent/mise" },
+    ["ls", "--current", "--json"],
+    15,
+    new AbortController().signal,
+  );
+  assertEquals(r.ok, false);
+  assertEquals(!r.ok && r.kind, "notfound");
+});
+
+Deno.test("stdout is withheld from the error on a failed run", async () => {
+  // stdout can carry config contents. Errors reach swamp run logs and
+  // reports, so only stderr is quoted back.
+  const m = await fakeMise({
+    stdout: "SENSITIVE-CONFIG-BODY",
+    stderr: "error: could not read config",
+    exit: 1,
+  });
+  try {
+    const r = await runMise(
+      { name: "local", misePath: m.path },
+      ["ls", "--current", "--json"],
+      15,
+      new AbortController().signal,
+    );
+    assertEquals(r.ok, false);
+    assertEquals(
+      !r.ok && r.error.includes("SENSITIVE-CONFIG-BODY"),
+      false,
+      "stdout must never reach the error string",
+    );
+    assertEquals(!r.ok && r.error.includes("could not read config"), true);
+  } finally {
+    await m.cleanup();
+  }
 });

@@ -199,6 +199,93 @@ export function sshArgs(
   ];
 }
 
+/**
+ * A shell that cannot find mise reports it in several ways depending on which
+ * shell answered: 127 is conventional, but the message alone is the reliable
+ * signal across sh, bash, and zsh. This distinction is the whole point of the
+ * unmeasured state, so it is detected on both.
+ */
+const NOT_FOUND_RE = /command not found|No such file or directory/i;
+
+export function classifyFailure(
+  code: number,
+  stderr: string,
+): "notfound" | "failed" {
+  if (code === 127 || NOT_FOUND_RE.test(stderr)) return "notfound";
+  return "failed";
+}
+
+export type RunResult =
+  | { ok: true; stdout: string }
+  | { ok: false; kind: "notfound" | "failed"; error: string };
+
+export type ParsedNode = z.infer<typeof NodeSchema>;
+
+/**
+ * Run one read-only mise subcommand against one node.
+ *
+ * Only stderr is quoted back into the error. mise prints config contents on
+ * stdout, and error strings end up in swamp run logs and reports, so stdout
+ * stays out of them.
+ */
+export async function runMise(
+  node: ParsedNode,
+  sub: string[],
+  timeoutSec: number,
+  signal: AbortSignal,
+): Promise<RunResult> {
+  const bin = node.misePath ?? "mise";
+  const cmd = node.ssh
+    ? new Deno.Command("ssh", {
+      args: sshArgs(
+        node.ssh,
+        timeoutSec,
+        remoteCommand(bin, node.dir, sub),
+      ),
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+      signal: AbortSignal.any([
+        signal,
+        AbortSignal.timeout((timeoutSec + 10) * 1000),
+      ]),
+    })
+    : new Deno.Command(bin, {
+      args: localArgs(node.dir, sub),
+      stdin: "null",
+      stdout: "piped",
+      stderr: "piped",
+      signal: AbortSignal.any([
+        signal,
+        AbortSignal.timeout((timeoutSec + 10) * 1000),
+      ]),
+    });
+
+  try {
+    const out = await cmd.output();
+    const stderr = new TextDecoder().decode(out.stderr).trim();
+    if (!out.success) {
+      return {
+        ok: false,
+        kind: classifyFailure(out.code, stderr),
+        error: stderr.slice(0, 160) || `exit ${out.code}`,
+      };
+    }
+    return { ok: true, stdout: new TextDecoder().decode(out.stdout) };
+  } catch (e) {
+    // Deno throws NotFound when the local binary itself is absent, which is
+    // the same fact as a shell's 127 and must classify the same way.
+    const msg = (e as Error).message;
+    return {
+      ok: false,
+      kind: e instanceof Deno.errors.NotFound
+        ? "notfound"
+        : classifyFailure(-1, msg),
+      error: msg.slice(0, 160),
+    };
+  }
+}
+
 export const model = {
   type: "@jpisgeek/mise",
   version: "2026.08.24.1",
