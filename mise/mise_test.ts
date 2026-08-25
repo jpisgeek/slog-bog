@@ -152,6 +152,13 @@ Deno.test("every value in the remote command survived schema validation", () => 
   assertEquals(parsed.success, false, "a quote in dir must never parse");
 });
 
+Deno.test("misePath reaches the remote command unquoted, so its charset is load-bearing", () => {
+  for (const misePath of ["mise$(id)", "mise`id`", "mise path", "mise|tee"]) {
+    const r = GlobalArgsSchema.safeParse({ nodes: [{ name: "n", misePath }] });
+    assertEquals(r.success, false, `misePath should be rejected: ${misePath}`);
+  }
+});
+
 Deno.test("ssh flags fail closed and never spawn a local shell", () => {
   const args = sshArgs(
     { host: "host.example.com", user: "reader", port: 2222 },

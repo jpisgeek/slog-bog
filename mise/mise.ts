@@ -142,7 +142,7 @@ export function classifyTool(
   return drift;
 }
 
-/** The three read-only invocations this model ever makes. */
+/** The read-only invocations this model ever makes. */
 export const SUB_LS = ["ls", "--current", "--json"];
 export const SUB_CONFIG = ["config", "ls", "--json"];
 export const SUB_OUTDATED = ["outdated", "--json"];
@@ -158,10 +158,12 @@ export function localArgs(dir: string | undefined, sub: string[]): string[] {
 }
 
 /**
- * The one place operator data is interpolated into a string a remote shell
- * will parse. `dir` is single-quoted, which is sufficient rather than merely
- * hopeful because the schema has already refused any value containing a
- * quote. Everything else in the string is a fixed literal.
+ * Two operator-supplied values reach this string: `misePath` unquoted at the
+ * start and `dir` single-quoted in the -C flag. Each is safe only because its
+ * schema regex forbids every shell metacharacter. The quoting around dir is
+ * sufficient rather than merely hopeful because the schema has already refused
+ * any value containing a quote. Loosening either SAFE_BIN_PATH or
+ * SAFE_ABS_PATH breaks the command without changing its text.
  */
 export function remoteCommand(
   misePath: string,
