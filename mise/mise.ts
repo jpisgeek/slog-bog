@@ -142,6 +142,61 @@ export function classifyTool(
   return drift;
 }
 
+/** The three read-only invocations this model ever makes. */
+export const SUB_LS = ["ls", "--current", "--json"];
+export const SUB_CONFIG = ["config", "ls", "--json"];
+export const SUB_OUTDATED = ["outdated", "--json"];
+export const SUB_VERSION = ["--version"];
+export const SUB_TRUST = ["trust", "--show"];
+
+/**
+ * Local argv. Handed straight to Deno.Command, which does not go through a
+ * shell, so nothing here can be reinterpreted no matter what dir holds.
+ */
+export function localArgs(dir: string | undefined, sub: string[]): string[] {
+  return dir ? ["-C", dir, ...sub] : [...sub];
+}
+
+/**
+ * The one place operator data is interpolated into a string a remote shell
+ * will parse. `dir` is single-quoted, which is sufficient rather than merely
+ * hopeful because the schema has already refused any value containing a
+ * quote. Everything else in the string is a fixed literal.
+ */
+export function remoteCommand(
+  misePath: string,
+  dir: string | undefined,
+  sub: string[],
+): string {
+  const parts = [misePath];
+  if (dir) parts.push("-C", `'${dir}'`);
+  parts.push(...sub);
+  return parts.join(" ");
+}
+
+/**
+ * BatchMode=yes so an unknown host key or a password prompt fails closed
+ * instead of hanging a sweep forever. ConnectTimeout is capped at ten seconds
+ * because a switched-off host should not consume the whole per-node budget
+ * before the command even starts.
+ */
+export function sshArgs(
+  ssh: { host: string; user: string; port: number },
+  timeoutSec: number,
+  remote: string,
+): string[] {
+  return [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    `ConnectTimeout=${Math.min(timeoutSec, 10)}`,
+    "-p",
+    String(ssh.port),
+    `${ssh.user}@${ssh.host}`,
+    remote,
+  ];
+}
+
 export const model = {
   type: "@jpisgeek/mise",
   version: "2026.08.24.1",

@@ -14,7 +14,15 @@
  * Requires --allow-run --allow-write --allow-read (fake binary in a temp dir).
  */
 import { assertEquals } from "jsr:@std/assert@1";
-import { classifyTool, GlobalArgsSchema, satisfiesExpect } from "./mise.ts";
+import {
+  classifyTool,
+  GlobalArgsSchema,
+  localArgs,
+  remoteCommand,
+  satisfiesExpect,
+  sshArgs,
+  SUB_LS,
+} from "./mise.ts";
 
 const okNode = { name: "studio" };
 
@@ -113,4 +121,58 @@ Deno.test("outdated and expect failures stack onto the install state", () => {
     expectFail: true,
   });
   assertEquals(d, ["outdated", "expected"]);
+});
+
+Deno.test("local invocation is an argv array with no shell involved", () => {
+  assertEquals(localArgs("/srv/project", SUB_LS), [
+    "-C",
+    "/srv/project",
+    "ls",
+    "--current",
+    "--json",
+  ]);
+  assertEquals(localArgs(undefined, SUB_LS), ["ls", "--current", "--json"]);
+});
+
+Deno.test("remote command single-quotes the dir and nothing else", () => {
+  assertEquals(
+    remoteCommand("mise", "/srv/project", SUB_LS),
+    "mise -C '/srv/project' ls --current --json",
+  );
+  assertEquals(
+    remoteCommand("/opt/homebrew/bin/mise", undefined, SUB_LS),
+    "/opt/homebrew/bin/mise ls --current --json",
+  );
+});
+
+Deno.test("every value in the remote command survived schema validation", () => {
+  const parsed = GlobalArgsSchema.safeParse({
+    nodes: [{ name: "n", dir: "/srv/it's" }],
+  });
+  assertEquals(parsed.success, false, "a quote in dir must never parse");
+});
+
+Deno.test("ssh flags fail closed and never spawn a local shell", () => {
+  const args = sshArgs(
+    { host: "host.example.com", user: "reader", port: 2222 },
+    15,
+    "mise ls --current --json",
+  );
+  assertEquals(args, [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-p",
+    "2222",
+    "reader@host.example.com",
+    "mise ls --current --json",
+  ]);
+});
+
+Deno.test("connect timeout is capped at ten seconds", () => {
+  const args = sshArgs({ host: "h.example.com", user: "u", port: 22 }, 90, "x");
+  assertEquals(args[3], "ConnectTimeout=10");
+  const quick = sshArgs({ host: "h.example.com", user: "u", port: 22 }, 5, "x");
+  assertEquals(quick[3], "ConnectTimeout=5");
 });
