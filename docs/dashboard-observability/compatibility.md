@@ -75,6 +75,21 @@ trusted, or installed.
   evidence as a future optional multi-cloud adapter source.** Local hosted-AI
   collectors and bundle contracts remain authoritative.
 
+#### Task 10 re-check
+
+Registry version `2026.08.24.1` still composes unrelated cloud providers and
+does not cover Claude Platform organization Usage and Cost Admin APIs. Its
+Anthropic dependency, `@webframp/anthropic/analytics`, covers only Claude
+Enterprise Analytics and advertises a cost resource that is "zeroed otherwise"
+when cost reports are unavailable. That conflicts with the approved rule that
+missing is not zero. Registry metadata also does not expose its resource
+schemas, pagination completeness, or dashboard bundle contract.
+
+**Decision:** reject both as Task 10 dependencies. The local implementation
+supports the separately documented Platform and Enterprise API families,
+credential types, unavailable capabilities, minor-unit cost strings, refresh
+timestamps, and grouped-result coverage limits without unrelated packages.
+
 ### `@dougschaefer/openai-usage`
 
 - **Observed registry version:** `2026.06.29.1`

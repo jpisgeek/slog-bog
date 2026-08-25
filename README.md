@@ -9,6 +9,7 @@ dashboards) belong in your own models, not here.
 
 | Extension                      | Version        | Source                                       | What it is                                                                                                              |
 | ------------------------------ | -------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `@jpisgeek/anthropic-usage`    | `2026.08.25.1` | [`anthropic-usage/`](anthropic-usage/)       | Local Anthropic Platform and Claude Enterprise organization usage and cost collection.                                  |
 | `@jpisgeek/dashboard`          | `2026.08.25.1` | [`dashboard/`](dashboard/)                   | Renders explicit provider-neutral dashboard bundle v1 inputs as a self-contained, exceptions-first HTML status page.    |
 | `@jpisgeek/dashboard-homelab`  | `2026.08.25.1` | [`dashboard-homelab/`](dashboard-homelab/)   | Provider-neutral dashboard bundle adapter for the local Netdata, TrueNAS, and Firewalla collector contracts.            |
 | `@jpisgeek/dashboard-lmstudio` | `2026.08.25.1` | [`dashboard-lmstudio/`](dashboard-lmstudio/) | Provider-neutral dashboard adapter for @jpisgeek/lmstudio endpoint and per-request probes.                              |

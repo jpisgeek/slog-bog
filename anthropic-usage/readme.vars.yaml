@@ -1,0 +1,32 @@
+package: "@jpisgeek/anthropic-usage"
+purpose: >-
+  Collects organization token usage and authoritative cost from either the
+  Claude Platform Usage and Cost Admin API or the separate Claude Enterprise
+  Analytics API. Product and credential capabilities are explicit, and
+  unavailable, unsupported, partial, or capped coverage never becomes zero.
+example: |
+  globalArguments:
+    accountKind: platform
+    authentication: api-key
+    credential: ${{ vault.get("example-vault", "ANTHROPIC_ADMIN_KEY") }}
+    timeoutMs: 15000
+  reports:
+    require:
+      - '@jpisgeek/anthropic-usage'
+
+  # Use accountKind: enterprise with an Analytics API key for claude.ai.
+caveats: >-
+  Platform and Enterprise credentials are not interchangeable. Platform usage
+  reports do not expose request counts. Enterprise cost and usage are available
+  only to eligible plans; grouped buckets can omit groups beyond Anthropic's
+  documented top-100 cap, and recent values may be revised for 30 days. Cost
+  amounts are retained in provider minor units. This extension does not inspect
+  personal subscriptions, infer remaining quota, or calculate cost from a
+  mutable public price table.
+security: >-
+  Supply credentials through a Swamp vault expression. They are marked
+  sensitive, sent only to the fixed official HTTPS API origin, and never
+  persisted in resources, errors, report output, or URLs. Response bodies and
+  server error text are discarded. Workspace, model, product, and description
+  breakdowns may reveal internal workload names, so protect stored data and
+  dashboards accordingly.

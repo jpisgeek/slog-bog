@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-9 complete; Task 10 pending
+- **Phase:** BUILD — Tasks 1-10 complete; Task 11 pending
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
 - **Build:** in progress
-- **Completed tasks:** 9 of 16
+- **Completed tasks:** 10 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 
@@ -245,6 +245,9 @@ each distinct state and performance unit.
 authorization, malformed responses, missing dimensions, and exact totals.
 
 ### Task 10: Build local Anthropic usage collection
+
+**Status:** complete — implementation and evidence are recorded in
+[anthropic-usage.md](anthropic-usage.md).
 
 **Goal:** observe eligible Anthropic organization or enterprise usage through
 official supported APIs.
