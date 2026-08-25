@@ -11,6 +11,11 @@
  * non-login shell's PATH, and an empty tool list from a host that never ran
  * mise reads exactly like a host that is perfectly clean. So every failure to
  * measure is recorded as a failure to measure, never as a zero.
+ *
+ * The same rule holds one level down. A host that answers the tool list but
+ * not the outdated probe is written as degraded, with the subcommands that
+ * went quiet named on the record, because a drift count from a probe that
+ * never ran is not a low count. It is no count at all.
  */
 import { z } from "npm:zod@4";
 
@@ -118,17 +123,29 @@ export const GlobalArgsSchema = z.object({
 /**
  * Every way a host's tools or config can diverge from what mise's own config
  * asked for, plus "unmeasured" for a host that could not be asked at all. A
- * flat union rather than one boolean per condition because a single tool can
+ * flat list rather than one boolean per condition because a single tool can
  * carry more than one at once, installed but outdated and also failing the
  * fleet-wide expect, for instance.
+ *
+ * This array is the only source of truth. The Drift type and the zod enum
+ * the resource schemas validate against are both derived from it, so a
+ * misspelled class fails at write time instead of settling into the bog as
+ * published data nobody can query for.
  */
-export type Drift =
-  | "notinstalled"
-  | "notactive"
-  | "notineffect"
-  | "outdated"
-  | "expected"
-  | "unmeasured";
+const DRIFT_CLASSES = [
+  "notinstalled",
+  "notactive",
+  "notineffect",
+  "outdated",
+  "expected",
+  "unmeasured",
+] as const;
+
+/** One drift class, derived from DRIFT_CLASSES so the two cannot part ways. */
+export type Drift = typeof DRIFT_CLASSES[number];
+
+/** The same list as a zod enum, for the drift arrays the resources carry. */
+const DriftEnum = z.enum(DRIFT_CLASSES);
 
 /**
  * The only two facts classifyTool needs to place a tool on the
@@ -242,11 +259,14 @@ export function sshArgs(
  * unreadable config or a broken shim. Those hosts ran mise and hit a real
  * problem, so matching that phrase loosely would file a measured failure as
  * "never measured", inverting the one distinction this model is built on.
- * It is therefore only accepted behind a shell prefix.
+ * It is therefore only accepted behind a named shell at the start of a line,
+ * optionally by way of the "line 1:" that bash adds. Matching any word ending
+ * in "sh" was too loose by half: mise's own "failed to refresh: No such file
+ * or directory" ends in "sh" and would have been filed as a missing binary.
  */
 const CMD_NOT_FOUND_RE = /command not found/i;
 const SHELL_NO_SUCH_FILE_RE =
-  /(?:^|\n)[^\n]*sh: [^\n]*No such file or directory/i;
+  /(?:^|\n)(?:[^\s:]*\/)?(?:ash|bash|csh|dash|fish|ksh|sh|tcsh|zsh): (?:line \d+: )?[^\n]*No such file or directory/i;
 
 /**
  * Turns an exit code and stderr into the two-way split the rest of the model
@@ -479,14 +499,31 @@ const NodeStateSchema = z.object({
    * zero ones, because zero is a measurement and this is the absence of one.
    */
   measured: z.boolean(),
-  reachable: z.boolean(),
+  /**
+   * mise answered, but at least one of the follow-up subcommands did not.
+   * The drift counts on a degraded node are a floor rather than a total: the
+   * outdated probe has to reach an upstream registry, and a host busy enough
+   * to time it out still reports every tool it has. Read this before reading
+   * a zero as good news.
+   */
+  degraded: z.boolean(),
+  /** Which subcommands went unanswered: "config", "outdated", "trust", "version". */
+  failedSubcommands: z.array(z.string()),
+  /**
+   * On an unmeasured host, "notfound" when mise itself was absent and
+   * "failed" when mise ran and hit a real problem. null on a host that
+   * answered. A not-found host usually wants misePath set, which is a
+   * different errand from a host that is off the network.
+   */
+  failureKind: z.string().nullable(),
   transport: z.string(),
   error: z.string().nullable(),
   miseVersion: z.string().nullable(),
+  /** The directory the reading came from. null means wherever an ssh login lands. */
   dir: z.string().nullable(),
   configCount: z.number().nullable(),
   toolCount: z.number().nullable(),
-  drift: z.array(z.string()),
+  drift: z.array(DriftEnum),
 });
 
 const ToolStateSchema = z.object({
@@ -501,7 +538,7 @@ const ToolStateSchema = z.object({
   active: z.boolean(),
   outdated: z.boolean(),
   latestVersion: z.string().nullable(),
-  drift: z.array(z.string()),
+  drift: z.array(DriftEnum),
 });
 
 const ConfigStateSchema = z.object({
@@ -517,6 +554,13 @@ const SummarySchema = z.object({
   nodes: z.number(),
   nodesMeasured: z.number(),
   nodesUnmeasured: z.number(),
+  /**
+   * Measured hosts where a follow-up subcommand went unanswered. While this
+   * is above zero, every drift total below is a floor rather than a count of
+   * everything out there. A sweep that could not run the outdated probe on
+   * half the fleet still reports the outdated it found, and no more.
+   */
+  nodesDegraded: z.number(),
   tools: z.number(),
   notinstalled: z.number(),
   notactive: z.number(),
@@ -559,13 +603,46 @@ function identityKey(parts: string[]): string {
  * they look once flattened.
  */
 function resourceName(prefix: string, ...parts: string[]): string {
-  const flat = parts
-    .map((p) =>
-      p.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase().replace(/^-+|-+$/g, "")
-    )
-    .filter((p) => p !== "")
-    .join("-");
+  const flat = parts.map(slugPart).join("-");
   return `${prefix}-${flat || "id"}-${fnv1a(identityKey(parts))}`;
+}
+
+/**
+ * One identity part, flattened for the readable half of a resource name. A
+ * part that flattens away to nothing becomes "x" rather than disappearing, so
+ * every part keeps its position and the node name is always the first segment
+ * after the prefix. That is what lets nodePrefix name a host's whole run of
+ * resources without knowing which tools it had.
+ */
+function slugPart(p: string): string {
+  const s = p
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .toLowerCase()
+    .replace(/^-+|-+$/g, "");
+  return s === "" ? "x" : s;
+}
+
+/**
+ * The leading text every tool or config resource name for one host shares.
+ * The prune uses it to leave a host's stored rows alone when this sweep could
+ * not measure that host. One node name that slugs to a prefix of another's
+ * covers both, which errs towards keeping records rather than deleting them.
+ */
+function nodePrefix(prefix: string, node: string): string {
+  return `${prefix}-${slugPart(node)}-`;
+}
+
+/**
+ * Where a local sweep actually looks. Null when the runtime will not say,
+ * which records the same "we do not know" the ssh case does rather than
+ * writing down a directory nobody read.
+ */
+function currentDir(): string | null {
+  try {
+    return Deno.cwd();
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -583,8 +660,10 @@ export const model = {
   resources: {
     node: {
       description:
-        "One record per host: whether mise answered at all, which directory " +
-        "was measured, and how much drift was found there.",
+        "One record per host: whether mise answered at all, whether it " +
+        "answered in full, which directory the reading came from, and how " +
+        "much drift was found there. A null dir means an ssh node with no " +
+        "dir set, where the reading comes from wherever the login lands.",
       schema: NodeStateSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
@@ -617,7 +696,11 @@ export const model = {
       description:
         "Ask every configured host what toolchain it is running and write " +
         "down where that disagrees with its own config. Read-only: nothing " +
-        "is installed, upgraded, or trusted.",
+        "is installed, upgraded, or trusted. A full sweep prunes tool and " +
+        "config records that have departed. A single-node run never deletes " +
+        "anything, and neither does a host that came back unmeasured or only " +
+        "part measured, which keeps its stored rows rather than having them " +
+        "read as gone.",
       arguments: z.object({
         node: z.string().optional().describe("Limit the sweep to one node"),
       }),
@@ -652,105 +735,175 @@ export const model = {
             const node = queue.shift();
             if (!node) return;
             const transport = node.ssh ? "ssh" : "local";
-            const run = (sub: string[]) =>
-              runMise(node, sub, g.timeoutSec, ctx.signal);
+            // What was measured, not what the operator typed. Left as the
+            // raw input, two sweeps run from different working directories
+            // would judge different configs and both record dir: null.
+            const dir = node.dir ?? (node.ssh ? null : currentDir());
+            try {
+              const run = (sub: string[]) =>
+                runMise(node, sub, g.timeoutSec, ctx.signal);
 
-            const ls = await run(SUB_LS);
-            if (!ls.ok) {
-              // The honesty case. Counts stay null so that "we could not ask"
-              // never reads downstream as "there was nothing to find".
+              const ls = await run(SUB_LS);
+              if (!ls.ok) {
+                // The honesty case. Counts stay null so that "we could not
+                // ask" never reads downstream as "there was nothing to find".
+                ctx.logger.warning(
+                  "{name} unmeasured ({kind}): {err}",
+                  { name: node.name, kind: ls.kind, err: ls.error },
+                );
+                nodeStates.push({
+                  name: node.name,
+                  measured: false,
+                  // Not part measured, not measured at all. The unmeasured
+                  // drift record below carries that whole fact on its own.
+                  degraded: false,
+                  failedSubcommands: [],
+                  failureKind: ls.kind,
+                  transport,
+                  error: ls.error,
+                  miseVersion: null,
+                  dir,
+                  configCount: null,
+                  toolCount: null,
+                  drift: ["unmeasured"],
+                });
+                continue;
+              }
+
+              const rows = parseLsCurrent(ls.stdout);
+              const ver = await run(SUB_VERSION);
+              const cfg = await run(SUB_CONFIG);
+              const outd = await run(SUB_OUTDATED);
+              const trust = await run(SUB_TRUST);
+
+              // A subcommand that never answered leaves a hole in the
+              // reading, and the empty object it falls back to is shaped
+              // exactly like good news. `outdated` is the one that has to
+              // reach upstream registries, so on a busy host it is the one
+              // that times out, and a drift sweep reporting no drift because
+              // its drift probe timed out is the single thing this model
+              // exists to prevent. Every hole is named here instead.
+              const failed: string[] = [];
+              if (!cfg.ok) failed.push("config");
+              if (!outd.ok) failed.push("outdated");
+              if (!trust.ok) failed.push("trust");
+              if (!ver.ok) failed.push("version");
+              if (failed.length > 0) {
+                ctx.logger.warning(
+                  "{name} answered in part, no reading from: {subs}",
+                  { name: node.name, subs: failed.join(", ") },
+                );
+              }
+
+              const outdated = outd.ok ? parseOutdated(outd.stdout) : {};
+              const configs = cfg.ok ? parseConfigLs(cfg.stdout) : [];
+              const trusted = trust.ok ? parseTrustShow(trust.stdout) : {};
+
+              const nodeDrift = new Set<Drift>();
+              for (const r of rows) {
+                // Tool names are keys off a remote host's JSON, so every
+                // lookup by one is guarded. A tool called "constructor" or
+                // "__proto__" otherwise reads a function off the prototype
+                // chain, which passes an undefined check and then lands in a
+                // field typed string.
+                const expected = Object.hasOwn(g.expect, r.tool)
+                  ? g.expect[r.tool]
+                  : undefined;
+                const expectFail = expected !== undefined &&
+                  r.resolvedVersion !== null &&
+                  !satisfiesExpect(expected, r.resolvedVersion);
+                const isOutdated = Object.hasOwn(outdated, r.tool);
+                const drift = classifyTool(r, {
+                  outdated: isOutdated,
+                  expectFail,
+                });
+                for (const d of drift) nodeDrift.add(d);
+                toolStates.push({
+                  node: node.name,
+                  tool: r.tool,
+                  requestedVersion: r.requestedVersion,
+                  resolvedVersion: r.resolvedVersion,
+                  installPath: r.installPath,
+                  sourceType: r.sourceType,
+                  sourcePath: r.sourcePath,
+                  installed: r.installed,
+                  active: r.active,
+                  outdated: isOutdated,
+                  latestVersion: isOutdated ? outdated[r.tool] : null,
+                  drift,
+                });
+              }
+
+              // Config paths come off the same remote JSON as tool names and
+              // need the same guard: parseConfigLs asks only for a non-empty
+              // string, so "__proto__" reaches this lookup.
+              const trustOf = (p: string): boolean | null =>
+                Object.hasOwn(trusted, p) ? trusted[p] : null;
+              const present = rows.map((r) => r.tool);
+              for (const c of configs) {
+                const missing = notInEffect(c.tools, present);
+                if (missing.length > 0) nodeDrift.add("notineffect");
+                configStates.push({
+                  node: node.name,
+                  path: c.path,
+                  // trust --show reports the directory, config ls the file,
+                  // so a miss here is unknown rather than false.
+                  trusted: trustOf(c.path) ??
+                    trustOf(c.path.replace(/\/[^/]+$/, "")),
+                  toolsDeclared: c.tools,
+                  toolsInEffect: c.tools.filter((t) => present.includes(t)),
+                  toolsNotInEffect: missing,
+                });
+              }
+
+              nodeStates.push({
+                name: node.name,
+                measured: true,
+                degraded: failed.length > 0,
+                failedSubcommands: failed,
+                failureKind: null,
+                transport,
+                // A degraded host is not a clean host, so it does not get to
+                // report a null error while quietly missing a reading.
+                error: failed.length > 0
+                  ? `part measured, no answer from: ${failed.join(", ")}`
+                  : null,
+                miseVersion: ver.ok
+                  ? (ver.stdout.trim().split(" ")[0] || null)
+                  : null,
+                dir,
+                // Zero configs is a measurement. No answer from config ls is
+                // the absence of one, and null is how that is written down.
+                configCount: cfg.ok ? configs.length : null,
+                toolCount: rows.length,
+                drift: [...nodeDrift],
+              });
+            } catch (e) {
+              // One host's unexpected throw must not discard the fleet. The
+              // workers run under Promise.all, so an escaping error would
+              // take the whole sweep with it and nothing at all would be
+              // written, including for every host that answered.
+              const msg = (e as Error)?.message ?? String(e);
               ctx.logger.warning(
-                "{name} unmeasured ({kind}): {err}",
-                { name: node.name, kind: ls.kind, err: ls.error },
+                "{name} threw mid-sweep, recorded unmeasured: {err}",
+                { name: node.name, err: msg },
               );
               nodeStates.push({
                 name: node.name,
                 measured: false,
-                // Deliberately false even when ssh itself connected and only
-                // mise was missing. The schema has no field for "answered but
-                // could not be measured", so `measured` carries that signal
-                // and `error` keeps the kind.
-                reachable: false,
+                degraded: false,
+                failedSubcommands: [],
+                // Nothing here says mise was absent. The sweep broke.
+                failureKind: "failed",
                 transport,
-                error: ls.error,
+                error: msg.slice(0, 160),
                 miseVersion: null,
-                dir: node.dir ?? null,
+                dir,
                 configCount: null,
                 toolCount: null,
                 drift: ["unmeasured"],
               });
-              continue;
             }
-
-            const rows = parseLsCurrent(ls.stdout);
-            const ver = await run(SUB_VERSION);
-            const cfg = await run(SUB_CONFIG);
-            const outd = await run(SUB_OUTDATED);
-            const trust = await run(SUB_TRUST);
-
-            const outdated = outd.ok ? parseOutdated(outd.stdout) : {};
-            const configs = cfg.ok ? parseConfigLs(cfg.stdout) : [];
-            const trusted = trust.ok ? parseTrustShow(trust.stdout) : {};
-
-            const nodeDrift = new Set<string>();
-            for (const r of rows) {
-              const expected = g.expect[r.tool];
-              const expectFail = expected !== undefined &&
-                r.resolvedVersion !== null &&
-                !satisfiesExpect(expected, r.resolvedVersion);
-              const isOutdated = Object.hasOwn(outdated, r.tool);
-              const drift = classifyTool(r, {
-                outdated: isOutdated,
-                expectFail,
-              });
-              for (const d of drift) nodeDrift.add(d);
-              toolStates.push({
-                node: node.name,
-                tool: r.tool,
-                requestedVersion: r.requestedVersion,
-                resolvedVersion: r.resolvedVersion,
-                installPath: r.installPath,
-                sourceType: r.sourceType,
-                sourcePath: r.sourcePath,
-                installed: r.installed,
-                active: r.active,
-                outdated: isOutdated,
-                latestVersion: outdated[r.tool] ?? null,
-                drift,
-              });
-            }
-
-            const present = rows.map((r) => r.tool);
-            for (const c of configs) {
-              const missing = notInEffect(c.tools, present);
-              if (missing.length > 0) nodeDrift.add("notineffect");
-              configStates.push({
-                node: node.name,
-                path: c.path,
-                // trust --show reports the directory, config ls the file, so
-                // a miss here is unknown rather than false.
-                trusted: trusted[c.path] ??
-                  trusted[c.path.replace(/\/[^/]+$/, "")] ?? null,
-                toolsDeclared: c.tools,
-                toolsInEffect: c.tools.filter((t) => present.includes(t)),
-                toolsNotInEffect: missing,
-              });
-            }
-
-            nodeStates.push({
-              name: node.name,
-              measured: true,
-              reachable: true,
-              transport,
-              error: null,
-              miseVersion: ver.ok
-                ? (ver.stdout.trim().split(" ")[0] || null)
-                : null,
-              dir: node.dir ?? null,
-              configCount: configs.length,
-              toolCount: rows.length,
-              drift: [...nodeDrift],
-            });
           }
         };
         await Promise.all(
@@ -760,15 +913,31 @@ export const model = {
           ),
         );
 
+        // Every name written this sweep, and the names that must survive the
+        // prune anyway. A host that could not be measured, or that answered
+        // only in part, says nothing about which of its tools and configs
+        // still exist, so its stored rows are held rather than read as gone.
+        const live = new Set<string>();
+        const protectedPrefixes: string[] = [];
+
         for (const n of nodeStates) {
+          const name = resourceName("node", n.name);
+          live.add(name);
+          if (!n.measured || n.degraded) {
+            protectedPrefixes.push(
+              nodePrefix("tool", n.name),
+              nodePrefix("config", n.name),
+            );
+          }
           handles.push(
             await ctx.writeResource(
               "node",
-              resourceName("node", n.name),
+              name,
               n,
               {
                 tags: {
                   measured: String(n.measured),
+                  degraded: String(n.degraded),
                   transport: n.transport,
                 },
               },
@@ -776,10 +945,12 @@ export const model = {
           );
         }
         for (const t of toolStates) {
+          const name = resourceName("tool", t.node, t.tool);
+          live.add(name);
           handles.push(
             await ctx.writeResource(
               "tool",
-              resourceName("tool", t.node, t.tool),
+              name,
               t,
               {
                 tags: {
@@ -792,10 +963,12 @@ export const model = {
           );
         }
         for (const c of configStates) {
+          const name = resourceName("config", c.node, c.path);
+          live.add(name);
           handles.push(
             await ctx.writeResource(
               "config",
-              resourceName("config", c.node, c.path),
+              name,
               c,
               { tags: { node: c.node } },
             ),
@@ -804,11 +977,13 @@ export const model = {
 
         const count = (d: Drift) =>
           toolStates.filter((t) => t.drift.includes(d)).length;
+        const degradedCount = nodeStates.filter((n) => n.degraded).length;
         handles.push(
           await ctx.writeResource("summary", "summary", {
             nodes: nodeStates.length,
             nodesMeasured: nodeStates.filter((n) => n.measured).length,
             nodesUnmeasured: nodeStates.filter((n) => !n.measured).length,
+            nodesDegraded: degradedCount,
             tools: toolStates.length,
             notinstalled: count("notinstalled"),
             notactive: count("notactive"),
@@ -818,8 +993,33 @@ export const model = {
             outdated: count("outdated"),
             expected: count("expected"),
             sweptAt: new Date().toISOString(),
-          }, { tags: { nodes: String(nodeStates.length) } }),
+          }, {
+            tags: {
+              nodes: String(nodeStates.length),
+              nodesDegraded: String(degradedCount),
+            },
+          }),
         );
+        live.add("summary");
+
+        // Prune only on a full sweep. A single-node run legitimately sees one
+        // host's worth of resources, so it deletes nothing. Without this the
+        // summary and a stale tool row end up as two published views of the
+        // same fact that permanently disagree: remove a tool from a config
+        // and the summary says notinstalled is zero while last sweep's row
+        // still carries the drift.
+        if (!args.node) {
+          const existing = await ctx.dataRepository.findAllForModel(
+            ctx.modelType,
+            ctx.modelId,
+          );
+          for (const rec of existing as { name: string }[]) {
+            if (live.has(rec.name)) continue;
+            if (protectedPrefixes.some((p) => rec.name.startsWith(p))) continue;
+            await ctx.deleteResource(rec.name);
+            ctx.logger.info("pruned {name}", { name: rec.name });
+          }
+        }
 
         return { dataHandles: handles };
       },
