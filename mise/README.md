@@ -90,20 +90,26 @@ rather than dropping to zero. This matters more than it sounds: mise is
 routinely missing from a non-login shell's PATH, and a zero tool count from a
 host that never ran mise is indistinguishable from a host that is genuinely
 clean. Set `misePath` when a host records `failureKind: notfound`, which is mise
-missing from the PATH rather than a host missing from the network. A host can
-also answer in part. When a follow-up subcommand goes quiet the record is marked
-`degraded` and names it in `failedSubcommands`, and `nodesDegraded` on the
-summary counts how many hosts that happened to. While that count is above zero,
-read the drift totals as a floor rather than as everything there is to find.
-mise config is directory-scoped, so `dir` decides which config is being judged.
-Leave it off and you measure the swamp working directory locally and the login
-directory over SSH, which is rarely the question you meant to ask. The node
-record's `dir` field names the directory the reading actually came from, so what
-a sweep judged is never left to guesswork. Trust is recorded but never treated
-as drift. A plain `[tools]` file reports as untrusted while applying perfectly,
-because mise only demands trust for configs that can execute something. Node,
-tool, and config resource names all carry a hash suffix, so find them with
-`swamp data list <model>` rather than building the name by hand.
+missing from the PATH rather than a host missing from the network. A host that
+exits zero and hands back something that is not JSON records
+`failureKind: unparseable` and stays unmeasured. That one is usually a login
+shell printing a banner over the top of the answer, so the repair belongs on the
+host. A host can also answer in part. When a follow-up subcommand goes quiet, or
+answers with a payload that will not parse, the record is marked `degraded` and
+names it in `failedSubcommands`, and `nodesDegraded` on the summary counts how
+many hosts that happened to. While that count is above zero, read the drift
+totals as a floor rather than as everything there is to find. Tool rows carry
+the same flag as a `degraded` tag, so a query over rows alone cannot mistake a
+partial sweep for a clean one. mise config is directory-scoped, so `dir` decides
+which config is being judged. Leave it off and you measure the swamp working
+directory locally and the login directory over SSH, which is rarely the question
+you meant to ask. The node record's `dir` field names the directory the reading
+actually came from, so what a sweep judged is never left to guesswork. Trust is
+recorded but never treated as drift. A plain `[tools]` file reports as untrusted
+while applying perfectly, because mise only demands trust for configs that can
+execute something. Node, tool, and config resource names all carry a hash
+suffix, so find them with `swamp data list <model>` rather than building the
+name by hand.
 
 ## Security
 

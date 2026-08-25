@@ -389,6 +389,38 @@ export type ToolRow = {
   drift: Drift[];
 };
 
+/**
+ * Did this payload come back as JSON at all?
+ *
+ * A remote login shell that prints anything to stdout, a banner or a stray
+ * echo in ~/.bashrc, glues its own text to the front of mise's output, and
+ * ssh reports the whole thing as exit 0. Handed to the tolerant parsers below
+ * that payload becomes an empty result, which is exactly the shape of a host
+ * with nothing wrong. So the payload is checked before it is parsed.
+ *
+ * A valid empty object is not a failure. `{}` from `ls --current` says the
+ * config in that directory declares no tools, which is a reading and stays
+ * one. Only text that will not parse, or that parses to something other than
+ * an object or an array, counts as no answer.
+ */
+function isJsonPayload(raw: string): boolean {
+  try {
+    const v = JSON.parse(raw);
+    return typeof v === "object" && v !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The stdout of a run that both succeeded and answered in JSON, or null when
+ * either half of that failed. From a consumer's side those two are one fact:
+ * the probe did not answer, so nothing may be claimed from it.
+ */
+function jsonStdout(r: RunResult): string | null {
+  return r.ok && isJsonPayload(r.stdout) ? r.stdout : null;
+}
+
 /** JSON.parse that yields a fallback instead of throwing mid-sweep. */
 function parseJson<T>(raw: string, fallback: T): T {
   try {
@@ -510,10 +542,12 @@ const NodeStateSchema = z.object({
   /** Which subcommands went unanswered: "config", "outdated", "trust", "version". */
   failedSubcommands: z.array(z.string()),
   /**
-   * On an unmeasured host, "notfound" when mise itself was absent and
-   * "failed" when mise ran and hit a real problem. null on a host that
-   * answered. A not-found host usually wants misePath set, which is a
-   * different errand from a host that is off the network.
+   * How an unmeasured host failed. "notfound" when mise itself was absent,
+   * "failed" when mise ran and hit a real problem, and "unparseable" when the
+   * host exited zero and handed back something that is not JSON, which is
+   * usually a login shell printing over the top of the answer. null on a host
+   * that answered. Each wants a different errand, and a not-found host in
+   * particular wants misePath set rather than a look at the network.
    */
   failureKind: z.string().nullable(),
   transport: z.string(),
@@ -744,12 +778,21 @@ export const model = {
                 runMise(node, sub, g.timeoutSec, ctx.signal);
 
               const ls = await run(SUB_LS);
-              if (!ls.ok) {
+              // Two ways to learn nothing, and they take the same exit. mise
+              // never ran, or mise exited zero behind a shell that printed
+              // over the answer. Parsing the second on the tolerant path
+              // would have written a clean host with no tools.
+              const lsJson = jsonStdout(ls);
+              if (lsJson === null) {
+                const kind = ls.ok ? "unparseable" : ls.kind;
+                const err = ls.ok
+                  ? "mise exited zero with output that is not JSON"
+                  : ls.error;
                 // The honesty case. Counts stay null so that "we could not
                 // ask" never reads downstream as "there was nothing to find".
                 ctx.logger.warning(
                   "{name} unmeasured ({kind}): {err}",
-                  { name: node.name, kind: ls.kind, err: ls.error },
+                  { name: node.name, kind, err },
                 );
                 nodeStates.push({
                   name: node.name,
@@ -758,9 +801,9 @@ export const model = {
                   // drift record below carries that whole fact on its own.
                   degraded: false,
                   failedSubcommands: [],
-                  failureKind: ls.kind,
+                  failureKind: kind,
                   transport,
-                  error: ls.error,
+                  error: err,
                   miseVersion: null,
                   dir,
                   configCount: null,
@@ -770,7 +813,7 @@ export const model = {
                 continue;
               }
 
-              const rows = parseLsCurrent(ls.stdout);
+              const rows = parseLsCurrent(lsJson);
               const ver = await run(SUB_VERSION);
               const cfg = await run(SUB_CONFIG);
               const outd = await run(SUB_OUTDATED);
@@ -783,9 +826,16 @@ export const model = {
               // that times out, and a drift sweep reporting no drift because
               // its drift probe timed out is the single thing this model
               // exists to prevent. Every hole is named here instead.
+              //
+              // The two JSON probes are held to the payload rule as well as
+              // the exit code. `trust --show` and `--version` are plain text
+              // with no JSON shape to fail, so an exit code is all there is
+              // to judge them on.
+              const cfgJson = jsonStdout(cfg);
+              const outdJson = jsonStdout(outd);
               const failed: string[] = [];
-              if (!cfg.ok) failed.push("config");
-              if (!outd.ok) failed.push("outdated");
+              if (cfgJson === null) failed.push("config");
+              if (outdJson === null) failed.push("outdated");
               if (!trust.ok) failed.push("trust");
               if (!ver.ok) failed.push("version");
               if (failed.length > 0) {
@@ -795,8 +845,8 @@ export const model = {
                 );
               }
 
-              const outdated = outd.ok ? parseOutdated(outd.stdout) : {};
-              const configs = cfg.ok ? parseConfigLs(cfg.stdout) : [];
+              const outdated = outdJson === null ? {} : parseOutdated(outdJson);
+              const configs = cfgJson === null ? [] : parseConfigLs(cfgJson);
               const trusted = trust.ok ? parseTrustShow(trust.stdout) : {};
 
               const nodeDrift = new Set<Drift>();
@@ -874,7 +924,7 @@ export const model = {
                 dir,
                 // Zero configs is a measurement. No answer from config ls is
                 // the absence of one, and null is how that is written down.
-                configCount: cfg.ok ? configs.length : null,
+                configCount: cfgJson === null ? null : configs.length,
                 toolCount: rows.length,
                 drift: [...nodeDrift],
               });
@@ -884,10 +934,9 @@ export const model = {
               // take the whole sweep with it and nothing at all would be
               // written, including for every host that answered.
               const msg = (e as Error)?.message ?? String(e);
-              ctx.logger.warning(
-                "{name} threw mid-sweep, recorded unmeasured: {err}",
-                { name: node.name, err: msg },
-              );
+              // Record first, log second. The logger is the one thing in here
+              // that reaches outside this model, so it is also the one thing
+              // that can throw on the way out and take the record with it.
               nodeStates.push({
                 name: node.name,
                 measured: false,
@@ -903,6 +952,10 @@ export const model = {
                 toolCount: null,
                 drift: ["unmeasured"],
               });
+              ctx.logger.warning(
+                "{name} threw mid-sweep, recorded unmeasured: {err}",
+                { name: node.name, err: msg },
+              );
             }
           }
         };
@@ -944,6 +997,13 @@ export const model = {
             ),
           );
         }
+        // A tool row cannot say on its own that its host answered in part,
+        // and it writes outdated: false when the outdated probe never ran.
+        // The host's degraded flag rides along as a tag so a query over rows
+        // alone cannot read a partial sweep as a clean one.
+        const degradedNodes = new Set(
+          nodeStates.filter((n) => n.degraded).map((n) => n.name),
+        );
         for (const t of toolStates) {
           const name = resourceName("tool", t.node, t.tool);
           live.add(name);
@@ -957,6 +1017,7 @@ export const model = {
                   node: t.node,
                   tool: t.tool,
                   drift: t.drift.join(","),
+                  degraded: String(degradedNodes.has(t.node)),
                 },
               },
             ),

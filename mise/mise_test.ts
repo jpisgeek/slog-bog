@@ -745,6 +745,100 @@ Deno.test("an unmeasured host records how it failed, not that it is degraded", a
   assertEquals(node.failedSubcommands, []);
 });
 
+Deno.test("an unparseable ls payload is unmeasured, never zero tools", async () => {
+  // A login shell that prints anything to stdout prepends it to the payload,
+  // and ssh calls that exit zero. Parsed tolerantly it becomes no tools at
+  // all, which is the shape of a host with nothing wrong.
+  const m = await fakeMiseSuite({ ls: "welcome to the bog\n{}" });
+  try {
+    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.measured, false);
+    assertEquals(node.failureKind, "unparseable");
+    assertEquals(node.toolCount, null);
+    assertEquals(node.configCount, null);
+    assertEquals(node.drift, ["unmeasured"]);
+    // it was never part measured, so degraded stays out of it
+    assertEquals(node.degraded, false);
+    assertEquals(node.failedSubcommands, []);
+    assertEquals(c.written.filter((w) => w.spec === "tool").length, 0);
+    const summary = c.written.find((w) => w.spec === "summary")!.data;
+    assertEquals(summary.nodesUnmeasured, 1);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a valid empty ls payload is a reading of zero tools", async () => {
+  // The other half of the same rule, and the half an over-eager fix breaks.
+  // {} says the config in that directory declares no tools. That is a
+  // measurement of zero, not an absence of one.
+  const m = await fakeMiseSuite({ ls: "{}" });
+  try {
+    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.measured, true);
+    assertEquals(node.toolCount, 0);
+    assertEquals(node.failureKind, null);
+    assertEquals(node.degraded, false);
+    assertEquals(node.drift, []);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a probe that exits zero with junk did not answer either", async () => {
+  const m = await fakeMiseSuite({
+    ls: LS_CURRENT_CLEAN,
+    config: "welcome to the bog\n[]",
+    outdated: "welcome to the bog\n{}",
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.measured, true, "the tool list itself was readable");
+    assertEquals(node.degraded, true);
+    assertEquals(node.failedSubcommands, ["config", "outdated"]);
+    assertEquals(node.configCount, null);
+    assertEquals(c.written.filter((w) => w.spec === "config").length, 0);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a tool row carries its host's degraded flag", async () => {
+  const partial = await fakeMiseSuite({
+    ls: LS_CURRENT_CLEAN,
+    fail: ["outdated"],
+  });
+  const whole = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const c = mockCtx({
+      nodes: [
+        { name: "studio", misePath: partial.path },
+        { name: "builder", misePath: whole.path },
+      ],
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const tagsFor = (node: string) => {
+      const w = c.written.find((w) =>
+        w.spec === "tool" && w.data.node === node
+      )!;
+      return (w.opts as { tags?: Record<string, string> }).tags ?? {};
+    };
+    // The row itself writes outdated: false because the probe never ran, so
+    // without the tag a query over rows alone reads this host as clean.
+    assertEquals(tagsFor("studio").degraded, "true");
+    assertEquals(tagsFor("builder").degraded, "false");
+  } finally {
+    await partial.cleanup();
+    await whole.cleanup();
+  }
+});
+
 // ---- untrusted keys from a remote host -----------------------------------
 
 Deno.test("a hostile tool name cannot reach the prototype chain", async () => {
