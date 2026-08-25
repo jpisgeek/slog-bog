@@ -1,0 +1,22 @@
+manifestVersion: 1
+name: "@jpisgeek/dashboard-vertical-slice-fixture"
+version: 2026.08.25.1
+description: Public-safe synthetic Netdata-shaped collector for dashboard workflow verification.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/examples/dashboard-vertical-slice
+paths:
+  base: manifest
+models:
+  - synthetic_netdata.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles: []
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - fixture
+  - dashboard
+dependencies: []

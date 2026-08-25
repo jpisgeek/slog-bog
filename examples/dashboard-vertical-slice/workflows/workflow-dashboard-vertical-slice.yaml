@@ -1,0 +1,44 @@
+id: f8b80d4e-d8d8-4728-933b-1209e1d60aa2
+name: dashboard-vertical-slice
+tags: {}
+description: >-
+  Public-safe collector to normalized report to explicit bundle renderer proof.
+inputs:
+  type: object
+  properties:
+    mode:
+      type: string
+      enum:
+        - healthy
+        - partial
+      default: healthy
+jobs:
+  - name: main
+    description: Observe, normalize through the required report, then render.
+    steps:
+      - name: observe
+        description: Write deterministic typed collector resources.
+        task:
+          type: model_method
+          modelIdOrName: synthetic-netdata
+          methodName: discover
+          inputs:
+            mode: "${{ inputs.mode }}"
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: render
+        description: Pass the exact persisted report JSON into the renderer.
+        task:
+          type: model_method
+          modelIdOrName: synthetic-dashboard
+          methodName: render
+        dependsOn:
+          - step: observe
+            condition:
+              type: succeeded
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

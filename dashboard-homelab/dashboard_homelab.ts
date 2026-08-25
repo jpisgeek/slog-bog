@@ -404,7 +404,7 @@ interface DataHandle {
 
 interface ReportContext {
   scope: "method" | "model";
-  modelType: string;
+  modelType: string | { toString(): string };
   modelId: string;
   definition: { name: string; version: number };
   methodName: string;
@@ -414,12 +414,16 @@ interface ReportContext {
   dataHandles: DataHandle[];
   dataRepository: {
     getContent(
-      type: string,
+      type: string | { toString(): string },
       modelId: string,
       dataName: string,
       version?: number,
     ): Promise<Uint8Array | null>;
   };
+}
+
+function modelTypeName(ctx: ReportContext): string {
+  return String(ctx.modelType);
 }
 
 const sensitivity = {
@@ -630,7 +634,7 @@ function specName(handle: DataHandle): string | undefined {
 }
 
 async function readRecords(ctx: ReportContext): Promise<ReadResult> {
-  const schemas = sourceSchemas[ctx.modelType];
+  const schemas = sourceSchemas[modelTypeName(ctx)];
   const records: Record<string, Json[]> = Object.fromEntries(
     Object.keys(schemas).map((name) => [name, []]),
   );
@@ -736,7 +740,7 @@ function sourceFailureExceptions(
     subject: ctx.definition.name,
     headline: "Collector record rejected",
     detail,
-    source: ctx.modelType,
+    source: modelTypeName(ctx),
     suppressed: false,
     suppressReason: "",
     sensitivity: "operational" as const,
@@ -751,7 +755,7 @@ function sourceFailureExceptions(
       detail: unauthorized
         ? "collector authentication or authorization failed; inspect the Swamp run log"
         : "collector execution failed; inspect the Swamp run log",
-      source: ctx.modelType,
+      source: modelTypeName(ctx),
       suppressed: false,
       suppressReason: "",
       sensitivity: "operational",
@@ -1012,13 +1016,14 @@ function firewallaSection(ctx: ReportContext, read: ReadResult) {
 export async function normalize(
   ctx: ReportContext,
 ): Promise<DashboardBundleV1> {
-  if (!sourceSchemas[ctx.modelType]) {
-    throw new Error(`unsupported homelab collector type ${ctx.modelType}`);
+  const modelType = modelTypeName(ctx);
+  if (!sourceSchemas[modelType]) {
+    throw new Error(`unsupported homelab collector type ${modelType}`);
   }
   const read = await readRecords(ctx);
-  const section = ctx.modelType === "@jpisgeek/netdata"
+  const section = modelType === "@jpisgeek/netdata"
     ? netdataSection(ctx, read)
-    : ctx.modelType === "@jpisgeek/truenas"
+    : modelType === "@jpisgeek/truenas"
     ? trueNasSection(ctx, read)
     : firewallaSection(ctx, read);
   const parsedSection = DashboardSectionSchema.parse(section);
@@ -1030,7 +1035,7 @@ export async function normalize(
     producer: {
       extension: "@jpisgeek/dashboard-homelab",
       extensionVersion: "2026.08.25.1",
-      modelType: ctx.modelType,
+      modelType,
       modelName: ctx.definition.name,
       modelId: ctx.modelId,
       dataName: "report-jpisgeek-dashboard-homelab-json",

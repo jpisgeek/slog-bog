@@ -580,7 +580,7 @@ function collectExceptions(
     }
     const states = [
       { id: bundle.id, title: bundle.title, state: bundle.state, summary: "" },
-      ...bundle.sections.map((s) => ({
+      ...bundle.sections.filter((s) => s.state !== bundle.state).map((s) => ({
         id: `${bundle.id}:${s.id}`,
         title: s.title,
         state: s.state,

@@ -184,6 +184,7 @@ Deno.test("partial coverage appears before any reassuring summary", async () => 
   assertEquals(rendered.result.coverageStates, {
     "synthetic-bundle": "partial",
   });
+  assertEquals(rendered.result.exceptions, 1);
 });
 
 Deno.test("non-healthy state without an exception never renders zero things", async () => {

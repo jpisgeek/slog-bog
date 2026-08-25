@@ -277,6 +277,19 @@ Deno.test("report emits the exact persisted JSON contract name", async () => {
   assertStringIncludes(result.markdown, "State");
 });
 
+Deno.test("live coercible ModelType values select the correct adapter", async () => {
+  const base = context("@jpisgeek/netdata", [
+    { spec: "node", name: "node-a", value: netdataNode() },
+    { spec: "summary", name: "summary", value: netdataSummary() },
+  ]);
+  const liveLike = {
+    ...base,
+    modelType: { toString: () => "@jpisgeek/netdata" },
+  };
+  const bundle = await normalize(liveLike);
+  assertEquals(bundle.sections[0].id, "netdata");
+});
+
 Deno.test("published entry point contains the canonical contract verbatim", async () => {
   const entry = await Deno.readTextFile(
     new URL("./dashboard_homelab.ts", import.meta.url),
