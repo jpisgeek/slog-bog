@@ -1,0 +1,46 @@
+id: 0f2c1dc3-3ab2-460a-8f3e-b5c4ad378d85
+name: "@jpisgeek/dashboard-homelab-only"
+tags: {}
+description: Render explicitly selected homelab bundles from normalized reports.
+inputs:
+  type: object
+  properties:
+    includeNetdata:
+      type: boolean
+      default: true
+    includeTruenas:
+      type: boolean
+      default: true
+    includeFirewalla:
+      type: boolean
+      default: true
+    netdataModel:
+      type: string
+      default: netdata
+    truenasModel:
+      type: string
+      default: truenas
+    firewallaModel:
+      type: string
+      default: firewalla
+jobs:
+  - name: main
+    description: Compose selected homelab report bundles and render them.
+    steps:
+      - name: render
+        description: Pass exact normalized report data into the renderer.
+        task:
+          type: model_method
+          modelType: "@jpisgeek/dashboard"
+          modelName: composed-dashboard
+          methodName: render
+          globalArgs:
+            title: Homelab operations
+            bundles: '${{ (inputs.includeNetdata ? [data.latest(inputs.netdataModel, "report-jpisgeek-dashboard-homelab-json").attributes] : []) + (inputs.includeTruenas ? [data.latest(inputs.truenasModel, "report-jpisgeek-dashboard-homelab-json").attributes] : []) + (inputs.includeFirewalla ? [data.latest(inputs.firewallaModel, "report-jpisgeek-dashboard-homelab-json").attributes] : []) }}'
+            outputPath: ./dashboard/homelab.html
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

@@ -1,0 +1,31 @@
+id: b56685e3-17ac-461c-8540-a2241ab3fbf2
+name: "@jpisgeek/dashboard-local-inference-only"
+tags: {}
+description: Render one explicit LM Studio headless-daemon bundle.
+inputs:
+  type: object
+  properties:
+    lmstudioModel:
+      type: string
+      default: lmstudio-daemon
+jobs:
+  - name: main
+    description: Compose one LM Studio report bundle and render it.
+    steps:
+      - name: render
+        description: Pass the exact LM Studio normalization report into the renderer.
+        task:
+          type: model_method
+          modelType: "@jpisgeek/dashboard"
+          modelName: composed-dashboard
+          methodName: render
+          globalArgs:
+            title: Local inference
+            bundles: '${{ [data.latest(inputs.lmstudioModel, "report-jpisgeek-dashboard-lmstudio-json").attributes] }}'
+            outputPath: ./dashboard/local-inference.html
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

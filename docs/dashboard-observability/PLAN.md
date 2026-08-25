@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-12 complete; Task 13 pending
+- **Phase:** BUILD — Tasks 1-13 complete; Task 14 pending
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
 - **Build:** in progress
-- **Completed tasks:** 12 of 16
+- **Completed tasks:** 13 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 
@@ -311,6 +311,9 @@ models, malformed JSON, missing CLI, partial coverage, timeout, and caller
 cancellation. Do not contact the private Mac Studio during public BUILD.
 
 ### Task 13: Add optional composition workflows and examples
+
+**Status:** complete — implementation and evidence are recorded in
+[composition-workflows.md](composition-workflows.md).
 
 **Goal:** make piece-by-piece installation practical without a mandatory
 meta-package.

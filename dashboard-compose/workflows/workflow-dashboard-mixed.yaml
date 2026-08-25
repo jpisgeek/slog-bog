@@ -1,0 +1,52 @@
+id: 069444fb-47d5-470d-ba4d-c990d78736e3
+name: "@jpisgeek/dashboard-mixed"
+tags: {}
+description: Compose only explicitly selected normalized dashboard bundles.
+inputs:
+  type: object
+  properties:
+    includeHomelab:
+      type: boolean
+      default: false
+    includeSwamp:
+      type: boolean
+      default: false
+    includeHostedAi:
+      type: boolean
+      default: false
+    includeLocalInference:
+      type: boolean
+      default: false
+    homelabModel:
+      type: string
+      default: netdata
+    swampModel:
+      type: string
+      default: swamp-ops
+    hostedAiModel:
+      type: string
+      default: openai-usage
+    localInferenceModel:
+      type: string
+      default: lmstudio-daemon
+jobs:
+  - name: main
+    description: Compose selected domain report bundles and render them.
+    steps:
+      - name: render
+        description: Pass only selected exact report artifacts to the renderer.
+        task:
+          type: model_method
+          modelType: "@jpisgeek/dashboard"
+          modelName: composed-dashboard
+          methodName: render
+          globalArgs:
+            title: Mixed operations
+            bundles: '${{ (inputs.includeHomelab ? [data.latest(inputs.homelabModel, "report-jpisgeek-dashboard-homelab-json").attributes] : []) + (inputs.includeSwamp ? [data.latest(inputs.swampModel, "report-jpisgeek-dashboard-swamp-json").attributes] : []) + (inputs.includeHostedAi ? [data.latest(inputs.hostedAiModel, "report-jpisgeek-openai-usage-json").attributes] : []) + (inputs.includeLocalInference ? [data.latest(inputs.localInferenceModel, "report-jpisgeek-dashboard-lmstudio-json").attributes] : []) }}'
+            outputPath: ./dashboard/mixed.html
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

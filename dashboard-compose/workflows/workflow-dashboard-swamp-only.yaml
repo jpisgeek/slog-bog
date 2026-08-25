@@ -1,0 +1,31 @@
+id: c8e0b3ab-925f-431a-9713-5f302937f465
+name: "@jpisgeek/dashboard-swamp-only"
+tags: {}
+description: Render one explicit Swamp operational-observability bundle.
+inputs:
+  type: object
+  properties:
+    swampModel:
+      type: string
+      default: swamp-ops
+jobs:
+  - name: main
+    description: Compose one Swamp report bundle and render it.
+    steps:
+      - name: render
+        description: Pass the exact Swamp normalization report into the renderer.
+        task:
+          type: model_method
+          modelType: "@jpisgeek/dashboard"
+          modelName: composed-dashboard
+          methodName: render
+          globalArgs:
+            title: Swamp operations
+            bundles: '${{ [data.latest(inputs.swampModel, "report-jpisgeek-dashboard-swamp-json").attributes] }}'
+            outputPath: ./dashboard/swamp.html
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

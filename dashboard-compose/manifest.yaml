@@ -1,0 +1,34 @@
+manifestVersion: 1
+name: "@jpisgeek/dashboard-compose"
+version: 2026.08.25.1
+description: >
+  Optional Swamp workflows that pass explicit normalized bundle data into the
+  provider-neutral dashboard renderer. Homelab, Swamp, hosted AI, local
+  inference, and mixed workflows remain independently selectable and introduce
+  no collector dependency fan-out.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/dashboard-compose
+paths:
+  base: manifest
+models: []
+workflows:
+  - workflows/workflow-dashboard-homelab-only.yaml
+  - workflows/workflow-dashboard-swamp-only.yaml
+  - workflows/workflow-dashboard-hosted-ai-only.yaml
+  - workflows/workflow-dashboard-local-inference-only.yaml
+  - workflows/workflow-dashboard-mixed.yaml
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - dashboard
+  - workflow
+  - composition
+  - observability
+dependencies: []
