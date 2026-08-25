@@ -2,10 +2,10 @@
 
 ## Lifecycle Status
 
-- **Phase:** BUILD — Tasks 1-3 complete; Task 4 pending
+- **Phase:** BUILD — Tasks 1-4 complete; Task 5 pending
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
 - **Build:** in progress
-- **Completed tasks:** 3 of 16
+- **Completed tasks:** 4 of 16
 - **Blockers:** none
 - **Last updated:** 2026-08-25
 

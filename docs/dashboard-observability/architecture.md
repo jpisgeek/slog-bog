@@ -36,10 +36,10 @@ This is the exception, not the default.
 
 ## Shared contract packaging
 
-Keep one canonical static TypeScript/Zod contract source in this public
-repository. Each independently published model or report imports that source at
-build time. Swamp resolves static local imports and inlines them into every
-entry point's standalone bundle.
+Keep one canonical TypeScript/Zod contract source in this public repository.
+Each independently published model or report inlines that source into its entry
+point before quality scoring. A conformance test compares the inlined block
+byte-for-byte with the canonical body.
 
 Therefore:
 
@@ -55,9 +55,23 @@ The canonical contract should have its own tests and fixtures. It does not need
 an otherwise meaningless model or report merely to satisfy the registry rule
 that a manifest contain at least one extension content type.
 
-This choice follows Swamp's `design/extension.md` packaging boundary and the
-publishing reference: entry points become standalone bundles, and static local
-imports are automatically resolved and included.
+This choice follows Swamp's `design/extension.md` packaging boundary: published
+entry points must be standalone.
+
+### Packaging correction from Task 4
+
+Task 1 proved that local imports were present in the disposable extension format
+output. Task 4 exercised the stronger hermetic publication-quality path.
+`swamp extension quality` extracted report entry points into `reports/` but did
+not place a sibling `additionalFiles` contract on the module resolution path.
+The scorer failed `deno doc` on the unresolved import. A dry-run archive could
+still be built, so dry-run alone was insufficient evidence.
+
+The supported package shape is therefore an explicitly inlined contract block
+inside each published entry point, guarded by a byte-for-byte conformance test.
+This is packaging duplication, not a second contract authority: edits begin in
+`dashboard-contract/dashboard_bundle.ts`, then the generated/inlined block is
+refreshed. Runtime extension dependencies remain empty.
 
 ## Live proof
 
@@ -177,7 +191,7 @@ It is not required for Swamp CLI execution in this coding agent.
 1. Task 3 creates the canonical contract source, conformance tests, and fixtures
    but not a fake standalone registry extension.
 2. Every manifest includes only its actual model/report/workflow entry points;
-   local contract imports are automatically bundled.
+   its entry points contain a conformance-checked inline copy of the contract.
 3. Normalization reports produce explicit JSON bundles. Their persisted data
    names are documented in package examples.
 4. The renderer accepts declared bundle arguments and never enumerates models.
