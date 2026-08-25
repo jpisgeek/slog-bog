@@ -408,10 +408,305 @@ export function notInEffect(declared: string[], present: string[]): string[] {
   return declared.filter((t) => !have.has(t));
 }
 
+const NodeStateSchema = z.object({
+  name: z.string(),
+  /**
+   * Did mise actually run here? Everything downstream depends on this being
+   * separate from the counts. A host that did not answer has null counts, not
+   * zero ones, because zero is a measurement and this is the absence of one.
+   */
+  measured: z.boolean(),
+  reachable: z.boolean(),
+  transport: z.string(),
+  error: z.string().nullable(),
+  miseVersion: z.string().nullable(),
+  dir: z.string().nullable(),
+  configCount: z.number().nullable(),
+  toolCount: z.number().nullable(),
+  drift: z.array(z.string()),
+});
+
+const ToolStateSchema = z.object({
+  node: z.string(),
+  tool: z.string(),
+  requestedVersion: z.string().nullable(),
+  resolvedVersion: z.string().nullable(),
+  installPath: z.string().nullable(),
+  sourceType: z.string().nullable(),
+  sourcePath: z.string().nullable(),
+  installed: z.boolean(),
+  active: z.boolean(),
+  outdated: z.boolean(),
+  latestVersion: z.string().nullable(),
+  drift: z.array(z.string()),
+});
+
+const ConfigStateSchema = z.object({
+  node: z.string(),
+  path: z.string(),
+  trusted: z.boolean().nullable(),
+  toolsDeclared: z.array(z.string()),
+  toolsInEffect: z.array(z.string()),
+  toolsNotInEffect: z.array(z.string()),
+});
+
+const SummarySchema = z.object({
+  nodes: z.number(),
+  nodesMeasured: z.number(),
+  nodesUnmeasured: z.number(),
+  tools: z.number(),
+  notinstalled: z.number(),
+  notactive: z.number(),
+  notineffect: z.number(),
+  outdated: z.number(),
+  expected: z.number(),
+  sweptAt: z.string(),
+});
+
+/** Deterministic 32-bit FNV-1a, eight lowercase hex characters. */
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Resource-name fragment for a config path. The hash is taken over the raw
+ * path, so two paths that normalise to the same slug still land on different
+ * resources instead of overwriting each other.
+ */
+function slug(path: string): string {
+  const s = path.replace(/[^a-zA-Z0-9]+/g, "-").toLowerCase().replace(
+    /^-+|-+$/g,
+    "",
+  );
+  return `${s || "config"}-${fnv1a(path)}`;
+}
+
 export const model = {
   type: "@jpisgeek/mise",
   version: "2026.08.24.1",
   globalArguments: GlobalArgsSchema,
-  resources: {},
-  methods: {},
+  resources: {
+    node: {
+      description:
+        "One record per host: whether mise answered at all, which directory " +
+        "was measured, and how much drift was found there.",
+      schema: NodeStateSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
+    tool: {
+      description:
+        "One record per tool per host: what the config asked for, what the " +
+        "host resolved it to, and whether it is installed, active, or behind.",
+      schema: ToolStateSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    config: {
+      description:
+        "One record per mise config file in scope, with the tools it " +
+        "declares and the tools that never took effect.",
+      schema: ConfigStateSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
+    summary: {
+      description: "Fleet totals for the most recent sweep.",
+      schema: SummarySchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
+  },
+  methods: {
+    discover: {
+      description:
+        "Ask every configured host what toolchain it is running and write " +
+        "down where that disagrees with its own config. Read-only: nothing " +
+        "is installed, upgraded, or trusted.",
+      arguments: z.object({
+        node: z.string().optional().describe("Limit the sweep to one node"),
+      }),
+      // deno-lint-ignore no-explicit-any
+      execute: async (args: { node?: string }, ctx: any) => {
+        const g = GlobalArgsSchema.parse(ctx.globalArgs);
+        const targets = args.node
+          ? g.nodes.filter((n) => n.name === args.node)
+          : g.nodes;
+
+        ctx.logger.info("sweeping {n} host(s) for mise state", {
+          n: targets.length,
+        });
+
+        const handles = [];
+        const nodeStates: z.infer<typeof NodeStateSchema>[] = [];
+        const toolStates: z.infer<typeof ToolStateSchema>[] = [];
+        const configStates: z.infer<typeof ConfigStateSchema>[] = [];
+
+        // Bounded concurrency: a long nodes list otherwise spawns an
+        // unbounded pile of ssh processes at once.
+        const queue = [...targets];
+        const worker = async () => {
+          for (;;) {
+            const node = queue.shift();
+            if (!node) return;
+            const transport = node.ssh ? "ssh" : "local";
+            const run = (sub: string[]) =>
+              runMise(node, sub, g.timeoutSec, ctx.signal);
+
+            const ls = await run(SUB_LS);
+            if (!ls.ok) {
+              // The honesty case. Counts stay null so that "we could not ask"
+              // never reads downstream as "there was nothing to find".
+              ctx.logger.warning(
+                "{name} unmeasured ({kind}): {err}",
+                { name: node.name, kind: ls.kind, err: ls.error },
+              );
+              nodeStates.push({
+                name: node.name,
+                measured: false,
+                // Deliberately false even when ssh itself connected and only
+                // mise was missing. The schema has no field for "answered but
+                // could not be measured", so `measured` carries that signal
+                // and `error` keeps the kind. See the plan's self-review note.
+                reachable: false,
+                transport,
+                error: ls.error,
+                miseVersion: null,
+                dir: node.dir ?? null,
+                configCount: null,
+                toolCount: null,
+                drift: ["unmeasured"],
+              });
+              continue;
+            }
+
+            const rows = parseLsCurrent(ls.stdout);
+            const ver = await run(SUB_VERSION);
+            const cfg = await run(SUB_CONFIG);
+            const outd = await run(SUB_OUTDATED);
+            const trust = await run(SUB_TRUST);
+
+            const outdated = outd.ok ? parseOutdated(outd.stdout) : {};
+            const configs = cfg.ok ? parseConfigLs(cfg.stdout) : [];
+            const trusted = trust.ok ? parseTrustShow(trust.stdout) : {};
+
+            const nodeDrift = new Set<string>();
+            for (const r of rows) {
+              const expected = g.expect[r.tool];
+              const expectFail = expected !== undefined &&
+                r.resolvedVersion !== null &&
+                !satisfiesExpect(expected, r.resolvedVersion);
+              const isOutdated = Object.hasOwn(outdated, r.tool);
+              const drift = classifyTool(r, {
+                outdated: isOutdated,
+                expectFail,
+              });
+              for (const d of drift) nodeDrift.add(d);
+              toolStates.push({
+                node: node.name,
+                tool: r.tool,
+                requestedVersion: r.requestedVersion,
+                resolvedVersion: r.resolvedVersion,
+                installPath: r.installPath,
+                sourceType: r.sourceType,
+                sourcePath: r.sourcePath,
+                installed: r.installed,
+                active: r.active,
+                outdated: isOutdated,
+                latestVersion: outdated[r.tool] ?? null,
+                drift,
+              });
+            }
+
+            const present = rows.map((r) => r.tool);
+            for (const c of configs) {
+              const missing = notInEffect(c.tools, present);
+              if (missing.length > 0) nodeDrift.add("notineffect");
+              configStates.push({
+                node: node.name,
+                path: c.path,
+                // trust --show reports the directory, config ls the file, so
+                // a miss here is unknown rather than false.
+                trusted: trusted[c.path] ??
+                  trusted[c.path.replace(/\/[^/]+$/, "")] ?? null,
+                toolsDeclared: c.tools,
+                toolsInEffect: c.tools.filter((t) => present.includes(t)),
+                toolsNotInEffect: missing,
+              });
+            }
+
+            nodeStates.push({
+              name: node.name,
+              measured: true,
+              reachable: true,
+              transport,
+              error: null,
+              miseVersion: ver.ok ? ver.stdout.trim().split(" ")[0] : null,
+              dir: node.dir ?? null,
+              configCount: configs.length,
+              toolCount: rows.length,
+              drift: [...nodeDrift],
+            });
+          }
+        };
+        await Promise.all(
+          Array.from(
+            { length: Math.min(g.maxConcurrency, targets.length) },
+            worker,
+          ),
+        );
+
+        for (const n of nodeStates) {
+          handles.push(
+            await ctx.writeResource("node", `node-${n.name}`, n, {
+              tags: { measured: String(n.measured), transport: n.transport },
+            }),
+          );
+        }
+        for (const t of toolStates) {
+          handles.push(
+            await ctx.writeResource("tool", `tool-${t.node}-${t.tool}`, t, {
+              tags: { node: t.node, tool: t.tool, drift: t.drift.join(",") },
+            }),
+          );
+        }
+        for (const c of configStates) {
+          handles.push(
+            await ctx.writeResource(
+              "config",
+              `config-${c.node}-${slug(c.path)}`,
+              c,
+              { tags: { node: c.node } },
+            ),
+          );
+        }
+
+        const count = (d: Drift) =>
+          toolStates.filter((t) => t.drift.includes(d)).length;
+        handles.push(
+          await ctx.writeResource("summary", "summary", {
+            nodes: nodeStates.length,
+            nodesMeasured: nodeStates.filter((n) => n.measured).length,
+            nodesUnmeasured: nodeStates.filter((n) => !n.measured).length,
+            tools: toolStates.length,
+            notinstalled: count("notinstalled"),
+            notactive: count("notactive"),
+            notineffect: configStates.filter((c) =>
+              c.toolsNotInEffect.length > 0
+            ).length,
+            outdated: count("outdated"),
+            expected: count("expected"),
+            sweptAt: new Date().toISOString(),
+          }, { tags: { nodes: String(nodeStates.length) } }),
+        );
+
+        return { dataHandles: handles };
+      },
+    },
+  },
 };

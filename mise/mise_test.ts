@@ -19,6 +19,7 @@ import {
   classifyTool,
   GlobalArgsSchema,
   localArgs,
+  model,
   notInEffect,
   parseConfigLs,
   parseLsCurrent,
@@ -316,6 +317,17 @@ const LS_CURRENT = JSON.stringify({
   }],
 });
 
+const LS_CURRENT_CLEAN = JSON.stringify({
+  node: [{
+    version: "22.23.2",
+    requested_version: "22",
+    install_path: "<home>/.local/share/mise/installs/node/22.23.2",
+    source: { type: "mise.toml", path: "/srv/project/mise.toml" },
+    installed: true,
+    active: true,
+  }],
+});
+
 Deno.test("ls --current becomes one flat row per tool", () => {
   const rows = parseLsCurrent(LS_CURRENT);
   assertEquals(rows.length, 2);
@@ -370,4 +382,157 @@ Deno.test("a declared tool absent from ls --current is notineffect", () => {
     ["go"],
   );
   assertEquals(notInEffect(["node"], ["node"]), []);
+});
+
+type Json = Record<string, unknown>;
+
+/** Mock ctx capturing writeResource calls, as the dashboard tests do. */
+function mockCtx(globalArgs: Json) {
+  const written: Array<{ spec: string; name: string; data: Json }> = [];
+  return {
+    written,
+    // deno-lint-ignore no-explicit-any
+    ctx: {
+      signal: new AbortController().signal,
+      globalArgs,
+      modelType: "@jpisgeek/mise",
+      modelId: "m1",
+      logger: { info: () => {}, warning: () => {} },
+      writeResource: (spec: string, name: string, data: Json) => {
+        written.push({ spec, name, data });
+        return Promise.resolve({});
+      },
+      deleteResource: () => Promise.resolve(),
+      dataRepository: {
+        findAllForModel: () => Promise.resolve([]),
+        getContent: () => Promise.resolve(null),
+        delete: () => Promise.resolve(),
+      },
+    } as any,
+  };
+}
+
+/** A fake mise that answers each subcommand with canned JSON. */
+async function fakeMiseSuite(
+  answers: { ls?: string; config?: string; outdated?: string; trust?: string },
+): Promise<{ path: string; cleanup: () => Promise<void> }> {
+  const dir = await Deno.makeTempDir();
+  const path = `${dir}/mise`;
+  const script = [
+    "#!/bin/sh",
+    "# skip a leading -C <dir> so the fake accepts the same argv as the real one",
+    'if [ "$1" = "-C" ]; then shift 2; fi',
+    'if [ "$1" = "--version" ]; then echo "2026.8.12 test"; exit 0; fi',
+    `if [ "$1" = "ls" ]; then cat <<'EOF'\n${
+      answers.ls ?? "{}"
+    }\nEOF\nexit 0; fi`,
+    `if [ "$1" = "config" ]; then cat <<'EOF'\n${
+      answers.config ?? "[]"
+    }\nEOF\nexit 0; fi`,
+    `if [ "$1" = "outdated" ]; then cat <<'EOF'\n${
+      answers.outdated ?? "{}"
+    }\nEOF\nexit 0; fi`,
+    `if [ "$1" = "trust" ]; then cat <<'EOF'\n${
+      answers.trust ?? ""
+    }\nEOF\nexit 0; fi`,
+    "exit 0",
+  ].join("\n");
+  await Deno.writeTextFile(path, script);
+  await Deno.chmod(path, 0o755);
+  return { path, cleanup: () => Deno.remove(dir, { recursive: true }) };
+}
+
+Deno.test("discover is the only method", () => {
+  assertEquals(Object.keys(model.methods), ["discover"]);
+});
+
+Deno.test("a clean host writes tool rows with no drift", async () => {
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const tools = c.written.filter((w) => w.spec === "tool");
+    assertEquals(tools.length, 1);
+    assertEquals(tools[0].data.drift, []);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.measured, true);
+    assertEquals(node.toolCount, 1);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a host without mise is unmeasured, never a zero tool count", async () => {
+  const c = mockCtx({
+    nodes: [{ name: "gone", misePath: "/nonexistent/mise" }],
+  });
+  await model.methods.discover.execute({}, c.ctx);
+  const node = c.written.find((w) => w.spec === "node")!.data;
+  assertEquals(node.measured, false);
+  assertEquals(node.reachable, false);
+  assertEquals(node.toolCount, null, "an unmeasured host has no tool count");
+  assertEquals((node.drift as string[]).includes("unmeasured"), true);
+  const summary = c.written.find((w) => w.spec === "summary")!.data;
+  assertEquals(summary.nodesUnmeasured, 1);
+  assertEquals(summary.nodesMeasured, 0);
+});
+
+Deno.test("miseVersion is null when never obtained, not empty string", async () => {
+  const c = mockCtx({
+    nodes: [{ name: "gone", misePath: "/nonexistent/mise" }],
+  });
+  await model.methods.discover.execute({}, c.ctx);
+  const node = c.written.find((w) => w.spec === "node")!.data;
+  assertEquals(node.miseVersion, null);
+});
+
+Deno.test("a declared tool that never took effect is recorded", async () => {
+  const m = await fakeMiseSuite({
+    ls:
+      '{"node":[{"version":"22.23.2","requested_version":"22","installed":true,"active":true,"source":{"type":"mise.toml","path":"/srv/project/mise.toml"}}]}',
+    config: '[{"path":"/srv/project/mise.toml","tools":["node","go"]}]',
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const cfg = c.written.find((w) => w.spec === "config")!.data;
+    assertEquals(cfg.toolsNotInEffect, ["go"]);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("expect mismatch is flagged against the resolved version", async () => {
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const c = mockCtx({
+      nodes: [{ name: "studio", misePath: m.path }],
+      expect: { node: "24" },
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const tool = c.written.find((w) => w.spec === "tool")!.data;
+    assertEquals((tool.drift as string[]).includes("expected"), true);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("summary totals agree with the per-node counts", async () => {
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const c = mockCtx({
+      nodes: [
+        { name: "studio", misePath: m.path },
+        { name: "gone", misePath: "/nonexistent/mise" },
+      ],
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const summary = c.written.find((w) => w.spec === "summary")!.data;
+    assertEquals(summary.nodes, 2);
+    assertEquals(summary.nodesMeasured, 1);
+    assertEquals(summary.nodesUnmeasured, 1);
+    assertEquals(summary.tools, 1);
+  } finally {
+    await m.cleanup();
+  }
 });
