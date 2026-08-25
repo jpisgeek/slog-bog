@@ -42,7 +42,10 @@ swamp extension pull @jpisgeek/mise
 
 Ask every configured host what toolchain it is running and write down where that
 disagrees with its own config. Read-only: nothing is installed, upgraded, or
-trusted.
+trusted. A full sweep prunes tool and config records that have departed. A
+single-node run never deletes anything, and neither does a host that came back
+unmeasured or only part measured, which keeps its stored rows rather than having
+them read as gone.
 
 | argument | type   | required | default | description                 |
 | -------- | ------ | -------- | ------- | --------------------------- |
@@ -50,12 +53,12 @@ trusted.
 
 ### Data written
 
-| resource  | lifetime | fields                                                                                                                                                        | description                                                                                                                            |
-| --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `node`    | infinite | `name`, `measured`, `reachable`, `transport`, `error`, `miseVersion`, `dir`, `configCount`, `toolCount`, `drift`                                              | One record per host: whether mise answered at all, which directory was measured, and how much drift was found there.                   |
-| `tool`    | infinite | `node`, `tool`, `requestedVersion`, `resolvedVersion`, `installPath`, `sourceType`, `sourcePath`, `installed`, `active`, `outdated`, `latestVersion`, `drift` | One record per tool per host: what the config asked for, what the host resolved it to, and whether it is installed, active, or behind. |
-| `config`  | infinite | `node`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                               | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                             |
-| `summary` | infinite | `nodes`, `nodesMeasured`, `nodesUnmeasured`, `tools`, `notinstalled`, `notactive`, `configsNotInEffect`, `outdated`, `expected`, `sweptAt`                    | Fleet totals for the most recent sweep.                                                                                                |
+| resource  | lifetime | fields                                                                                                                                                        | description                                                                                                                                                                                                                                                     |
+| --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `node`    | infinite | `name`, `measured`, `degraded`, `failedSubcommands`, `failureKind`, `transport`, `error`, `miseVersion`, `dir`, `configCount`, `toolCount`, `drift`           | One record per host: whether mise answered at all, whether it answered in full, which directory the reading came from, and how much drift was found there. A null dir means an ssh node with no dir set, where the reading comes from wherever the login lands. |
+| `tool`    | infinite | `node`, `tool`, `requestedVersion`, `resolvedVersion`, `installPath`, `sourceType`, `sourcePath`, `installed`, `active`, `outdated`, `latestVersion`, `drift` | One record per tool per host: what the config asked for, what the host resolved it to, and whether it is installed, active, or behind.                                                                                                                          |
+| `config`  | infinite | `node`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                               | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                                                                                                                                                      |
+| `summary` | infinite | `nodes`, `nodesMeasured`, `nodesUnmeasured`, `nodesDegraded`, `tools`, `notinstalled`, `notactive`, `configsNotInEffect`, `outdated`, `expected`, `sweptAt`   | Fleet totals for the most recent sweep.                                                                                                                                                                                                                         |
 
 ## Example
 
@@ -86,15 +89,21 @@ A host that does not answer is recorded as unmeasured, and its counts stay null
 rather than dropping to zero. This matters more than it sounds: mise is
 routinely missing from a non-login shell's PATH, and a zero tool count from a
 host that never ran mise is indistinguishable from a host that is genuinely
-clean. Set `misePath` when a host reports unmeasured with a not-found error.
+clean. Set `misePath` when a host records `failureKind: notfound`, which is mise
+missing from the PATH rather than a host missing from the network. A host can
+also answer in part. When a follow-up subcommand goes quiet the record is marked
+`degraded` and names it in `failedSubcommands`, and `nodesDegraded` on the
+summary counts how many hosts that happened to. While that count is above zero,
+read the drift totals as a floor rather than as everything there is to find.
 mise config is directory-scoped, so `dir` decides which config is being judged.
 Leave it off and you measure the swamp working directory locally and the login
-directory over SSH, which is rarely the question you meant to ask. Trust is
-recorded but never treated as drift. A plain `[tools]` file reports as untrusted
-while applying perfectly, because mise only demands trust for configs that can
-execute something. Node, tool, and config resource names all carry a hash
-suffix, so find them with `swamp data list <model>` rather than building the
-name by hand.
+directory over SSH, which is rarely the question you meant to ask. The node
+record's `dir` field names the directory the reading actually came from, so what
+a sweep judged is never left to guesswork. Trust is recorded but never treated
+as drift. A plain `[tools]` file reports as untrusted while applying perfectly,
+because mise only demands trust for configs that can execute something. Node,
+tool, and config resource names all carry a hash suffix, so find them with
+`swamp data list <model>` rather than building the name by hand.
 
 ## Security
 
@@ -107,8 +116,11 @@ operator-supplied values reach the remote command: `dir`, single-quoted, and
 `misePath`, unquoted. Each is safe because its schema refuses at parse time any
 value containing a character a shell would act on, rather than repairing it: a
 half-fixed path that measures the wrong directory silently is worse than a
-config error. `ssh.host` and `ssh.user` are refused on the same grounds, so
-neither can be read as an ssh option such as `-oProxyCommand=`. SSH uses
+config error. `ssh.host` and `ssh.user` are a different case, and a stronger
+one. Neither reaches a shell at all. Each occupies a single argv element handed
+straight to `ssh`, so the only thing their schema has to refuse is a leading
+dash, which would otherwise let either be read as an ssh option such as
+`-oProxyCommand=`. They carry no charset rule and do not need one. SSH uses
 `BatchMode=yes`, so an unknown host key fails closed instead of prompting.
 Errors quote stderr only, never stdout, because stdout carries config contents
 and error strings reach swamp run logs. Written data: host labels, the measured
