@@ -1,0 +1,33 @@
+package: "@jpisgeek/dashboard-lmstudio"
+purpose: >-
+  Normalizes scoped @jpisgeek/lmstudio endpoint and request-probe output into
+  dashboard bundle v1. Endpoint-down, token-rejected, missing model capability,
+  context exhaustion, output-token limit, and reasoning-only empty output stay
+  distinct. Token and timing values retain their actual units and one probe is
+  never presented as aggregate runtime accounting.
+example: |
+  # Require this report on either @jpisgeek/lmstudio model definition.
+  reports:
+    require:
+      - '@jpisgeek/dashboard-lmstudio'
+
+  # After a probe runs, pass its exact report artifact to the renderer:
+  globalArguments:
+    bundles:
+      - ${{ data.latest("lmstudio-probe", "report-jpisgeek-dashboard-lmstudio-json").attributes }}
+caveats: >-
+  Each report describes exactly one endpoint or request-probe execution. A
+  completion bundle uses observed-traffic coverage with accountingScope
+  single-request and aggregateAccounting false. It does not measure requests
+  that bypass the probe. contextExhausted is the collector's documented
+  heuristic: finish_reason length before the requested output cap. A complete
+  runtime ledger requires instrumenting all traffic or a trustworthy aggregate
+  runtime source.
+security: >-
+  This report performs no network, process, environment, or vault operations.
+  It reads only the data handles from the scoped LM Studio execution. The API
+  token and caller prompt are not present in those resources. Model identifiers,
+  HTTP status, timings, usage counts, and capability findings are operational
+  metadata. Classified collector errors can also retain a sanitized endpoint
+  hostname or URL without userinfo or query parameters; protect stored reports
+  and rendered dashboards accordingly.

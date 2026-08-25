@@ -7,16 +7,17 @@ dashboards) belong in your own models, not here.
 
 <!-- extensions:start -->
 
-| Extension                     | Version        | Source                                     | What it is                                                                                                              |
-| ----------------------------- | -------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `@jpisgeek/dashboard`         | `2026.08.25.1` | [`dashboard/`](dashboard/)                 | Renders explicit provider-neutral dashboard bundle v1 inputs as a self-contained, exceptions-first HTML status page.    |
-| `@jpisgeek/dashboard-homelab` | `2026.08.25.1` | [`dashboard-homelab/`](dashboard-homelab/) | Provider-neutral dashboard bundle adapter for the local Netdata, TrueNAS, and Firewalla collector contracts.            |
-| `@jpisgeek/dashboard-swamp`   | `2026.08.25.1` | [`dashboard-swamp/`](dashboard-swamp/)     | Local Swamp operational observability.                                                                                  |
-| `@jpisgeek/firewalla`         | `2026.08.22.2` | [`firewalla/`](firewalla/)                 | Device and machine inventory from the Firewalla MSP API.                                                                |
-| `@jpisgeek/lmstudio`          | `2026.08.23.1` | [`lmstudio/`](lmstudio/)                   | Probe and validate an OpenAI-compatible inference endpoint before you trust it.                                         |
-| `@jpisgeek/netdata`           | `2026.08.23.1` | [`netdata/`](netdata/)                     | Netdata standalone agent state across a set of nodes.                                                                   |
-| `@jpisgeek/proton-pass`       | `2026.08.23.1` | [`proton-pass/`](proton-pass/)             | Proton Pass vault provider: resolves ${{ vault.get('<vault>', 'KEY') }} live through the official pass-cli at run time. |
-| `@jpisgeek/truenas`           | `2026.08.23.1` | [`truenas/`](truenas/)                     | Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket API.                                       |
+| Extension                      | Version        | Source                                       | What it is                                                                                                              |
+| ------------------------------ | -------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `@jpisgeek/dashboard`          | `2026.08.25.1` | [`dashboard/`](dashboard/)                   | Renders explicit provider-neutral dashboard bundle v1 inputs as a self-contained, exceptions-first HTML status page.    |
+| `@jpisgeek/dashboard-homelab`  | `2026.08.25.1` | [`dashboard-homelab/`](dashboard-homelab/)   | Provider-neutral dashboard bundle adapter for the local Netdata, TrueNAS, and Firewalla collector contracts.            |
+| `@jpisgeek/dashboard-lmstudio` | `2026.08.25.1` | [`dashboard-lmstudio/`](dashboard-lmstudio/) | Provider-neutral dashboard adapter for @jpisgeek/lmstudio endpoint and per-request probes.                              |
+| `@jpisgeek/dashboard-swamp`    | `2026.08.25.1` | [`dashboard-swamp/`](dashboard-swamp/)       | Local Swamp operational observability.                                                                                  |
+| `@jpisgeek/firewalla`          | `2026.08.22.2` | [`firewalla/`](firewalla/)                   | Device and machine inventory from the Firewalla MSP API.                                                                |
+| `@jpisgeek/lmstudio`           | `2026.08.23.1` | [`lmstudio/`](lmstudio/)                     | Probe and validate an OpenAI-compatible inference endpoint before you trust it.                                         |
+| `@jpisgeek/netdata`            | `2026.08.23.1` | [`netdata/`](netdata/)                       | Netdata standalone agent state across a set of nodes.                                                                   |
+| `@jpisgeek/proton-pass`        | `2026.08.23.1` | [`proton-pass/`](proton-pass/)               | Proton Pass vault provider: resolves ${{ vault.get('<vault>', 'KEY') }} live through the official pass-cli at run time. |
+| `@jpisgeek/truenas`            | `2026.08.23.1` | [`truenas/`](truenas/)                       | Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket API.                                       |
 
 <!-- extensions:end -->
 
