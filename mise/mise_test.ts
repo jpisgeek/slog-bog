@@ -32,7 +32,7 @@ import {
   SUB_LS,
 } from "./mise.ts";
 
-const okNode = { name: "studio" };
+const okNode = { name: "workstation" };
 
 Deno.test("dir must be absolute and free of traversal", () => {
   const bad = [
@@ -82,7 +82,7 @@ Deno.test("ssh host and user must not be parseable as ssh options", () => {
 
 Deno.test("duplicate node names are rejected", () => {
   const r = GlobalArgsSchema.safeParse({
-    nodes: [{ name: "studio" }, { name: "studio" }],
+    nodes: [{ name: "workstation" }, { name: "workstation" }],
   });
   assertEquals(r.success, false, "two nodes cannot share a name");
 });
@@ -536,7 +536,7 @@ Deno.test("discover is the only method", () => {
 Deno.test("a clean host writes tool rows with no drift", async () => {
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const tools = c.written.filter((w) => w.spec === "tool");
     assertEquals(tools.length, 1);
@@ -592,7 +592,7 @@ Deno.test("a declared tool that never took effect is recorded", async () => {
     config: '[{"path":"/srv/project/mise.toml","tools":["node","go"]}]',
   });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const cfg = c.written.find((w) => w.spec === "config")!.data;
     assertEquals(cfg.toolsNotInEffect, ["go"]);
@@ -605,7 +605,7 @@ Deno.test("expect mismatch is flagged against the resolved version", async () =>
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
     const c = mockCtx({
-      nodes: [{ name: "studio", misePath: m.path }],
+      nodes: [{ name: "workstation", misePath: m.path }],
       expect: { node: "24" },
     });
     await model.methods.discover.execute({}, c.ctx);
@@ -621,7 +621,7 @@ Deno.test("summary totals agree with the per-node counts", async () => {
   try {
     const c = mockCtx({
       nodes: [
-        { name: "studio", misePath: m.path },
+        { name: "workstation", misePath: m.path },
         { name: "gone", misePath: "/nonexistent/mise" },
       ],
     });
@@ -648,7 +648,7 @@ Deno.test("a failed outdated probe is degraded, not a clean zero", async () => {
   // like "nothing is behind".
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN, fail: ["outdated"] });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.measured, true, "the tool list did come back");
@@ -670,7 +670,7 @@ Deno.test("a failed outdated probe is degraded, not a clean zero", async () => {
 Deno.test("a failed config ls leaves configCount null, never zero", async () => {
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN, fail: ["config"] });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.configCount, null, "zero is a measurement, null is not");
@@ -692,7 +692,7 @@ Deno.test("every failed subcommand is named on the record", async () => {
     fail: ["config", "outdated", "trust", "version"],
   });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.failedSubcommands, [
@@ -714,7 +714,7 @@ Deno.test("every failed subcommand is named on the record", async () => {
 Deno.test("a whole reading carries no error and no failureKind", async () => {
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.degraded, false);
@@ -751,7 +751,7 @@ Deno.test("an unparseable ls payload is unmeasured, never zero tools", async () 
   // all, which is the shape of a host with nothing wrong.
   const m = await fakeMiseSuite({ ls: "welcome to the bog\n{}" });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.measured, false);
@@ -776,7 +776,7 @@ Deno.test("a valid empty ls payload is a reading of zero tools", async () => {
   // measurement of zero, not an absence of one.
   const m = await fakeMiseSuite({ ls: "{}" });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.measured, true);
@@ -796,7 +796,7 @@ Deno.test("an ls payload of the wrong shape is unmeasured too", async () => {
   for (const payload of ["[]", '[{"node":[]},"junk"]']) {
     const m = await fakeMiseSuite({ ls: payload });
     try {
-      const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+      const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
       await model.methods.discover.execute({}, c.ctx);
       const node = c.written.find((w) => w.spec === "node")!.data;
       assertEquals(
@@ -824,7 +824,7 @@ Deno.test("a probe that answers in the wrong shape did not answer", async () => 
     outdated: '[{"node":"24.1.0"}]',
   });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.measured, true, "the tool list itself was readable");
@@ -843,7 +843,7 @@ Deno.test("a probe that exits zero with junk did not answer either", async () =>
     outdated: "welcome to the bog\n{}",
   });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     assertEquals(node.measured, true, "the tool list itself was readable");
@@ -865,7 +865,7 @@ Deno.test("a tool row carries its host's degraded flag", async () => {
   try {
     const c = mockCtx({
       nodes: [
-        { name: "studio", misePath: partial.path },
+        { name: "workstation", misePath: partial.path },
         { name: "builder", misePath: whole.path },
       ],
     });
@@ -878,7 +878,7 @@ Deno.test("a tool row carries its host's degraded flag", async () => {
     };
     // The row itself writes outdated: false because the probe never ran, so
     // without the tag a query over rows alone reads this host as clean.
-    assertEquals(tagsFor("studio").degraded, "true");
+    assertEquals(tagsFor("workstation").degraded, "true");
     assertEquals(tagsFor("builder").degraded, "false");
   } finally {
     await partial.cleanup();
@@ -904,7 +904,7 @@ Deno.test("a hostile tool name cannot reach the prototype chain", async () => {
   });
   try {
     const c = mockCtx({
-      nodes: [{ name: "studio", misePath: m.path }],
+      nodes: [{ name: "workstation", misePath: m.path }],
       // No expect entry for either name. Unguarded, g.expect["constructor"]
       // is a function, and satisfiesExpect calls .split on it.
       expect: { node: "22" },
@@ -929,14 +929,14 @@ Deno.test("one node's exception never discards the fleet", async () => {
     const c = mockCtx({
       nodes: [
         { name: "gone", misePath: "/nonexistent/mise" },
-        { name: "studio", misePath: m.path },
+        { name: "workstation", misePath: m.path },
       ],
     }, { throwOnFirstWarning: true });
     await model.methods.discover.execute({}, c.ctx);
     const nodes = c.written.filter((w) => w.spec === "node");
     assertEquals(nodes.length, 2, "the healthy host must still be written");
-    const studio = nodes.find((n) => n.data.name === "studio")!.data;
-    assertEquals(studio.measured, true);
+    const workstation = nodes.find((n) => n.data.name === "workstation")!.data;
+    assertEquals(workstation.measured, true);
     const gone = nodes.find((n) => n.data.name === "gone")!.data;
     assertEquals(gone.measured, false);
     assertStringIncludes(String(gone.error), "logger exploded");
@@ -951,14 +951,14 @@ Deno.test("one node's exception never discards the fleet", async () => {
 Deno.test("dir records the directory measured, not the field left blank", async () => {
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
-    const c = mockCtx({ nodes: [{ name: "studio", misePath: m.path }] });
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
     await model.methods.discover.execute({}, c.ctx);
     const node = c.written.find((w) => w.spec === "node")!.data;
     // Two sweeps from different working directories judge different configs.
     // Recording the operator's blank field would make them indistinguishable.
     assertEquals(node.dir, Deno.cwd());
     const c2 = mockCtx({
-      nodes: [{ name: "studio", misePath: m.path, dir: "/srv/project" }],
+      nodes: [{ name: "workstation", misePath: m.path, dir: "/srv/project" }],
     });
     await model.methods.discover.execute({}, c2.ctx);
     assertEquals(
@@ -1020,13 +1020,13 @@ Deno.test("a full sweep prunes rows the fleet no longer reports", async () => {
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
     const c = mockCtx(
-      { nodes: [{ name: "studio", misePath: m.path }] },
-      { existing: ["tool-studio-go-1234abcd", "summary"] },
+      { nodes: [{ name: "workstation", misePath: m.path }] },
+      { existing: ["tool-workstation-go-1234abcd", "summary"] },
     );
     await model.methods.discover.execute({}, c.ctx);
     // Without this the summary would say notinstalled: 0 while last sweep's
     // row still carried the drift, two published views of one fact.
-    assertEquals(c.deleted, ["tool-studio-go-1234abcd"]);
+    assertEquals(c.deleted, ["tool-workstation-go-1234abcd"]);
   } finally {
     await m.cleanup();
   }
@@ -1038,13 +1038,13 @@ Deno.test("a single-node run never deletes anything", async () => {
     const c = mockCtx(
       {
         nodes: [
-          { name: "studio", misePath: m.path },
+          { name: "workstation", misePath: m.path },
           { name: "builder", misePath: m.path },
         ],
       },
       { existing: ["tool-builder-go-1234abcd"] },
     );
-    await model.methods.discover.execute({ node: "studio" }, c.ctx);
+    await model.methods.discover.execute({ node: "workstation" }, c.ctx);
     assertEquals(c.deleted, [], "a filtered run legitimately sees a subset");
   } finally {
     await m.cleanup();
@@ -1058,19 +1058,19 @@ Deno.test("a host that could not be measured keeps its history", async () => {
       {
         nodes: [
           { name: "gone", misePath: "/nonexistent/mise" },
-          { name: "studio", misePath: m.path },
+          { name: "workstation", misePath: m.path },
         ],
       },
       {
         existing: [
           "tool-gone-go-1234abcd",
-          "config-studio-mise-toml-5678abcd",
+          "config-workstation-mise-toml-5678abcd",
           "tool-retired-go-9999abcd",
         ],
       },
     );
     await model.methods.discover.execute({}, c.ctx);
-    // gone was never measured and studio's config ls never answered, so
+    // gone was never measured and workstation's config ls never answered, so
     // neither host's stored rows are evidence of anything departing. The
     // retired host really is gone from the fleet config.
     assertEquals(c.deleted, ["tool-retired-go-9999abcd"]);
@@ -1083,7 +1083,7 @@ Deno.test("a host that could not be measured keeps its history", async () => {
 
 Deno.test("a misspelled drift class never reaches stored data", () => {
   const row = {
-    node: "studio",
+    node: "workstation",
     tool: "node",
     requestedVersion: "22",
     resolvedVersion: "22.23.2",
