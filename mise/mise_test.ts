@@ -223,6 +223,21 @@ Deno.test("an ordinary failure is not mistaken for a missing binary", () => {
   );
 });
 
+Deno.test("mise's own os error is a real failure, not a missing binary", () => {
+  // mise is a Rust binary and renders io failures this way for an unreadable
+  // config or a broken shim. That host ran mise and hit a problem, so calling
+  // it "notfound" would file a measured failure as never measured.
+  assertEquals(
+    classifyFailure(1, "error: No such file or directory (os error 2)"),
+    "failed",
+  );
+  // the shell-prefixed form is still a missing binary
+  assertEquals(
+    classifyFailure(126, "bash: line 1: mise: No such file or directory"),
+    "notfound",
+  );
+});
+
 Deno.test("a successful run returns stdout", async () => {
   const m = await fakeMise({ stdout: '{"node":[]}' });
   try {

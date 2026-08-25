@@ -200,18 +200,30 @@ export function sshArgs(
 }
 
 /**
- * A shell that cannot find mise reports it in several ways depending on which
- * shell answered: 127 is conventional, but the message alone is the reliable
- * signal across sh, bash, and zsh. This distinction is the whole point of the
- * unmeasured state, so it is detected on both.
+ * A shell that cannot find mise says so in one of two shapes, and the exit
+ * code alone is not enough because some invocations return 126 or 1 instead
+ * of the conventional 127.
+ *
+ * The two phrases are not equally safe to match. "command not found" is
+ * shell phrasing and mise never emits it about itself, so it can be matched
+ * anywhere in stderr. "No such file or directory" is an ordinary os error
+ * string, and mise is a Rust binary whose own io failures render it for an
+ * unreadable config or a broken shim. Those hosts ran mise and hit a real
+ * problem, so matching that phrase loosely would file a measured failure as
+ * "never measured", inverting the one distinction this model is built on.
+ * It is therefore only accepted behind a shell prefix.
  */
-const NOT_FOUND_RE = /command not found|No such file or directory/i;
+const CMD_NOT_FOUND_RE = /command not found/i;
+const SHELL_NO_SUCH_FILE_RE =
+  /(?:^|\n)[^\n]*sh: [^\n]*No such file or directory/i;
 
 export function classifyFailure(
   code: number,
   stderr: string,
 ): "notfound" | "failed" {
-  if (code === 127 || NOT_FOUND_RE.test(stderr)) return "notfound";
+  if (code === 127) return "notfound";
+  if (CMD_NOT_FOUND_RE.test(stderr)) return "notfound";
+  if (SHELL_NO_SUCH_FILE_RE.test(stderr)) return "notfound";
   return "failed";
 }
 
