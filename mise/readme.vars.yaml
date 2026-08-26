@@ -1,0 +1,101 @@
+# Hand-written inputs for scripts/gen-readme.ts. Everything else in README.md
+# comes from the code. Placeholders only, never a real host, path, or vault item.
+package: "@jpisgeek/mise"
+purpose: >-
+  Toolchain state across a fleet, as measured rather than as assumed. Records
+  which tool versions each host is actually running and where that parts ways
+  with the host's own config: asked for but never installed, installed but not
+  active, declared in a config that never took, or simply behind. Installs
+  nothing and upgrades nothing. mise already does that job. This one wades
+  through the fleet, writes down what it finds, and leaves the acting to
+  whatever workflow wants it.
+example: |
+  globalArguments:
+    nodes:
+      - name: workstation
+        dir: /srv/project
+      - name: builder
+        dir: /srv/project
+        ssh:
+          host: builder.example.com
+          user: toolchain-reader
+          port: 22
+        # A non-login shell usually has no ~/.local/bin on PATH, and that is
+        # exactly where mise tends to live.
+        misePath: /usr/local/bin/mise
+    timeoutSec: 15
+    maxConcurrency: 8
+    expect:
+      node: "22"
+      python: "3.12"
+caveats: >-
+  A host that does not answer is recorded as unmeasured, and its counts stay
+  null rather than dropping to zero. This matters more than it sounds: mise is
+  routinely missing from a non-login shell's PATH, and a zero tool count from a
+  host that never ran mise is indistinguishable from a host that is genuinely
+  clean. Set `misePath` when a host records `failureKind: notfound`, which is
+  mise missing from the PATH rather than a host missing from the network. A
+  host that exits zero and hands back something other than the JSON that
+  subcommand promises records `failureKind: unparseable` and stays unmeasured.
+  That one is usually a login shell printing a banner over the top of the
+  answer, so the repair belongs on the host. A host can also answer in part.
+  When a follow-up subcommand goes quiet, or answers in a shape this model
+  cannot read, the record is marked
+  `degraded` and names it in `failedSubcommands`, and `nodesDegraded` on the
+  summary counts how many hosts that happened to. While that count is above
+  zero, read the drift totals as a floor rather than as everything there is to
+  find. Tool rows carry the same flag as a `degraded` tag, so a query over
+  rows alone cannot mistake a partial sweep for a clean one.
+  mise config is directory-scoped, so `dir` decides which config is being
+  judged. Leave it off and you measure the swamp working directory locally and
+  the login directory over SSH, which is rarely the question you meant to ask.
+  The node record's `dir` field names the directory the reading actually came
+  from, so what a sweep judged is never left to guesswork. It is null in two
+  cases: an ssh node with no `dir` set, where the reading comes from wherever
+  the login lands, and a local node whose working directory could not be
+  read, which is what a deleted working directory looks like.
+  Trust is recorded but never treated as drift. A plain `[tools]` file reports
+  as untrusted while applying perfectly, because mise only demands trust for
+  configs that can execute something. `expect` can only police tools a host's
+  own config declares. Hold the fleet to `{node: "22"}` and a host whose
+  config never mentions node records no `expected` drift at all, which is not
+  the same as passing. A tool no config on that host declares produces no
+  record for that host at all, so its absence is invisible in the drift
+  counts rather than surfacing under some other class. To hold a host to a
+  tool, the tool has to be in that host's config. A full sweep deletes every
+  stored record it did not write that time, so dropping a host from `nodes`
+  removes its node record along with its tool and config rows. A run limited
+  to one node with `--node` is a diagnostic and touches only that host. It
+  deletes nothing, and it does not write the `summary` either, because one
+  host's totals under a fleet-wide name would read as the fleet. The standing
+  summary keeps its own `sweptAt`, which is the honest way to see how old it
+  is. Node, tool, and config resource names
+  all carry a hash suffix, so find them with `swamp data list <model>` rather
+  than building the name by hand.
+security: >-
+  Read-only throughout. The model runs `ls --current`, `config ls`, `outdated`,
+  `trust --show`, and `--version`, and nothing else. It never calls
+  `mise install`, `mise upgrade`, `mise token`, `mise settings`, or `mise
+  trust` without `--show`, so it cannot change a host or surface a credential.
+  Local hosts are invoked as an argv array that never reaches a shell. Over
+  SSH, two operator-supplied values reach the remote command: `dir`,
+  single-quoted, and `misePath`, unquoted. Each is safe because its schema
+  refuses at parse time any value containing a character a shell would act on,
+  rather than repairing it: a half-fixed path that measures the wrong
+  directory silently is worse than a config error. `ssh.host` and `ssh.user`
+  are a different case, and a stronger one. Neither reaches a shell at all.
+  Each occupies a single argv element handed straight to `ssh`, so the only
+  thing their schema has to refuse is a leading dash, which would otherwise
+  let either be read as an ssh option such as `-oProxyCommand=`. They carry
+  no shell charset rule and do not need one. Node labels refuse terminal
+  controls at parse time. Every string returned by a host is made printable
+  before it reaches a resource field, tag, or log parameter. C0 and C1 bytes,
+  including ESC, are written as visible `\uNNNN` text instead of being handed
+  to a terminal. SSH uses `BatchMode=yes`, so an
+  unknown host key
+  fails closed instead of prompting. Errors quote stderr only, never stdout,
+  because stdout carries config contents and error strings reach swamp run
+  logs. Written data: host labels, the measured directory, mise version, tool
+  names and versions, install paths, and config file paths. Install and config
+  paths embed the remote account's home directory and real project directory
+  names, so treat the datastore as infrastructure detail.

@@ -1,0 +1,35 @@
+manifestVersion: 1
+name: "@jpisgeek/mise"
+version: 2026.08.24.1
+description: >
+  Read-only sweep of mise toolchain state across a fleet. Records which tool
+  versions each host is actually running and where that disagrees with the
+  host's own config: requested but never installed, installed but not active,
+  declared in a config that never took effect, or behind the latest. Installs
+  nothing and upgrades nothing. mise already does that well. This one only
+  wades through the fleet and writes down what it finds, including which hosts
+  refused to answer, because a host that could not be measured is not a host
+  that is clean.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/mise
+paths:
+  base: manifest
+models:
+  - mise.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - mise
+  - toolchain
+  - drift
+  - fleet
+  - versions
+dependencies: []
