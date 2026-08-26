@@ -11,12 +11,10 @@ example: |
   globalArguments:
     title: Operations
     bundles:
-      - ${{ data.latest("netdata", "report-jpisgeek-dashboard-homelab-json").attributes }}
-      - ${{ data.latest("truenas", "report-jpisgeek-dashboard-homelab-json").attributes }}
-      - ${{ data.latest("firewalla", "report-jpisgeek-dashboard-homelab-json").attributes }}
+      - ${{ data.latest("example-bundle-producer", "report-example-dashboard-json").attributes }}
     outputPath: ./dashboard/index.html
     suppress:
-      - id: condition:accepted-maintenance
+      - id: 14:example-bundle30:condition:accepted-maintenance
         reason: approved maintenance window
 caveats: >-
   The renderer accepts bundle v1 only. Unsupported major versions and invalid

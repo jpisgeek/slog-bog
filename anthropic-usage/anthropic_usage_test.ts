@@ -78,6 +78,7 @@ Deno.test("platform uses Admin endpoints and leaves undocumented request count u
   const result = await run("platform", (input, init) => {
     urls.push(String(input));
     assertEquals((init?.headers as Json)["x-api-key"], "private-credential");
+    assertEquals(init?.redirect, "error");
     return Promise.resolve(
       Response.json(
         page(
@@ -174,6 +175,20 @@ Deno.test("malformed dimensions never become zero", async () => {
           ? [cost(false)]
           : [usage(false, { output_tokens: "five" })],
       ))),
+  );
+  assertEquals((result.usageStatus as Json).errorKind, "invalid-response");
+  assertEquals(result.usage, null);
+});
+
+Deno.test("malformed result buckets never become complete zero usage", async () => {
+  const result = await run(
+    "platform",
+    (input) =>
+      Promise.resolve(Response.json(
+        String(input).includes("cost_report")
+          ? page([cost(false)])
+          : { ...page([]), data: [{ starting_at: "x" }] },
+      )),
   );
   assertEquals((result.usageStatus as Json).errorKind, "invalid-response");
   assertEquals(result.usage, null);

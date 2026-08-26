@@ -46,9 +46,9 @@ Studio because that runtime was down and being updated.
 ## Compatibility evidence
 
 The live registry search on 2026-08-25 returned only the existing
-`@jpisgeek/lmstudio` package at `2026.08.23.1`; it exposed no separate shared
-LM Studio daemon adapter matching this profile. The package is therefore
-extended locally rather than adding a community dependency.
+`@jpisgeek/lmstudio` package at `2026.08.23.1`; it exposed no separate shared LM
+Studio daemon adapter matching this profile. The package is therefore extended
+locally rather than adding a community dependency.
 
 Mocked tests cover loaded models, an exact empty inventory, unreachable remote,
 malformed output, missing CLI, timeout, and caller cancellation. The dashboard

@@ -8,7 +8,7 @@ provider-neutral dashboard bundle contract. Every record is validated before
 use, and missing, stale, partial, rejected, and unauthorized observations do not
 become healthy values or convenient zeros.
 
-**Version** `2026.08.25.1` · **License** MIT · **Source**
+**Version** `2026.08.25.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/dashboard-homelab
 
 ## Install

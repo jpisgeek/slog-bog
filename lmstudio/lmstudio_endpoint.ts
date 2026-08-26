@@ -30,20 +30,22 @@ const GlobalArgsSchema = z.object({
     .string()
     .min(1)
     .refine((v) => {
+      if (v.includes("?") || v.includes("#")) return false;
       try {
         const u = new URL(v);
         // http(s) only, and no embedded credentials: baseUrl is logged and can
         // appear in stored error text, so `https://user:pass@host` would leak.
         // The only credential is apiToken.
         return (u.protocol === "http:" || u.protocol === "https:") &&
-          u.username === "" && u.password === "";
+          u.username === "" && u.password === "" && u.search === "" &&
+          u.hash === "";
       } catch {
         return false;
       }
     }, {
       message:
-        "baseUrl must be a valid http(s) URL with no embedded credentials " +
-        "(user:pass@host); pass the token via apiToken.",
+        "baseUrl must be a valid http(s) URL with no userinfo, query, or " +
+        "fragment; pass the token via apiToken.",
     })
     .describe(
       "Base URL of the OpenAI-compatible inference endpoint, including any " +
@@ -113,6 +115,7 @@ function safeUrlForLog(raw: string): string {
     u.username = "";
     u.password = "";
     u.search = "";
+    u.hash = "";
     return u.toString();
   } catch {
     return "[unparseable URL]";
@@ -150,7 +153,7 @@ function classifyFetchError(
   }
   return {
     kind: "unreachable",
-    message: `could not reach endpoint: ${err?.message ?? String(e)}`,
+    message: "could not reach endpoint",
   };
 }
 
@@ -158,13 +161,18 @@ function extractModelIds(payload: unknown): string[] {
   if (payload && typeof payload === "object") {
     const data = (payload as Record<string, unknown>).data;
     if (Array.isArray(data)) {
-      return data
-        .map((entry) =>
-          entry && typeof entry === "object"
-            ? (entry as Record<string, unknown>).id
-            : undefined
-        )
-        .filter((id): id is string => typeof id === "string");
+      const ids: string[] = [];
+      for (const entry of data) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          throw new Error("invalid model entry");
+        }
+        const id = (entry as Record<string, unknown>).id;
+        if (typeof id !== "string" || !id) {
+          throw new Error("model entry is missing a string id");
+        }
+        ids.push(id);
+      }
+      return ids;
     }
   }
   throw new Error(
@@ -189,6 +197,7 @@ async function models(
   let response: Response;
   try {
     response = await fetch(`${base}/models`, {
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${g.apiToken}`,
         Accept: "application/json",
@@ -238,7 +247,7 @@ async function models(
   let payload: unknown;
   try {
     payload = await response.json();
-  } catch (e) {
+  } catch {
     // An unannotated JSON.parse failure here would surface as a bare
     // "Unexpected token < in JSON at position 0" with no indication of what
     // was being fetched or that the HTTP status was actually a 2xx --
@@ -248,9 +257,7 @@ async function models(
       `MALFORMED_RESPONSE: ${
         safeUrlForLog(`${base}/models`)
       } returned HTTP ${response.status} ` +
-        `but the body was not valid JSON: ${
-          e instanceof Error ? e.message : String(e)
-        }`,
+        "but the body was not valid JSON",
     );
   }
 
@@ -291,6 +298,7 @@ async function health(
     // /models doubles as the health probe: it is cheap, and it exercises
     // auth the same way every other call does.
     const response = await fetch(`${base}/models`, {
+      redirect: "error",
       headers: {
         Authorization: `Bearer ${g.apiToken}`,
         Accept: "application/json",
@@ -367,6 +375,11 @@ export const model = {
   type: "@jpisgeek/lmstudio/endpoint",
   version: "2026.08.25.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [{
+    toVersion: "2026.08.25.1",
+    description: "Tighten endpoint validation with no argument schema changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }],
 
   resources: {
     models: {

@@ -8,6 +8,9 @@ purpose: >-
   is collected independently, so one failure cannot erase the evidence from
   the others. Missing is not zero and empty history is not healthy.
 example: |
+  models:
+    swamp-ops:
+      type: '@jpisgeek/swamp-observability'
   globalArguments:
     repoDir: /srv/swamp/example-repo
     swampBinary: /usr/local/bin/swamp
@@ -33,4 +36,6 @@ security: >-
   output. Command stderr and stdout on failure are classified and discarded.
   Swamp's built-in method summary records non-sensitive global arguments such
   as repoDir, server, and swampBinary, so treat those values as operational
-  metadata and protect the repository's stored reports accordingly.
+  metadata and protect the repository's stored reports accordingly. Remote
+  server URLs must use HTTPS and cannot contain URL credentials. Successful
+  command payloads are stored verbatim; only failure text is sanitized.

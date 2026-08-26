@@ -2,11 +2,12 @@
 
 ## Lifecycle Status
 
-- **Phase:** VERIFY complete — Tasks 1-14 complete; REVIEW not started
+- **Phase:** REVIEW in progress — Task 15 risk-based review
 - **Spec:** this document
 - **Plan:** [PLAN.md](PLAN.md), approved 2026-08-25
 - **Build:** complete
-- **Blockers:** none
+- **Blockers:** private denylist configuration and provider-specific approval
+  for the single external release reviewer
 - **Last updated:** 2026-08-25
 
 ## Purpose
@@ -245,8 +246,12 @@ Every adapter and renderer must enforce these rules:
 - Public examples use synthetic identifiers only.
 - Generated dashboards are operational inventory and must be served behind
   suitable access control when they contain sensitive details.
-- Public release requires an identifier scan and an exact-content-hash security
-  review after all generated files are final.
+- Public release requires an identifier scan, deterministic package gates, and
+  an exact-content-hash release record after all generated files are final. One
+  independent external-model review of the final release set is required, but
+  the reviewer is not required to be Fable and the review is not repeated once
+  per package. Additional model review is requested only when the primary review
+  leaves a material security or correctness question unresolved.
 
 ## Migration
 
@@ -296,7 +301,8 @@ The project is done when:
 - migration preserves the accepted visual direction and improves operational
   usefulness;
 - every eventual extension passes formatting, tests, quality, generated README,
-  identifier scan, security review, dry run, and exact-content-hash review;
+  identifier scan, risk-based security review, dry run, and exact-content-hash
+  release recording;
 - publication occurs only after explicit SHIP approval.
 
 ## Constraints and repository state

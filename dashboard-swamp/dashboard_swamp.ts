@@ -194,7 +194,10 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
-  url: z.string().url().optional(),
+  url: z.string().url().refine(
+    (value) => new URL(value).protocol === "https:",
+    "evidence URLs must use https",
+  ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
     ctx.addIssue({
@@ -347,7 +350,26 @@ export function deriveOverallState(
   let state: DashboardState = required.length === 0 ? "unknown" : "healthy";
 
   for (const section of required) {
-    if (STATE_RANK[section.state] > STATE_RANK[state]) state = section.state;
+    let sectionState = section.state;
+    const evidenceStates: DashboardState[] = [
+      section.freshness.state === "stale"
+        ? "stale"
+        : section.freshness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.completeness.state === "partial"
+        ? "partial"
+        : section.completeness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.coverage.kind === "unknown" ? "unknown" : "healthy",
+    ];
+    for (const evidenceState of evidenceStates) {
+      if (STATE_RANK[evidenceState] > STATE_RANK[sectionState]) {
+        sectionState = evidenceState;
+      }
+    }
+    if (STATE_RANK[sectionState] > STATE_RANK[state]) state = sectionState;
   }
 
   const exceptions = [
@@ -465,12 +487,38 @@ const sensitivity = {
   redacted: false,
 };
 
-function arrayFrom(payload: unknown, key: string): Json[] {
-  if (Array.isArray(payload)) return payload.filter(isJson);
-  if (isJson(payload) && Array.isArray(payload[key])) {
-    return payload[key].filter(isJson);
-  }
-  return [];
+function arrayFrom(
+  payload: unknown,
+  key: string,
+  validRecord: (value: Json) => boolean,
+): { entries: Json[]; rejected: number; validContainer: boolean } {
+  const raw = Array.isArray(payload)
+    ? payload
+    : isJson(payload) && Array.isArray(payload[key])
+    ? payload[key]
+    : null;
+  if (raw === null) return { entries: [], rejected: 1, validContainer: false };
+  const entries = raw.filter((value): value is Json =>
+    isJson(value) && validRecord(value)
+  );
+  return {
+    entries,
+    rejected: raw.length - entries.length,
+    validContainer: true,
+  };
+}
+
+function historyRecord(value: Json): boolean {
+  return ["status", "state", "outcome"].some((key) =>
+    typeof value[key] === "string" && value[key].trim() !== ""
+  );
+}
+
+function reportRecord(value: Json): boolean {
+  return ["status", "state", "outcome", "id", "name", "reportName", "dataName"]
+    .some((key) =>
+      typeof value[key] === "string" && String(value[key]).trim() !== ""
+    );
 }
 
 function isJson(value: unknown): value is Json {
@@ -479,7 +527,10 @@ function isJson(value: unknown): value is Json {
 
 function statusOf(value: Json): string {
   for (const key of ["status", "state", "outcome"]) {
-    if (typeof value[key] === "string") return value[key].toLowerCase();
+    if (typeof value[key] === "string") {
+      const status = value[key].trim().toLowerCase();
+      if (status !== "") return status;
+    }
   }
   return "unknown";
 }
@@ -540,7 +591,8 @@ function historySection(
   key: string,
 ) {
   if (!observation.available) return unavailableSection(observation, title);
-  const entries = arrayFrom(observation.payload, key);
+  const parsed = arrayFrom(observation.payload, key, historyRecord);
+  const { entries } = parsed;
   const counts = {
     active: 0,
     succeeded: 0,
@@ -567,7 +619,9 @@ function historySection(
     else if (/orphan/.test(status)) counts.orphaned++;
     else counts.unknown++;
   }
-  const state: DashboardState = entries.length === 0
+  const state: DashboardState = parsed.rejected > 0
+    ? "partial"
+    : entries.length === 0
     ? "unknown"
     : counts.stale > 0 || counts.orphaned > 0
     ? "critical"
@@ -575,13 +629,27 @@ function historySection(
     ? "degraded"
     : "healthy";
   const exceptions = [];
-  if (entries.length === 0) {
+  if (entries.length === 0 && parsed.validContainer) {
     exceptions.push({
       id: `swamp:${observation.interface}:empty`,
       severity: "info",
       subject: title,
       headline: "No history observed",
       detail: "The interface responded successfully but returned no history.",
+      source: "@jpisgeek/swamp-observability",
+      suppressed: false,
+      suppressReason: "",
+      sensitivity: "operational",
+    });
+  }
+  if (parsed.rejected > 0) {
+    exceptions.push({
+      id: `swamp:${observation.interface}:malformed-records`,
+      severity: "warning",
+      subject: title,
+      headline: "Malformed history records rejected",
+      detail:
+        `${parsed.rejected} malformed record(s) were excluded from counts.`,
       source: "@jpisgeek/swamp-observability",
       suppressed: false,
       suppressReason: "",
@@ -620,11 +688,13 @@ function historySection(
     title,
     state,
     impact: "required",
-    summary: entries.length === 0
+    summary: parsed.rejected > 0
+      ? `${entries.length} valid and ${parsed.rejected} malformed execution record(s) observed`
+      : entries.length === 0
       ? "History is available but empty"
       : `${entries.length} execution record(s) observed`,
     coverage: {
-      kind: "exact",
+      kind: parsed.rejected > 0 ? "unknown" : "exact",
       end: observation.observedAt,
       scope: `records returned by ${observation.interface}`,
     },
@@ -633,7 +703,14 @@ function historySection(
       observedAt: observation.observedAt,
       maxAgeSeconds: 300,
     },
-    completeness: { state: "exact", observed: entries.length, rejected: 0 },
+    completeness: parsed.rejected > 0
+      ? {
+        state: "partial",
+        observed: entries.length,
+        rejected: parsed.rejected,
+        reason: "one or more history records were malformed",
+      }
+      : { state: "exact", observed: entries.length, rejected: 0 },
     metrics: Object.entries(counts).map(([id, value]) => ({
       id,
       label: id[0].toUpperCase() + id.slice(1),
@@ -653,10 +730,13 @@ function historySection(
 function reportsSection(observation: Observation) {
   const title = "Stored reports";
   if (!observation.available) return unavailableSection(observation, title);
-  const entries = arrayFrom(observation.payload, "results");
+  const parsed = arrayFrom(observation.payload, "results", reportRecord);
+  const { entries } = parsed;
   const hasStatus = entries.length > 0 &&
     entries.every((entry) => statusOf(entry) !== "unknown");
-  const state: DashboardState = entries.length === 0
+  const state: DashboardState = parsed.rejected > 0
+    ? "partial"
+    : entries.length === 0
     ? "unknown"
     : hasStatus
     ? "healthy"
@@ -666,13 +746,15 @@ function reportsSection(observation: Observation) {
     title,
     state,
     impact: "required",
-    summary: entries.length === 0
+    summary: parsed.rejected > 0
+      ? `${entries.length} valid and ${parsed.rejected} malformed stored report record(s) observed`
+      : entries.length === 0
       ? "Report inventory is available but empty"
       : hasStatus
       ? `${entries.length} stored report(s) with status observed`
       : `${entries.length} stored report(s) observed; result status is unavailable`,
     coverage: {
-      kind: hasStatus ? "exact" : "unknown",
+      kind: hasStatus && parsed.rejected === 0 ? "exact" : "unknown",
       end: observation.observedAt,
       scope: "stored report inventory and exposed status fields",
       ...(hasStatus
@@ -684,7 +766,14 @@ function reportsSection(observation: Observation) {
       observedAt: observation.observedAt,
       maxAgeSeconds: 300,
     },
-    completeness: hasStatus
+    completeness: parsed.rejected > 0
+      ? {
+        state: "partial",
+        observed: entries.length,
+        rejected: parsed.rejected,
+        reason: "one or more stored report records were malformed",
+      }
+      : hasStatus
       ? { state: "exact", observed: entries.length, rejected: 0 }
       : {
         state: "partial",
@@ -722,7 +811,20 @@ function reportsSection(observation: Observation) {
         },
     ],
     facts: [],
-    exceptions: entries.length === 0
+    exceptions: parsed.rejected > 0
+      ? [{
+        id: "swamp:stored-reports:malformed-records",
+        severity: "warning",
+        subject: title,
+        headline: "Malformed stored report records rejected",
+        detail:
+          `${parsed.rejected} malformed record(s) were excluded from counts.`,
+        source: "@jpisgeek/swamp-observability",
+        suppressed: false,
+        suppressReason: "",
+        sensitivity: "operational",
+      }]
+      : entries.length === 0
       ? [{
         id: "swamp:stored-reports:empty",
         severity: "info",
@@ -761,13 +863,16 @@ function doctorSection(observation: Observation) {
   const payload = isJson(observation.payload) ? observation.payload : {};
   const number = (key: string) =>
     typeof payload[key] === "number" ? payload[key] : undefined;
-  const stale = number("stale") ?? 0;
+  const stale = number("stale");
   const orphaned = number("orphaned");
-  const active = number("active") ?? 0;
-  const tracked = number("totalTracked") ?? 0;
-  const state: DashboardState = stale + (orphaned ?? 0) > 0
+  const active = number("active");
+  const tracked = number("totalTracked");
+  const incomplete = [stale, orphaned, active, tracked].some((value) =>
+    value === undefined
+  );
+  const state: DashboardState = (stale ?? 0) + (orphaned ?? 0) > 0
     ? "critical"
-    : orphaned === undefined
+    : incomplete
     ? "partial"
     : tracked === 0
     ? "unknown"
@@ -777,17 +882,19 @@ function doctorSection(observation: Observation) {
     title: "Run diagnostics",
     state,
     impact: "required",
-    summary: orphaned === undefined
-      ? `${tracked} run(s) diagnosed; orphan count is unavailable`
+    summary: incomplete
+      ? `${
+        tracked ?? "Unknown number of"
+      } run(s) diagnosed; diagnostic counts are incomplete`
       : tracked === 0
       ? "No tracked runs to diagnose"
       : `${tracked} run(s) diagnosed`,
     coverage: {
-      kind: orphaned === undefined ? "unknown" : "exact",
+      kind: incomplete ? "unknown" : "exact",
       end: observation.observedAt,
       scope: "run doctor snapshot",
-      ...(orphaned === undefined
-        ? { notes: "run doctor did not expose an orphan count" }
+      ...(incomplete
+        ? { notes: "run doctor did not expose every diagnostic count" }
         : {}),
     },
     freshness: {
@@ -795,11 +902,11 @@ function doctorSection(observation: Observation) {
       observedAt: observation.observedAt,
       maxAgeSeconds: 300,
     },
-    completeness: orphaned === undefined
+    completeness: incomplete
       ? {
         state: "partial",
         observed: tracked,
-        reason: "orphan count is unavailable",
+        reason: "one or more diagnostic counts are unavailable",
       }
       : { state: "exact", observed: tracked, rejected: 0 },
     metrics: [
@@ -807,55 +914,50 @@ function doctorSection(observation: Observation) {
         ["tracked", "Tracked", tracked],
         ["active", "Active", active],
         ["stale", "Stale", stale],
-      ].map(([id, label, value]) => ({
-        id,
-        label,
-        unit: "count",
-        availability: "observed",
-        value,
-        confidence: "exact",
-        sensitivity: "operational",
-      })),
-      orphaned === undefined
-        ? {
-          id: "orphaned",
-          label: "Orphaned",
-          unit: "count",
-          availability: "unsupported",
-          reason: "run doctor did not expose an orphan count",
-          confidence: "unknown",
-          sensitivity: "operational",
-        }
-        : {
-          id: "orphaned",
-          label: "Orphaned",
-          unit: "count",
-          availability: "observed",
-          value: orphaned,
-          confidence: "exact",
-          sensitivity: "operational",
-        },
+        ["orphaned", "Orphaned", orphaned],
+      ].map(([id, label, value]) =>
+        value === undefined
+          ? {
+            id,
+            label,
+            unit: "count",
+            availability: "unsupported",
+            reason: `run doctor did not expose the ${id} count`,
+            confidence: "unknown",
+            sensitivity: "operational",
+          }
+          : {
+            id,
+            label,
+            unit: "count",
+            availability: "observed",
+            value,
+            confidence: "exact",
+            sensitivity: "operational",
+          }
+      ),
     ],
     facts: [],
-    exceptions: stale + (orphaned ?? 0) > 0
+    exceptions: (stale ?? 0) + (orphaned ?? 0) > 0
       ? [{
         id: "swamp:run-doctor:stale-or-orphaned",
         severity: "critical",
         subject: "Run diagnostics",
         headline: "Stale or orphaned runs require attention",
-        detail: `${stale} stale and ${orphaned ?? 0} orphaned run(s).`,
+        detail: `${stale ?? 0} stale and ${orphaned ?? 0} orphaned run(s).`,
         source: "@jpisgeek/swamp-observability",
         suppressed: false,
         suppressReason: "",
         sensitivity: "operational",
       }]
-      : orphaned === undefined
+      : incomplete
       ? [{
         id: "swamp:run-doctor:orphan-count-unsupported",
         severity: "warning",
         subject: "Run diagnostics",
-        headline: "Orphan count unavailable",
-        detail: "The public run doctor result did not expose an orphan count.",
+        headline: "Diagnostic count unavailable",
+        detail:
+          "The public run doctor result did not expose every diagnostic count.",
         source: "@jpisgeek/swamp-observability",
         suppressed: false,
         suppressReason: "",
@@ -931,7 +1033,7 @@ export async function normalize(
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/dashboard-swamp",
-      extensionVersion: "2026.08.25.1",
+      extensionVersion: "2026.08.25.2",
       modelType: String(ctx.modelType),
       modelName: ctx.definition.name,
       modelId: ctx.modelId,

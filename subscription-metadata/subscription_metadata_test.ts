@@ -84,6 +84,8 @@ Deno.test("source references reject embedded secrets and signed queries", async 
     const sourceReference of [
       "https://user:secret@example.invalid/docs",
       "https://example.invalid/docs?token=private",
+      "http://example.invalid/docs",
+      "file:///tmp/example",
     ]
   ) {
     await assertRejects(

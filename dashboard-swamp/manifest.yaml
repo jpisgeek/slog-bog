@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/dashboard-swamp"
-version: 2026.08.25.1
+version: 2026.08.25.2
 description: >
   Local Swamp operational observability. Reads documented run history,
   stale-run diagnostics, workflow history, and stored-report interfaces into

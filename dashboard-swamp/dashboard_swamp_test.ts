@@ -166,6 +166,94 @@ Deno.test("missing orphan and report status fields are not normalized to zero", 
   );
 });
 
+Deno.test("whitespace report status remains unavailable", async () => {
+  const bundle = await normalize(reportContext(complete({
+    "stored-reports": observation("stored-reports", {
+      results: [{ reportName: "@example/report", status: "   " }],
+    }),
+  })));
+  const section = bundle.sections[3];
+  assertEquals(section.state, "partial");
+  assertEquals(section.completeness.state, "partial");
+  assertEquals(
+    section.metrics.find((metric) => metric.id === "status-known")
+      ?.availability,
+    "unsupported",
+  );
+});
+
+Deno.test("missing stale count is unsupported rather than zero", async () => {
+  const bundle = await normalize(reportContext(complete({
+    "run-doctor": observation("run-doctor", {
+      totalTracked: 1,
+      active: 0,
+      orphaned: 0,
+    }),
+  })));
+  const section = bundle.sections[1];
+  assertEquals(section.state, "partial");
+  assertEquals(
+    section.metrics.find((metric) => metric.id === "stale")?.availability,
+    "unsupported",
+  );
+  assertEquals(section.exceptions[0].headline, "Diagnostic count unavailable");
+});
+
+Deno.test("malformed history and report records make coverage partial", async () => {
+  const bundle = await normalize(reportContext(complete({
+    "run-history": observation("run-history", {
+      runs: [{ status: "succeeded" }, "malformed", { status: 7 }],
+    }),
+    "stored-reports": observation("stored-reports", {
+      results: [{ status: "succeeded" }, 42, { status: 7 }],
+    }),
+  })));
+  for (const section of [bundle.sections[0], bundle.sections[3]]) {
+    assertEquals(section.state, "partial");
+    assertEquals(section.completeness.state, "partial");
+    assertEquals(section.completeness.rejected, 2);
+  }
+});
+
+Deno.test("every missing run diagnostic count remains unavailable", async () => {
+  const bundle = await normalize(reportContext(complete({
+    "run-doctor": observation("run-doctor", { stale: 0, orphaned: 0 }),
+  })));
+  const section = bundle.sections[1];
+  assertEquals(section.state, "partial");
+  for (const id of ["tracked", "active"]) {
+    assertEquals(
+      section.metrics.find((metric) => metric.id === id)?.availability,
+      "unsupported",
+    );
+  }
+});
+
+Deno.test("remote server requires credential-free HTTPS", () => {
+  for (
+    const server of [
+      "http://swamp.example.invalid",
+      "file:///tmp/swamp",
+      "https://user:token@swamp.example.invalid",
+      "https://swamp.example.invalid?token=private",
+      "https://swamp.example.invalid#private",
+    ]
+  ) {
+    const parsed = model.globalArguments.safeParse({
+      repoDir: "/tmp/synthetic-swamp-repo",
+      server,
+    });
+    assertEquals(parsed.success, false, server);
+  }
+  assertEquals(
+    model.globalArguments.safeParse({
+      repoDir: "/tmp/synthetic-swamp-repo",
+      server: "https://swamp.example.invalid",
+    }).success,
+    true,
+  );
+});
+
 Deno.test("empty history is unknown rather than healthy or zero activity", async () => {
   const bundle = await normalize(reportContext(complete({
     "run-history": observation("run-history", { runs: [] }),

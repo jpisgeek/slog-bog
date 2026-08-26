@@ -182,7 +182,11 @@ Deno.test("certificate alert remains independent without stable identity", async
         silenced: false,
       },
     },
-    { spec: "summary", name: "summary", value: trueNasSummary() },
+    {
+      spec: "summary",
+      name: "summary",
+      value: { ...trueNasSummary(), pools: 0, poolsUnhealthy: 0, disks: 0 },
+    },
   ]));
   const exceptions = bundle.sections[0].exceptions;
   assertEquals(exceptions.length, 2);
@@ -239,9 +243,41 @@ Deno.test("valid synthetic signals survive normalization", async () => {
 
 Deno.test("filtered Firewalla coverage declares its scope", async () => {
   const bundle = await normalize(context("@jpisgeek/firewalla", [
-    { spec: "inventory", name: "inventory", value: firewallaInventory() },
+    {
+      spec: "inventory",
+      name: "inventory",
+      value: { ...firewallaInventory(), machines: 0 },
+    },
   ], { network: "Synthetic" }));
   assertEquals(bundle.state, "healthy");
+  assertEquals(bundle.sections[0].coverage.scope, "requested collector filter");
+});
+
+Deno.test("summary counts without matching records make coverage partial", async () => {
+  const bundle = await normalize(context("@jpisgeek/firewalla", [
+    { spec: "inventory", name: "inventory", value: firewallaInventory() },
+  ]));
+  assertEquals(bundle.state, "partial");
+  assertEquals(bundle.sections[0].completeness.state, "partial");
+  assertEquals(
+    bundle.sections[0].exceptions[0].headline,
+    "Inventory and machine coverage differ",
+  );
+});
+
+Deno.test("collector-side Firewalla exclusions declare filtered coverage", async () => {
+  const bundle = await normalize(context("@jpisgeek/firewalla", [
+    {
+      spec: "inventory",
+      name: "inventory",
+      value: {
+        ...firewallaInventory(),
+        machines: 0,
+        skippedByNetwork: 1,
+        excludedNetworks: ["Guest"],
+      },
+    },
+  ]));
   assertEquals(bundle.sections[0].coverage.scope, "requested collector filter");
 });
 

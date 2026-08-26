@@ -330,6 +330,32 @@ Deno.test("failed request token zeros become unavailable instead of measured zer
   );
 });
 
+Deno.test("successful request without usage remains partial and unknown", async () => {
+  const bundle = await normalize(probe(
+    "completion",
+    completion({
+      promptTokens: null,
+      completionTokens: null,
+      totalTokens: null,
+      reasoningTokens: null,
+      contextExhausted: null,
+      maxTokensHit: null,
+    }),
+  ));
+  assertEquals(bundle.sections[0].state, "partial");
+  assertEquals(
+    bundle.sections[0].metrics.find((metric) => metric.id === "prompt-tokens")
+      ?.availability,
+    "unknown",
+  );
+  assertEquals(
+    bundle.sections[0].exceptions.some((item) =>
+      item.id === "lmstudio:completion:usage-unavailable"
+    ),
+    true,
+  );
+});
+
 Deno.test("partial and truncated capability checks never become healthy", async () => {
   const partial = await normalize(probe("capabilities", {
     model: "example/chat",

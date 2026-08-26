@@ -8,7 +8,7 @@ discovery and reaches no network. Missing, invalid, stale, partial, unsupported,
 and unauthorized inputs remain visible. Each exception is also written as a
 queryable resource.
 
-**Version** `2026.08.25.1` · **License** MIT · **Source**
+**Version** `2026.08.25.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/dashboard
 
 ## Install
@@ -43,7 +43,7 @@ No arguments.
 
 | resource    | lifetime | fields                                                                                                                                                                         | description                                                                     |
 | ----------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
-| `exception` | infinite | `id`, `severity`, `subject`, `headline`, `detail`, `source`, `suppressed`, `suppressReason`, `truncated`                                                                       | One queryable normalized or coverage exception, including visible suppressions. |
+| `exception` | infinite | `id`, `severity`, `subject`, `headline`, `detail`, `source`, `sensitivity`, `suppressed`, `suppressReason`, `truncated`                                                        | One queryable normalized or coverage exception, including visible suppressions. |
 | `render`    | infinite | `outputPath`, `bytes`, `exceptions`, `suppressed`, `critical`, `warning`, `bundlesReceived`, `bundlesValid`, `bundleIds`, `coverageStates`, `exceptionResources`, `renderedAt` | Outcome and coverage of the latest explicit bundle render.                      |
 
 ## Example
@@ -52,12 +52,10 @@ No arguments.
 globalArguments:
   title: Operations
   bundles:
-    - ${{ data.latest("netdata", "report-jpisgeek-dashboard-homelab-json").attributes }}
-    - ${{ data.latest("truenas", "report-jpisgeek-dashboard-homelab-json").attributes }}
-    - ${{ data.latest("firewalla", "report-jpisgeek-dashboard-homelab-json").attributes }}
+    - ${{ data.latest("example-bundle-producer", "report-example-dashboard-json").attributes }}
   outputPath: ./dashboard/index.html
   suppress:
-    - id: condition:accepted-maintenance
+    - id: 14:example-bundle30:condition:accepted-maintenance
       reason: approved maintenance window
 ```
 

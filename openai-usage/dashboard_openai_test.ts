@@ -115,6 +115,30 @@ Deno.test("authorization failure never becomes a zero", async () => {
   assertEquals(metric.availability, "unauthorized");
   assertEquals("value" in metric, false);
 });
+
+Deno.test("later-page authorization failure stays unauthorized", async () => {
+  const bundle = await normalize(context(snapshot({
+    usageStatus: status(
+      "partial",
+      "unauthorized",
+      "OpenAI rejected the configured Admin API credential",
+    ),
+  })));
+  assertEquals(bundle.sections[0].state, "unauthorized");
+  assertEquals(bundle.sections[0].exceptions[0].severity, "critical");
+});
+
+Deno.test("later-page cost authorization failure stays unauthorized", async () => {
+  const bundle = await normalize(context(snapshot({
+    costStatus: status(
+      "partial",
+      "unauthorized",
+      "OpenAI rejected the configured Admin API credential",
+    ),
+  })));
+  assertEquals(bundle.sections[1].state, "unauthorized");
+  assertEquals(bundle.sections[1].exceptions[0].severity, "critical");
+});
 Deno.test("missing currency stays unknown rather than zero", async () => {
   const bundle = await normalize(
     context(snapshot({ costs: { totals: [], breakdowns: [] } })),

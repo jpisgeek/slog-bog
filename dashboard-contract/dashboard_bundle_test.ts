@@ -200,3 +200,36 @@ Deno.test("coverage windows cannot run backwards", () => {
   ((input.sections as Json[])[0].coverage as Json).end = "2026-08-25T12:00:00Z";
   assertThrows(() => DashboardBundleV1Schema.parse(input));
 });
+
+Deno.test("evidence URLs reject unsafe schemes", () => {
+  for (
+    const url of [
+      "http://example.invalid",
+      "file:///tmp/example",
+      "javascript:alert(1)",
+    ]
+  ) {
+    const input = bundle();
+    (input.sections as Json[])[0].references = [{
+      kind: "url",
+      label: "unsafe",
+      url,
+    }];
+    assertEquals(DashboardBundleV1Schema.safeParse(input).success, false, url);
+  }
+});
+
+Deno.test("freshness and completeness evidence can never derive healthy", () => {
+  const input = section("healthy");
+  input.freshness = {
+    state: "stale",
+    observedAt: "2026-08-01T00:00:00Z",
+    reason: "expired",
+  };
+  input.completeness = {
+    state: "partial",
+    rejected: 1,
+    reason: "missing record",
+  };
+  assertEquals(deriveOverallState([input] as never), "partial");
+});

@@ -5,9 +5,10 @@ const DecimalSchema = z.string().regex(/^\d+(\.\d+)?$/);
 const ReferenceSchema = z.string().url().refine(
   (value) => {
     const url = new URL(value);
-    return !url.username && !url.password && !url.search && !url.hash;
+    return url.protocol === "https:" && !url.username && !url.password &&
+      !url.search && !url.hash;
   },
-  "sourceReference must not contain credentials, query parameters, or fragments",
+  "sourceReference must use https and must not contain credentials, query parameters, or fragments",
 );
 const LimitSchema = z.object({
   name: z.string().min(1).describe("Provider-declared limit name"),
@@ -82,7 +83,7 @@ const SnapshotSchema = GlobalArgsSchema.safeExtend({
   provenance: z.object({
     kind: z.literal("operator-config"),
     capturedAt: z.iso.datetime(),
-    sourceReference: z.string().url().optional(),
+    sourceReference: ReferenceSchema.optional(),
   }),
 }).strict();
 interface Context {
@@ -114,7 +115,7 @@ async function capture(_args: z.infer<typeof CaptureArgsSchema>, ctx: Context) {
 }
 export const model = {
   type: "@jpisgeek/subscription-metadata",
-  version: "2026.08.25.1",
+  version: "2026.08.25.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     snapshot: {

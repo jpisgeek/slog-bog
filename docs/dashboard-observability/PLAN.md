@@ -2,11 +2,12 @@
 
 ## Lifecycle Status
 
-- **Phase:** VERIFY complete — Tasks 1-14 complete; REVIEW not started
+- **Phase:** REVIEW in progress — Task 15 risk-based review
 - **Spec:** [DEFINE.md](DEFINE.md), approved 2026-08-25
 - **Build:** complete
 - **Completed tasks:** 14 of 16
-- **Blockers:** none
+- **Blockers:** private denylist configuration and provider-specific approval
+  for the single external release reviewer
 - **Last updated:** 2026-08-25
 
 ## Delivery strategy
@@ -348,9 +349,10 @@ recorded in [VERIFY.md](VERIFY.md).
 **Verify:** publish a VERIFY artifact mapping every DEFINE acceptance statement
 to commands and results; unresolved gaps return the lifecycle to BUILD.
 
-### Task 15: Run per-package quality and exact-content review gates
+### Task 15: Run per-package quality and risk-based review gates
 
-**Goal:** make every prospective public package reviewable on its final bytes.
+**Goal:** make every prospective public package auditable on its final bytes
+without spending an external-model review call on every package.
 
 For each changed or new manifest, run the repository gates in order:
 
@@ -359,14 +361,27 @@ For each changed or new manifest, run the repository gates in order:
 3. `swamp extension quality <manifest>`;
 4. generated README consistency check;
 5. `scripts/scan-identifiers.sh` with generic rules and the private denylist;
-6. `scripts/publish.sh <name> --review-only` to produce the exact-content-hash
-   Fable security verdict;
-7. resolve every `fix` or blocking finding, regenerate affected content, and
-   repeat the review for the new hash;
-8. run `scripts/check-review-verdicts.sh` and require exact-hash `PASS`.
+6. compute and record each publication payload's exact content hash;
+7. use one capable independent external model to perform a release-level
+   adversarial review across package boundaries, security-sensitive surfaces,
+   accuracy rules, and all prior review findings; the reviewer need not be
+   Fable;
+8. resolve every blocking correctness or security finding and regenerate the
+   affected hashes;
+9. use an additional independent reviewer only to resolve a material question
+   that remains ambiguous after the deterministic and release-level review.
 
-**Verify:** every final package has a matching PASS review and no unresolved
-correctness finding; changing any published byte invalidates the gate.
+Existing independent-review artifacts remain evidence, including FAIL findings,
+but the absence of a per-package Fable verdict is not itself a failure.
+Incomplete `.tmp` artifacts are not verdicts. This project does not use
+`scripts/check-review-verdicts.sh` as its gate of record because that script
+implements the repository's older mandatory-per-package model policy.
+
+**Verify:** the release-level REVIEW artifact lists every final package and
+exact hash, records the deterministic gates, dispositions every prior
+substantive finding, and has no unresolved blocking correctness or security
+finding. Changing published bytes invalidates that package's hash entry and
+requires rerunning its deterministic gates and relevant review checks.
 
 ### Task 16: Dry run and stop at SHIP approval
 
@@ -375,7 +390,9 @@ correctness finding; changing any published byte invalidates the gate.
 - Run the repository publication pipeline through Swamp dry-run for each
   approved package.
 - Record exact package versions, content hashes, dependencies, dry-run output,
-  and any registry warnings in the REVIEW artifact.
+  and any registry warnings in the REVIEW artifact. Invoke the dry-run directly
+  or through a non-publishing project-specific path; do not use the global
+  `publish.sh` model-review gate as a proxy for this project's revised policy.
 - Confirm no private checkout, inventory, workflow, secret, or fixture is in the
   payload.
 - Present the release set and any deferred adapters to the user.
@@ -397,7 +414,7 @@ Task 1 architecture proof
   -> Tasks 7-12 domain slices (one at a time)
   -> Task 13 optional workflows
   -> Task 14 whole-family VERIFY
-  -> Task 15 exact-content REVIEW
+  -> Task 15 risk-based exact-content REVIEW
   -> Task 16 dry-run and SHIP gate
 ```
 
@@ -416,7 +433,8 @@ sequential during BUILD so each slice finishes and verifies independently.
 | Migration drops legacy exceptions                         | Baseline and parity checks in Tasks 2, 4, 5, and 14                                           |
 | Invalid data crashes rendering or looks healthy           | Strict source validation plus conformance and adversarial fixtures                            |
 | Package family becomes monolithic                         | Enforce dependency matrix and independent install tests                                       |
-| Review PASS hides correctness findings                    | Require findings resolved, content regenerated, and fresh exact-hash review                   |
+| A review verdict hides correctness findings               | Require substantive findings to be dispositioned in the release-level REVIEW artifact         |
+| Per-package model review exhausts external quota          | Use one reviewer-agnostic external release review; escalate only unresolved questions         |
 | Public artifacts leak private topology                    | Synthetic fixtures plus generic/private identifier scans before review                        |
 | Original `mise-extension` work is disturbed               | Limit every command and edit to this Paseo worktree                                           |
 

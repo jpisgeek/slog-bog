@@ -180,7 +180,10 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
-  url: z.string().url().optional(),
+  url: z.string().url().refine(
+    (value) => new URL(value).protocol === "https:",
+    "evidence URLs must use https",
+  ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
     ctx.addIssue({
@@ -333,7 +336,26 @@ export function deriveOverallState(
   let state: DashboardState = required.length === 0 ? "unknown" : "healthy";
 
   for (const section of required) {
-    if (STATE_RANK[section.state] > STATE_RANK[state]) state = section.state;
+    let sectionState = section.state;
+    const evidenceStates: DashboardState[] = [
+      section.freshness.state === "stale"
+        ? "stale"
+        : section.freshness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.completeness.state === "partial"
+        ? "partial"
+        : section.completeness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.coverage.kind === "unknown" ? "unknown" : "healthy",
+    ];
+    for (const evidenceState of evidenceStates) {
+      if (STATE_RANK[evidenceState] > STATE_RANK[sectionState]) {
+        sectionState = evidenceState;
+      }
+    }
+    if (STATE_RANK[sectionState] > STATE_RANK[state]) state = sectionState;
   }
 
   const exceptions = [
@@ -416,6 +438,7 @@ const RenderedExceptionSchema = z.object({
   headline: z.string(),
   detail: z.string(),
   source: z.string(),
+  sensitivity: SensitivityClassSchema,
   suppressed: z.boolean(),
   suppressReason: z.string(),
   truncated: z.boolean(),
@@ -442,6 +465,7 @@ interface Exc {
   headline: string;
   detail: string;
   source: string;
+  sensitivity: z.infer<typeof SensitivityClassSchema>;
   suppressed: boolean;
   suppressReason: string;
   truncated: boolean;
@@ -475,11 +499,25 @@ function resourceName(id: string): string {
   ).slice(0, 48) || "condition";
   return `exception-${slug}-${fnv1a(id)}`;
 }
-function makeExc(input: Omit<Exc, "truncated">): Exc {
+function tupleId(...parts: string[]): string {
+  return parts.map((part) => `${part.length}:${part}`).join("");
+}
+function syntheticId(family: string, ...parts: string[]): string {
+  return tupleId("renderer", family, ...parts);
+}
+function scopedExceptionId(bundleId: string, exceptionId: string): string {
+  return tupleId(bundleId, exceptionId);
+}
+function makeExc(
+  input:
+    & Omit<Exc, "truncated" | "sensitivity">
+    & Partial<Pick<Exc, "sensitivity">>,
+): Exc {
   const headCut = input.headline.length > 160;
   const detailCut = input.detail.length > 240;
   return {
     ...input,
+    sensitivity: input.sensitivity ?? "operational",
     headline: input.headline.slice(0, 160),
     detail: input.detail.slice(0, 240),
     truncated: headCut || detailCut,
@@ -496,9 +534,10 @@ function stateSeverity(state: string): Exc["severity"] {
 function parseInputs(inputs: unknown[]) {
   const bundles: DashboardBundleV1[] = [];
   const issues: Exc[] = [];
+  const bundleIds = new Set<string>();
   if (inputs.length === 0) {
     issues.push(makeExc({
-      id: "coverage:no-bundles",
+      id: syntheticId("input", "no-bundles"),
       severity: "warning",
       subject: "Dashboard coverage",
       headline: "No dashboard bundles were provided",
@@ -510,13 +549,36 @@ function parseInputs(inputs: unknown[]) {
   }
   for (const [index, input] of inputs.entries()) {
     try {
-      bundles.push(parseDashboardBundle(input));
+      const bundle = parseDashboardBundle(input);
+      if (bundleIds.has(bundle.id)) {
+        issues.push(makeExc({
+          id: syntheticId(
+            "input",
+            "duplicate-bundle",
+            String(index),
+            bundle.id,
+          ),
+          severity: "critical",
+          subject: bundle.title,
+          headline: "Duplicate dashboard bundle ID",
+          detail: "Every input bundle must have a unique ID.",
+          source: "renderer",
+          suppressed: false,
+          suppressReason: "",
+        }));
+        continue;
+      }
+      bundleIds.add(bundle.id);
+      bundles.push(bundle);
     } catch (error) {
       const unsupported = error instanceof UnsupportedBundleVersionError;
       issues.push(makeExc({
-        id: `coverage:bundle-${index}:${
-          unsupported ? "unsupported" : "invalid"
-        }`,
+        id: syntheticId(
+          "input",
+          "invalid-bundle",
+          String(index),
+          unsupported ? "unsupported" : "invalid",
+        ),
         severity: unsupported ? "warning" : "critical",
         subject: `Bundle ${index + 1}`,
         headline: unsupported
@@ -547,24 +609,26 @@ function collectExceptions(
       ...bundle.sections.flatMap((section) => section.exceptions),
     ];
     for (const e of bundleExceptions) {
-      if (ids.has(e.id)) continue;
+      const id = scopedExceptionId(bundle.id, e.id);
+      if (ids.has(id)) continue;
       out.push(makeExc({
-        id: e.id,
+        id,
         severity: e.severity,
         subject: e.subject,
         headline: e.headline,
         detail: e.detail,
         source: e.source,
+        sensitivity: e.sensitivity,
         suppressed: e.suppressed,
         suppressReason: e.suppressReason,
       }));
-      ids.add(e.id);
+      ids.add(id);
     }
     if (
       (bundle.state === "critical" || bundle.state === "degraded") &&
       !bundleExceptions.some((e) => !e.suppressed)
     ) {
-      const id = `status:${bundle.id}:${bundle.state}`;
+      const id = syntheticId("status", bundle.id, bundle.state);
       out.push(makeExc({
         id,
         severity: bundle.state === "critical" ? "critical" : "warning",
@@ -579,9 +643,16 @@ function collectExceptions(
       ids.add(id);
     }
     const states = [
-      { id: bundle.id, title: bundle.title, state: bundle.state, summary: "" },
+      {
+        family: "bundle",
+        parts: [bundle.id],
+        title: bundle.title,
+        state: bundle.state,
+        summary: "",
+      },
       ...bundle.sections.filter((s) => s.state !== bundle.state).map((s) => ({
-        id: `${bundle.id}:${s.id}`,
+        family: "section",
+        parts: [bundle.id, s.id],
         title: s.title,
         state: s.state,
         summary: s.summary,
@@ -589,7 +660,7 @@ function collectExceptions(
     ];
     for (const item of states) {
       if (!COVERAGE_STATES.has(item.state)) continue;
-      const id = `coverage:${item.id}:${item.state}`;
+      const id = syntheticId(item.family, ...item.parts, item.state);
       if (ids.has(id)) continue;
       out.push(makeExc({
         id,
@@ -616,17 +687,6 @@ function collectExceptions(
   return out.sort((a, b) =>
     SEV_RANK[a.severity] - SEV_RANK[b.severity] || a.id.localeCompare(b.id)
   );
-}
-
-function ago(iso: string): string {
-  const seconds = Math.max(
-    0,
-    Math.floor((Date.now() - Date.parse(iso)) / 1000),
-  );
-  if (seconds < 90) return `${seconds}s ago`;
-  if (seconds < 5400) return `${Math.round(seconds / 60)}m ago`;
-  if (seconds < 172800) return `${Math.round(seconds / 3600)}h ago`;
-  return `${Math.round(seconds / 86400)}d ago`;
 }
 
 function renderHtml(d: {
@@ -710,9 +770,9 @@ th{text-align:left;color:var(--dim);font-size:11px;text-transform:uppercase;padd
 td{padding:7px 18px 7px 0;border-bottom:1px solid var(--line)}footer{margin-top:34px;color:var(--dim);font-size:12px;border-top:1px solid var(--line);padding-top:12px}
 </style></head><body><div class="wrap"><header><h1>${
     esc(d.title)
-  }</h1><div class="ts">rendered ${
-    esc(ago(d.now))
-  }</div></header><div class="banner${allClear ? " clear" : ""}"><h2>${
+  }</h1><div class="ts">rendered <time datetime="${esc(d.now)}">${
+    esc(d.now)
+  }</time></div></header><div class="banner${allClear ? " clear" : ""}"><h2>${
     allClear
       ? "Nothing needs you"
       : `${active.length} thing${active.length === 1 ? "" : "s"} need${
@@ -736,7 +796,7 @@ td{padding:7px 18px 7px 0;border-bottom:1px solid var(--line)}footer{margin-top:
 /** The provider-neutral @jpisgeek/dashboard model. */
 export const model = {
   type: "@jpisgeek/dashboard",
-  version: "2026.08.25.1",
+  version: "2026.08.25.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     exception: {
@@ -794,6 +854,7 @@ export const model = {
                 severity: exception.severity,
                 suppressed: String(exception.suppressed),
                 source: exception.source,
+                sensitivity: exception.sensitivity,
               },
             }),
           );

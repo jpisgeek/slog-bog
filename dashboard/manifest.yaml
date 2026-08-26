@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/dashboard"
-version: 2026.08.25.1
+version: 2026.08.25.2
 description: >
   Renders explicit provider-neutral dashboard bundle v1 inputs as a self-contained, exceptions-first HTML status page. Performs no source discovery and reaches no network. Missing, invalid, stale, partial, unsupported, and unauthorized coverage remains visible.
 repository: https://github.com/jpisgeek/slog-bog/tree/main/dashboard

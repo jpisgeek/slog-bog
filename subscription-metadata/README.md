@@ -7,7 +7,7 @@ currency, renewal window, seats, and provider-declared limits. It keeps
 subscription facts separate from API metering and never derives remaining quota
 or per-token cost.
 
-**Version** `2026.08.25.1` · **License** MIT · **Source**
+**Version** `2026.08.25.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/subscription-metadata
 
 ## Install
@@ -79,7 +79,10 @@ Values are declarations, not live billing facts, unless the operator cites an
 authorized stable API in sourceReference. Missing fields remain absent.
 priceMinor is the recurring plan price in currency minor units and never API
 usage cost. Limits named as remaining quota, availability, or per-token price
-are rejected. This package performs no account-dashboard scraping.
+are rejected. Currency uses three uppercase letters; price and currency must be
+supplied together; renewal timestamps use ISO datetime values; limit units use
+lowercase letters, digits, dot, underscore, or hyphen. This package performs no
+account-dashboard scraping.
 
 ## Security
 
@@ -87,7 +90,8 @@ This package performs no network, process, environment, or vault operations.
 Plan, price, renewal, and seat metadata can be commercially sensitive, so
 protect stored Swamp data and rendered dashboards accordingly. Do not put
 credentials, private account URLs, or bearer query parameters in
-sourceReference.
+sourceReference. References must use HTTPS and cannot contain credentials, query
+parameters, or fragments.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

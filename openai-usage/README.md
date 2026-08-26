@@ -7,7 +7,7 @@ official Admin APIs, then emits dashboard bundle v1. Usage and costs paginate
 independently so authorization, rate limits, malformed pages, and partial
 coverage cannot turn into reassuring zeroes.
 
-**Version** `2026.08.25.1` · **License** MIT · **Source**
+**Version** `2026.08.25.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/openai-usage
 
 ## Install

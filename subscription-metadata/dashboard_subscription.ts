@@ -194,7 +194,10 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
-  url: z.string().url().optional(),
+  url: z.string().url().refine(
+    (value) => new URL(value).protocol === "https:",
+    "evidence URLs must use https",
+  ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
     ctx.addIssue({
@@ -347,7 +350,26 @@ export function deriveOverallState(
   let state: DashboardState = required.length === 0 ? "unknown" : "healthy";
 
   for (const section of required) {
-    if (STATE_RANK[section.state] > STATE_RANK[state]) state = section.state;
+    let sectionState = section.state;
+    const evidenceStates: DashboardState[] = [
+      section.freshness.state === "stale"
+        ? "stale"
+        : section.freshness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.completeness.state === "partial"
+        ? "partial"
+        : section.completeness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.coverage.kind === "unknown" ? "unknown" : "healthy",
+    ];
+    for (const evidenceState of evidenceStates) {
+      if (STATE_RANK[evidenceState] > STATE_RANK[sectionState]) {
+        sectionState = evidenceState;
+      }
+    }
+    if (STATE_RANK[sectionState] > STATE_RANK[state]) state = sectionState;
   }
 
   const exceptions = [
@@ -406,28 +428,37 @@ export function parseDashboardBundle(input: unknown): DashboardBundleV1 {
 }
 // END INLINED DASHBOARD CONTRACT V1
 type Json = Record<string, unknown>;
+const DecimalSchema = z.string().regex(/^\d+(\.\d+)?$/);
+const ReferenceSchema = z.string().url().refine(
+  (value) => {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password &&
+      !url.search && !url.hash;
+  },
+  "sourceReference must use https and must not contain credentials, query parameters, or fragments",
+);
 const LimitSchema = z.object({
   name: z.string(),
-  value: z.number(),
-  unit: z.string(),
+  value: z.number().nonnegative().finite(),
+  unit: z.string().regex(/^[a-z][a-z0-9._-]*$/),
   period: z.string().optional(),
-  sourceReference: z.string().url().optional(),
+  sourceReference: ReferenceSchema.optional(),
 });
 const SnapshotSchema = z.object({
   provider: z.string(),
   planName: z.string().optional(),
   billingCadence: z.string().optional(),
-  priceMinor: z.string().optional(),
-  currency: z.string().optional(),
+  priceMinor: DecimalSchema.optional(),
+  currency: z.string().regex(/^[A-Z]{3}$/).optional(),
   renewalStart: z.iso.datetime().optional(),
   renewalEnd: z.iso.datetime().optional(),
   seats: z.number().int().nonnegative().optional(),
   declaredLimits: z.array(LimitSchema),
-  sourceReference: z.string().url().optional(),
+  sourceReference: ReferenceSchema.optional(),
   provenance: z.object({
     kind: z.literal("operator-config"),
     capturedAt: z.iso.datetime(),
-    sourceReference: z.string().url().optional(),
+    sourceReference: ReferenceSchema.optional(),
   }),
 });
 type Snapshot = z.infer<typeof SnapshotSchema>;
@@ -627,7 +658,7 @@ export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/subscription-metadata",
-      extensionVersion: "2026.08.25.1",
+      extensionVersion: "2026.08.25.2",
       modelType: String(ctx.modelType),
       modelName: ctx.definition.name,
       modelId: ctx.modelId,
@@ -656,8 +687,13 @@ export const report = {
   labels: ["dashboard", "subscription", "metadata"],
   execute: async (context: Context) => {
     const bundle = await normalize(context);
+    const markdownEscape = (value: string) =>
+      value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/([\\`*_[\]{}()#+.!|\-])/g, "\\$1").replace(/[\r\n]+/g, " ");
     return {
-      markdown: `# ${bundle.title}\n\n${bundle.sections[0].summary}`,
+      markdown: `# ${markdownEscape(bundle.title)}\n\n${
+        markdownEscape(bundle.sections[0].summary)
+      }`,
       json: bundle,
     };
   },

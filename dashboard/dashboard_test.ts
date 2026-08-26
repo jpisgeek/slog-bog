@@ -240,7 +240,10 @@ Deno.test("all bundle strings are escaped in exceptions metrics and facts", asyn
 
 Deno.test("suppression remains visible and queryable", async () => {
   const rendered = await render([bundle({ exceptions: [exception()] })], {
-    suppress: [{ id: "condition:one", reason: "maintenance window" }],
+    suppress: [{
+      id: "16:synthetic-bundle13:condition:one",
+      reason: "maintenance window",
+    }],
   });
   assertStringIncludes(rendered.html, "Expected");
   assertStringIncludes(rendered.html, "maintenance window");
@@ -248,6 +251,105 @@ Deno.test("suppression remains visible and queryable", async () => {
   assertEquals(rendered.result.suppressed, 1);
   const row = rendered.written.find((item) => item.spec === "exception")!.data;
   assertEquals(row.suppressed, true);
+  assertEquals(row.id, "16:synthetic-bundle13:condition:one");
+  assertEquals(row.sensitivity, "operational");
+});
+
+Deno.test("same producer exception id remains distinct across bundles", async () => {
+  const rendered = await render([
+    bundle({ id: "bundle-a", exceptions: [exception()] }),
+    bundle({ id: "bundle-b", exceptions: [exception()] }),
+  ]);
+  const ids = rendered.written.filter((item) => item.spec === "exception").map(
+    (item) => item.data.id,
+  );
+  assertEquals(ids, [
+    "8:bundle-a13:condition:one",
+    "8:bundle-b13:condition:one",
+  ]);
+});
+
+Deno.test("exception tuple encoding cannot collide on colon placement", async () => {
+  const rendered = await render([
+    bundle({ id: "a:b", exceptions: [exception({ id: "c" })] }),
+    bundle({ id: "a", exceptions: [exception({ id: "b:c" })] }),
+  ]);
+  const ids = rendered.written.filter((item) => item.spec === "exception").map(
+    (item) => item.data.id,
+  );
+  assertEquals(ids, ["1:a3:b:c", "3:a:b1:c"]);
+});
+
+Deno.test("synthetic coverage tuple encoding cannot collide", async () => {
+  const first = bundle({ id: "a:b", state: "unknown" });
+  const second = bundle({ id: "a" });
+  second.sections.push(
+    {
+      ...second.sections[0],
+      id: "b",
+      title: "Optional coverage",
+      state: "unknown",
+      impact: "optional",
+      freshness: { state: "unknown", reason: "not observed" },
+      completeness: { state: "unknown", reason: "not observed" },
+    } as unknown as typeof second.sections[number],
+  );
+  const rendered = await render([first, second]);
+  const ids = rendered.written.filter((item) => item.spec === "exception").map(
+    (item) => item.data.id,
+  );
+  assertEquals(new Set(ids).size, ids.length);
+  assertEquals(ids.length, 2);
+});
+
+Deno.test("duplicate bundle IDs fail visibly", async () => {
+  const rendered = await render([
+    bundle({ id: "same" }),
+    bundle({ id: "same" }),
+  ]);
+  assertStringIncludes(rendered.html, "Duplicate dashboard bundle ID");
+  assertEquals(rendered.result.bundlesValid, 1);
+  assertEquals(rendered.result.critical, 1);
+});
+
+Deno.test("synthetic families and repeated duplicate IDs remain distinct", async () => {
+  const rendered = await render([
+    bundle({ id: "unknown" }),
+    bundle({ id: "unknown" }),
+    bundle({ id: "unknown" }),
+    bundle({ id: "duplicate-bundle", state: "unknown" }),
+  ]);
+  const rows = rendered.written.filter((item) => item.spec === "exception");
+  const ids = rows.map((item) => String(item.data.id));
+  assertEquals(new Set(ids).size, ids.length);
+  assertEquals(
+    rows.filter((item) =>
+      item.data.headline === "Duplicate dashboard bundle ID"
+    )
+      .length,
+    2,
+  );
+  assertEquals(
+    rows.filter((item) => item.data.headline === "Coverage is unknown").length,
+    1,
+  );
+});
+
+Deno.test("stale partial evidence cannot render all-clear", async () => {
+  const input = bundle();
+  (input.sections[0] as Json).freshness = {
+    state: "stale",
+    observedAt: "2026-08-01T00:00:00Z",
+    reason: "expired",
+  };
+  (input.sections[0] as Json).completeness = {
+    state: "partial",
+    rejected: 1,
+    reason: "missing record",
+  };
+  const rendered = await render([input]);
+  assertEquals(rendered.html.includes("Nothing needs you"), false);
+  assertStringIncludes(rendered.html, "Invalid dashboard bundle");
 });
 
 Deno.test("resolved exception resources are pruned through the model API", async () => {

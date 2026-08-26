@@ -121,6 +121,19 @@ Deno.test("authorization and unsupported capabilities remain distinct", async ()
   );
   assertEquals(unsupported.sections[0].state, "unsupported");
 });
+
+Deno.test("successful-prefix failures retain authorization and capability state", async () => {
+  const unauthorized = await normalize(context(snapshot({
+    usageStatus: status("partial", "unauthorized", "rejected"),
+  })));
+  assertEquals(unauthorized.sections[0].state, "unauthorized");
+  assertEquals(unauthorized.sections[0].exceptions[0].severity, "critical");
+
+  const unsupported = await normalize(context(snapshot({
+    costStatus: status("partial", "unsupported", "not available"),
+  })));
+  assertEquals(unsupported.sections[1].state, "unsupported");
+});
 Deno.test("missing cost currency is unknown rather than zero", async () => {
   const bundle = await normalize(
     context(

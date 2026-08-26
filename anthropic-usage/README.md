@@ -7,7 +7,7 @@ Platform Usage and Cost Admin API or the separate Claude Enterprise Analytics
 API. Product and credential capabilities are explicit, and unavailable,
 unsupported, partial, or capped coverage never becomes zero.
 
-**Version** `2026.08.25.1` · **License** MIT · **Source**
+**Version** `2026.08.25.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/anthropic-usage
 
 ## Install

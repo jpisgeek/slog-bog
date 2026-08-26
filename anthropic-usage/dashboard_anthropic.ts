@@ -194,7 +194,10 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
-  url: z.string().url().optional(),
+  url: z.string().url().refine(
+    (value) => new URL(value).protocol === "https:",
+    "evidence URLs must use https",
+  ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
     ctx.addIssue({
@@ -347,7 +350,26 @@ export function deriveOverallState(
   let state: DashboardState = required.length === 0 ? "unknown" : "healthy";
 
   for (const section of required) {
-    if (STATE_RANK[section.state] > STATE_RANK[state]) state = section.state;
+    let sectionState = section.state;
+    const evidenceStates: DashboardState[] = [
+      section.freshness.state === "stale"
+        ? "stale"
+        : section.freshness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.completeness.state === "partial"
+        ? "partial"
+        : section.completeness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.coverage.kind === "unknown" ? "unknown" : "healthy",
+    ];
+    for (const evidenceState of evidenceStates) {
+      if (STATE_RANK[evidenceState] > STATE_RANK[sectionState]) {
+        sectionState = evidenceState;
+      }
+    }
+    if (STATE_RANK[sectionState] > STATE_RANK[state]) state = sectionState;
   }
 
   const exceptions = [
@@ -550,6 +572,15 @@ function completeness(status: Status, count: number, capped: boolean) {
 function usageSection(s: Snapshot) {
   if (!s.usage) return unavailable("usage", "Token usage", s.usageStatus);
   const partial = s.usageStatus.state === "partial" || s.usage.groupedTop100Cap;
+  const sectionState: DashboardState =
+    s.usageStatus.errorKind === "unauthorized"
+      ? "unauthorized"
+      : s.usageStatus.errorKind === "unsupported" ||
+          s.usageStatus.state === "unsupported"
+      ? "unsupported"
+      : partial
+      ? "partial"
+      : "healthy";
   const metrics: Json[] = [
     [
       "uncached-input-tokens",
@@ -600,7 +631,7 @@ function usageSection(s: Snapshot) {
   return DashboardSectionSchema.parse({
     id: "usage",
     title: "Token usage",
-    state: partial ? "partial" : "healthy",
+    state: sectionState,
     impact: "required",
     summary: `${
       s.usage.uncachedInputTokens + s.usage.outputTokens
@@ -633,10 +664,14 @@ function usageSection(s: Snapshot) {
     }],
     exceptions: partial
       ? [{
-        id: "anthropic:usage:partial",
-        severity: "warning",
+        id: `anthropic:usage:${s.usageStatus.errorKind || "partial"}`,
+        severity: sectionState === "unauthorized" ? "critical" : "warning",
         subject: "Token usage",
-        headline: "Usage coverage is partial",
+        headline: sectionState === "unauthorized"
+          ? "Organization API authorization rejected"
+          : sectionState === "unsupported"
+          ? "Usage capability unsupported"
+          : "Usage coverage is partial",
         detail: s.usageStatus.message ||
           "Grouped Enterprise results have a documented top-100 cap",
         source: "@jpisgeek/anthropic-usage",
@@ -653,6 +688,14 @@ function costSection(s: Snapshot) {
   if (!s.costs) return unavailable("costs", "Authoritative cost", s.costStatus);
   const missing = s.costs.totalsMinor.length === 0;
   const partial = s.costStatus.state === "partial" || s.costs.groupedTop100Cap;
+  const sectionState: DashboardState = s.costStatus.errorKind === "unauthorized"
+    ? "unauthorized"
+    : s.costStatus.errorKind === "unsupported" ||
+        s.costStatus.state === "unsupported"
+    ? "unsupported"
+    : partial
+    ? "partial"
+    : "healthy";
   const metrics: Json[] = s.costs.totalsMinor.map((t) => ({
     id: `cost-${t.currency.toLowerCase()}`,
     label: `Cost (${t.currency})`,
@@ -676,7 +719,7 @@ function costSection(s: Snapshot) {
   return DashboardSectionSchema.parse({
     id: "costs",
     title: "Authoritative cost",
-    state: partial ? "partial" : missing ? "unknown" : "healthy",
+    state: missing ? "unknown" : sectionState,
     impact: "required",
     summary: missing
       ? "No authoritative currency total was returned"
@@ -713,10 +756,14 @@ function costSection(s: Snapshot) {
     }],
     exceptions: partial
       ? [{
-        id: "anthropic:costs:partial",
-        severity: "warning",
+        id: `anthropic:costs:${s.costStatus.errorKind || "partial"}`,
+        severity: sectionState === "unauthorized" ? "critical" : "warning",
         subject: "Authoritative cost",
-        headline: "Cost coverage is partial",
+        headline: sectionState === "unauthorized"
+          ? "Organization API authorization rejected"
+          : sectionState === "unsupported"
+          ? "Cost capability unsupported"
+          : "Cost coverage is partial",
         detail: s.costStatus.message ||
           "Grouped Enterprise results have a documented top-100 cap",
         source: "@jpisgeek/anthropic-usage",
@@ -748,7 +795,7 @@ export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/anthropic-usage",
-      extensionVersion: "2026.08.25.1",
+      extensionVersion: "2026.08.25.2",
       modelType: String(ctx.modelType),
       modelName: ctx.definition.name,
       modelId: ctx.modelId,

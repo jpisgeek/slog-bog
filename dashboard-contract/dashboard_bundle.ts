@@ -192,7 +192,10 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
-  url: z.string().url().optional(),
+  url: z.string().url().refine(
+    (value) => new URL(value).protocol === "https:",
+    "evidence URLs must use https",
+  ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
     ctx.addIssue({
@@ -345,7 +348,26 @@ export function deriveOverallState(
   let state: DashboardState = required.length === 0 ? "unknown" : "healthy";
 
   for (const section of required) {
-    if (STATE_RANK[section.state] > STATE_RANK[state]) state = section.state;
+    let sectionState = section.state;
+    const evidenceStates: DashboardState[] = [
+      section.freshness.state === "stale"
+        ? "stale"
+        : section.freshness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.completeness.state === "partial"
+        ? "partial"
+        : section.completeness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.coverage.kind === "unknown" ? "unknown" : "healthy",
+    ];
+    for (const evidenceState of evidenceStates) {
+      if (STATE_RANK[evidenceState] > STATE_RANK[sectionState]) {
+        sectionState = evidenceState;
+      }
+    }
+    if (STATE_RANK[sectionState] > STATE_RANK[state]) state = sectionState;
   }
 
   const exceptions = [

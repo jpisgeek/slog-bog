@@ -55,6 +55,23 @@ for (const [label, m] of [["endpoint", endpoint], ["probe", probe]] as const) {
     }
   });
 
+  Deno.test(`${label}: baseUrl rejects query strings and fragments`, () => {
+    for (
+      const baseUrl of [
+        "https://inference.example.com/v1?token=private",
+        "https://inference.example.com/v1#private",
+        "https://inference.example.com/v1?",
+        "https://inference.example.com/v1#",
+      ]
+    ) {
+      assertEquals(
+        m.globalArguments.safeParse({ ...OK, baseUrl }).success,
+        false,
+        `CREDENTIAL LEAK — accepted: ${baseUrl}`,
+      );
+    }
+  });
+
   Deno.test(`${label}: baseUrl rejects non-http schemes`, () => {
     for (const baseUrl of ["file:///etc/passwd", "ftp://x.example.com"]) {
       assertEquals(
@@ -162,6 +179,28 @@ Deno.test("completionProbe: reasoning-budget and context flags are mandatory", (
   );
 });
 
+Deno.test("completionProbe: absent usage remains unknown rather than zero", () => {
+  const parsed = probe.resources.completionProbe.schema.safeParse({
+    model: "example/chat",
+    latencyMs: 1,
+    httpStatus: 200,
+    finishReason: "stop",
+    promptTokens: null,
+    completionTokens: null,
+    totalTokens: null,
+    reasoningTokens: null,
+    reasoningChars: 0,
+    contentChars: 2,
+    emptyContentWithReasoning: false,
+    contextExhausted: null,
+    maxTokensHit: null,
+    errorKind: "",
+    error: "",
+    checkedAt: new Date(0).toISOString(),
+  });
+  assertEquals(parsed.success, true);
+});
+
 Deno.test("health: reachable and authorized are independent booleans", () => {
   // "up but rejecting the token" must be representable distinctly from "down".
   const upButUnauthorized = {
@@ -199,6 +238,97 @@ Deno.test("the package exposes exactly the documented method set", () => {
 Deno.test("the two model types are distinct", () => {
   assertEquals(endpoint.type, "@jpisgeek/lmstudio/endpoint");
   assertEquals(probe.type, "@jpisgeek/lmstudio/probe");
+});
+
+Deno.test("published models migrate existing arguments without mutation", () => {
+  for (const model of [endpoint, probe]) {
+    assertEquals(model.version, "2026.08.25.1");
+    assertEquals(model.upgrades.at(-1)?.toVersion, model.version);
+    const old = { ...OK, timeoutSec: 30 };
+    assertEquals(model.upgrades.at(-1)?.upgradeAttributes(old), old);
+  }
+  assertEquals(daemon.version, "2026.08.25.1");
+  assertEquals("upgrades" in daemon, false);
+});
+
+Deno.test("completion rejects a malformed 2xx envelope", async () => {
+  const originalFetch = globalThis.fetch;
+  let written: Record<string, unknown> | undefined;
+  globalThis.fetch = () =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          choices: [{ finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+  try {
+    await probe.methods.completion.execute({
+      model: "example/chat",
+      prompt: "hello",
+      maxTokens: 8,
+      temperature: 0,
+    }, {
+      globalArgs: OK,
+      signal: new AbortController().signal,
+      logger: { info: () => {}, warning: () => {} },
+      writeResource: (
+        _spec: string,
+        _name: string,
+        value: Record<string, unknown>,
+      ) => {
+        written = value;
+        return Promise.resolve({ name: "completion" });
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assertEquals(written?.errorKind, "malformed_response");
+  assertEquals(written?.promptTokens, null);
+  assertEquals(written?.completionTokens, null);
+  assertEquals(written?.totalTokens, null);
+});
+
+Deno.test("completion rejects an empty finish reason", async () => {
+  const originalFetch = globalThis.fetch;
+  let written: Record<string, unknown> | undefined;
+  globalThis.fetch = () =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          choices: [{ finish_reason: "", message: { content: "ok" } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+  try {
+    await probe.methods.completion.execute({
+      model: "example/chat",
+      prompt: "hello",
+      maxTokens: 8,
+      temperature: 0,
+    }, {
+      globalArgs: OK,
+      signal: new AbortController().signal,
+      logger: { info: () => {}, warning: () => {} },
+      writeResource: (
+        _spec: string,
+        _name: string,
+        value: Record<string, unknown>,
+      ) => {
+        written = value;
+        return Promise.resolve({ name: "completion" });
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assertEquals(written?.errorKind, "malformed_response");
+  assertEquals(written?.promptTokens, null);
 });
 
 async function runDaemon(

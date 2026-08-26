@@ -8,7 +8,7 @@ provider-neutral dashboard bundle used by every other domain. Each interface is
 collected independently, so one failure cannot erase the evidence from the
 others. Missing is not zero and empty history is not healthy.
 
-**Version** `2026.08.25.1` · **License** MIT · **Source**
+**Version** `2026.08.25.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/dashboard-swamp
 
 ## Install
@@ -21,13 +21,13 @@ swamp extension pull @jpisgeek/dashboard-swamp
 
 ### Arguments
 
-| argument      | type    | required | default   | description                                                                         |
-| ------------- | ------- | -------- | --------- | ----------------------------------------------------------------------------------- |
-| `repoDir`     | string  | yes      |           | Swamp repository to observe                                                         |
-| `swampBinary` | string  | no       | `"swamp"` | Swamp executable path or name                                                       |
-| `server`      | string  | no       |           | Optional swamp serve URL; omit to observe the local repository                      |
-| `token`       | string  | no       |           | Optional serve token; use a vault expression. Passed only in the child environment. |
-| `timeoutMs`   | integer | no       | `15000`   |                                                                                     |
+| argument      | type    | required | default   | description                                                                                               |
+| ------------- | ------- | -------- | --------- | --------------------------------------------------------------------------------------------------------- |
+| `repoDir`     | string  | yes      |           | Swamp repository to observe                                                                               |
+| `swampBinary` | string  | no       | `"swamp"` | Swamp executable path or name                                                                             |
+| `server`      | string  | no       |           | Optional HTTPS swamp serve URL without userinfo, query, or fragment; omit to observe the local repository |
+| `token`       | string  | no       |           | Optional serve token; use a vault expression. Passed only in the child environment.                       |
+| `timeoutMs`   | integer | no       | `15000`   |                                                                                                           |
 
 ### Methods
 
@@ -40,13 +40,16 @@ No arguments.
 
 ### Data written
 
-| resource      | lifetime | fields                                                                  | description                                                                                                        |
-| ------------- | -------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `observation` | 30d      | `interface`, `available`, `observedAt`, `errorKind`, `error`, `payload` | One sanitized snapshot per documented Swamp operational interface; unavailable interfaces are retained explicitly. |
+| resource      | lifetime | fields                                                                  | description                                                                                                                                     |
+| ------------- | -------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `observation` | 30d      | `interface`, `available`, `observedAt`, `errorKind`, `error`, `payload` | One verbatim JSON snapshot per documented Swamp operational interface; errors are sanitized and unavailable interfaces are retained explicitly. |
 
 ## Example
 
 ```yaml
+models:
+  swamp-ops:
+    type: "@jpisgeek/swamp-observability"
 globalArguments:
   repoDir: /srv/swamp/example-repo
   swampBinary: /usr/local/bin/swamp
@@ -76,7 +79,9 @@ it is never placed in argv, logs, stored errors, or bundle output. Command
 stderr and stdout on failure are classified and discarded. Swamp's built-in
 method summary records non-sensitive global arguments such as repoDir, server,
 and swampBinary, so treat those values as operational metadata and protect the
-repository's stored reports accordingly.
+repository's stored reports accordingly. Remote server URLs must use HTTPS and
+cannot contain URL credentials. Successful command payloads are stored verbatim;
+only failure text is sanitized.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

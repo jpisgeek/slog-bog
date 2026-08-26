@@ -6,7 +6,7 @@ purpose: >-
   distinct. Token and timing values retain their actual units and one probe is
   never presented as aggregate runtime accounting.
 example: |
-  # Require this report on either @jpisgeek/lmstudio model definition.
+  # Require this report on any @jpisgeek/lmstudio model definition.
   reports:
     require:
       - '@jpisgeek/dashboard-lmstudio'

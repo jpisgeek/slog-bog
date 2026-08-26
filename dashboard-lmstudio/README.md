@@ -8,7 +8,7 @@ missing model capability, context exhaustion, output-token limit, and
 reasoning-only empty output stay distinct. Token and timing values retain their
 actual units and one probe is never presented as aggregate runtime accounting.
 
-**Version** `2026.08.25.2` · **License** MIT · **Source**
+**Version** `2026.08.25.3` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/dashboard-lmstudio
 
 ## Install
@@ -20,7 +20,7 @@ swamp extension pull @jpisgeek/dashboard-lmstudio
 ## Example
 
 ```yaml
-# Require this report on either @jpisgeek/lmstudio model definition.
+# Require this report on any @jpisgeek/lmstudio model definition.
 reports:
   require:
     - "@jpisgeek/dashboard-lmstudio"

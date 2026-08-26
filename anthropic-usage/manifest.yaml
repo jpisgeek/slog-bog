@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/anthropic-usage"
-version: 2026.08.25.1
+version: 2026.08.25.2
 description: >
   Local Anthropic Platform and Claude Enterprise organization usage and cost
   collection. Product, credential, pagination, coverage, refresh, and

@@ -152,7 +152,7 @@ async function readPages(
     try {
       const response = await fetcher(
         `https://api.anthropic.com${path}?${query}`,
-        { headers, signal },
+        { headers, signal, redirect: "error" },
       );
       if (!response.ok) {
         const kind = statusKind(response.status);
@@ -241,17 +241,25 @@ async function readPages(
     }
   }
 }
-function records(pages: Record<string, unknown>[]): Record<string, unknown>[] {
-  return pages.flatMap((page) =>
-    (page.data as unknown[]).flatMap((bucket) =>
-      bucket && typeof bucket === "object" &&
-        Array.isArray((bucket as Record<string, unknown>).results)
-        ? ((bucket as Record<string, unknown>).results as unknown[]).filter((
-          v,
-        ): v is Record<string, unknown> => !!v && typeof v === "object")
-        : []
-    )
-  );
+function records(
+  pages: Record<string, unknown>[],
+): Record<string, unknown>[] | null {
+  const output: Record<string, unknown>[] = [];
+  for (const page of pages) {
+    if (!Array.isArray(page.data)) return null;
+    for (const bucket of page.data) {
+      if (!bucket || typeof bucket !== "object") return null;
+      const results = (bucket as Record<string, unknown>).results;
+      if (!Array.isArray(results)) return null;
+      for (const item of results) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          return null;
+        }
+        output.push(item as Record<string, unknown>);
+      }
+    }
+  }
+  return output;
 }
 function integer(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0
@@ -263,7 +271,9 @@ function usageRows(
   enterprise: boolean,
 ): UsageRow[] | null {
   const rows: UsageRow[] = [];
-  for (const item of records(pages)) {
+  const items = records(pages);
+  if (!items) return null;
+  for (const item of items) {
     const cache = item.cache_creation && typeof item.cache_creation === "object"
       ? item.cache_creation as Record<string, unknown>
       : {};
@@ -321,7 +331,9 @@ function costRows(
   enterprise: boolean,
 ): CostRow[] | null {
   const rows: CostRow[] = [];
-  for (const item of records(pages)) {
+  const items = records(pages);
+  if (!items) return null;
+  for (const item of items) {
     const amount = decimal(item.amount);
     const currency = item.currency;
     if (
@@ -459,7 +471,7 @@ async function collect(args: z.infer<typeof CollectArgsSchema>, ctx: Context) {
 }
 export const model = {
   type: "@jpisgeek/anthropic-usage",
-  version: "2026.08.25.1",
+  version: "2026.08.25.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     snapshot: {

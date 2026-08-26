@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/dashboard-lmstudio"
-version: 2026.08.25.2
+version: 2026.08.25.3
 description: >
   Provider-neutral dashboard adapter for @jpisgeek/lmstudio endpoint,
   headless daemon, and per-request probes. Preserves reachability,

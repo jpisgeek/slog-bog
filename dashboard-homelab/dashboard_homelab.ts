@@ -180,7 +180,10 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
-  url: z.string().url().optional(),
+  url: z.string().url().refine(
+    (value) => new URL(value).protocol === "https:",
+    "evidence URLs must use https",
+  ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
     ctx.addIssue({
@@ -333,7 +336,26 @@ export function deriveOverallState(
   let state: DashboardState = required.length === 0 ? "unknown" : "healthy";
 
   for (const section of required) {
-    if (STATE_RANK[section.state] > STATE_RANK[state]) state = section.state;
+    let sectionState = section.state;
+    const evidenceStates: DashboardState[] = [
+      section.freshness.state === "stale"
+        ? "stale"
+        : section.freshness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.completeness.state === "partial"
+        ? "partial"
+        : section.completeness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.coverage.kind === "unknown" ? "unknown" : "healthy",
+    ];
+    for (const evidenceState of evidenceStates) {
+      if (STATE_RANK[evidenceState] > STATE_RANK[sectionState]) {
+        sectionState = evidenceState;
+      }
+    }
+    if (STATE_RANK[sectionState] > STATE_RANK[state]) state = sectionState;
   }
 
   const exceptions = [
@@ -654,7 +676,12 @@ async function readRecords(ctx: ReportContext): Promise<ReadResult> {
         handle.version,
       );
       if (!bytes) throw new Error("content unavailable");
-      const value = JSON.parse(new TextDecoder().decode(bytes));
+      let value: unknown;
+      try {
+        value = JSON.parse(new TextDecoder().decode(bytes));
+      } catch {
+        throw new Error("invalid JSON");
+      }
       const parsed = schemas[spec].safeParse(value);
       if (!parsed.success) throw new Error("source schema validation failed");
       records[spec].push(parsed.data as Json);
@@ -666,13 +693,13 @@ async function readRecords(ctx: ReportContext): Promise<ReadResult> {
 }
 
 function stableId(prefix: string, ...parts: string[]): string {
-  let hash = 0x811c9dc5;
-  const raw = parts.join("\u001f");
+  let hash = 0xcbf29ce484222325n;
+  const raw = parts.map((part) => `${part.length}:${part}`).join("");
   for (let i = 0; i < raw.length; i++) {
-    hash ^= raw.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
+    hash ^= BigInt(raw.charCodeAt(i));
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
   }
-  return `${prefix}:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+  return `${prefix}:${hash.toString(16).padStart(16, "0")}`;
 }
 
 function severity(level: string): "critical" | "warning" | "info" {
@@ -769,6 +796,16 @@ function netdataSection(ctx: ReportContext, read: ReadResult) {
   const alarms = read.records.alarm as z.infer<typeof NetdataAlarm>[];
   const mounts = read.records.mount as z.infer<typeof NetdataMount>[];
   const summary = (read.records.summary as z.infer<typeof NetdataSummary>[])[0];
+  const mismatch = summary && (
+    summary.nodes !== nodes.length ||
+    summary.nodesReachable !== nodes.filter((node) => node.reachable).length ||
+    summary.nodesUnreachable !==
+      nodes.filter((node) => !node.reachable).length ||
+    summary.alarmsActive !== alarms.length ||
+    summary.alarmsCritical !==
+      alarms.filter((alarm) => severity(alarm.status) === "critical").length ||
+    summary.mountsOverThreshold !== mounts.filter((m) => m.overThreshold).length
+  );
   const exceptions = [
     ...nodes.filter((n) => !n.reachable).map((n) => ({
       id: stableId("netdata-node", n.name),
@@ -804,9 +841,22 @@ function netdataSection(ctx: ReportContext, read: ReadResult) {
       sensitivity: "operational" as const,
     })),
     ...sourceFailureExceptions(ctx, read),
+    ...(mismatch
+      ? [{
+        id: "netdata:summary-record-mismatch",
+        severity: "warning" as const,
+        subject: "Netdata coverage",
+        headline: "Summary and record coverage differ",
+        detail: "Collector summary counts do not match the available records.",
+        source: "netdata:summary",
+        suppressed: false,
+        suppressReason: "",
+        sensitivity: "operational" as const,
+      }]
+      : []),
   ];
   const rejected = read.rejected + (summary ? 0 : 1) +
-    (summary?.nodesDegraded ?? 0);
+    (summary?.nodesDegraded ?? 0) + (mismatch ? 1 : 0);
   const fresh = freshness(summary?.syncedAt);
   let state: DashboardState = exceptions.some((e) => e.severity === "critical")
     ? "critical"
@@ -851,11 +901,26 @@ function netdataSection(ctx: ReportContext, read: ReadResult) {
 
 function trueNasSection(ctx: ReportContext, read: ReadResult) {
   const pools = read.records.pool as z.infer<typeof TrueNasPool>[];
+  const disks = read.records.disk as z.infer<typeof TrueNasDisk>[];
   const alerts = read.records.alert as z.infer<typeof TrueNasAlert>[];
   const certs = read.records.certificate as z.infer<
     typeof TrueNasCertificate
   >[];
   const summary = (read.records.summary as z.infer<typeof TrueNasSummary>[])[0];
+  const mismatch = summary && (
+    summary.pools !== pools.length ||
+    summary.poolsUnhealthy !== pools.filter((p) => !p.healthy).length ||
+    summary.disks !== disks.length || summary.alerts !== alerts.length ||
+    summary.alertsSilenced !==
+      alerts.filter((alert) => alert.silenced).length ||
+    summary.certificates !== certs.length ||
+    summary.certificatesExpiringSoon !==
+      certs.filter((certificate) => certificate.expiringSoon).length ||
+    summary.certificatesExpired !==
+      certs.filter((certificate) => certificate.expired).length ||
+    summary.certificatesWithoutExpiry !==
+      certs.filter((certificate) => !certificate.expiryKnown).length
+  );
   const exceptions = [
     ...pools.filter((p) => !p.healthy).map((p) => ({
       id: stableId("truenas-pool", p.name),
@@ -881,6 +946,17 @@ function trueNasSection(ctx: ReportContext, read: ReadResult) {
       suppressReason: "",
       sensitivity: "operational" as const,
     })),
+    ...certs.filter((c) => !c.expiryKnown).map((c) => ({
+      id: stableId("truenas-certificate-unknown", c.name),
+      severity: "warning" as const,
+      subject: c.name,
+      headline: "Certificate expiry unknown",
+      detail: "The collector could not determine this certificate's expiry.",
+      source: "truenas:certificate",
+      suppressed: false,
+      suppressReason: "",
+      sensitivity: "operational" as const,
+    })),
     // Alert records expose no stable certificate identifier. Preserve every
     // alert independently instead of attaching it to the first certificate.
     ...alerts.map((a) => ({
@@ -891,12 +967,25 @@ function trueNasSection(ctx: ReportContext, read: ReadResult) {
       detail: a.formatted,
       source: "truenas:alert",
       suppressed: a.silenced,
-      suppressReason: a.silenced ? "dismissed in TrueNAS" : "",
+      suppressReason: a.silenced ? "silenced in TrueNAS" : "",
       sensitivity: "operational" as const,
     })),
     ...sourceFailureExceptions(ctx, read),
+    ...(mismatch
+      ? [{
+        id: "truenas:summary-record-mismatch",
+        severity: "warning" as const,
+        subject: "TrueNAS coverage",
+        headline: "Summary and record coverage differ",
+        detail: "Collector summary counts do not match the available records.",
+        source: "truenas:summary",
+        suppressed: false,
+        suppressReason: "",
+        sensitivity: "operational" as const,
+      }]
+      : []),
   ];
-  const rejected = read.rejected + (summary ? 0 : 1);
+  const rejected = read.rejected + (summary ? 0 : 1) + (mismatch ? 1 : 0);
   const fresh = freshness(summary?.syncedAt);
   let state: DashboardState =
     exceptions.some((e) => !e.suppressed && e.severity === "critical")
@@ -921,7 +1010,9 @@ function trueNasSection(ctx: ReportContext, read: ReadResult) {
     freshness: fresh,
     completeness: completeness(rejected, "records rejected or summary missing"),
     metrics: pools.map((p) => ({
-      id: `pool.${p.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.used`,
+      id: `pool.${p.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.${
+        stableId("pool", p.name).split(":")[1]
+      }.used`,
       label: `${p.name} used`,
       unit: "percent" as const,
       confidence: "exact" as const,
@@ -939,6 +1030,7 @@ function firewallaSection(ctx: ReportContext, read: ReadResult) {
   const machines = read.records.machine as z.infer<typeof FirewallaMachine>[];
   const inventory =
     (read.records.inventory as z.infer<typeof FirewallaInventory>[])[0];
+  const mismatch = inventory && inventory.machines !== machines.length;
   const exceptions = [
     ...machines.filter((m) => !m.online && m.tier === "deep").map((m) => ({
       id: stableId("firewalla-machine", m.name),
@@ -952,8 +1044,22 @@ function firewallaSection(ctx: ReportContext, read: ReadResult) {
       sensitivity: "operational" as const,
     })),
     ...sourceFailureExceptions(ctx, read),
+    ...(mismatch
+      ? [{
+        id: "firewalla:summary-record-mismatch",
+        severity: "warning" as const,
+        subject: "Firewalla coverage",
+        headline: "Inventory and machine coverage differ",
+        detail:
+          "Collector inventory counts do not match the available records.",
+        source: "firewalla:inventory",
+        suppressed: false,
+        suppressReason: "",
+        sensitivity: "operational" as const,
+      }]
+      : []),
   ];
-  const rejected = read.rejected + (inventory ? 0 : 1);
+  const rejected = read.rejected + (inventory ? 0 : 1) + (mismatch ? 1 : 0);
   const fresh = freshness(inventory?.syncedAt);
   let state: DashboardState = exceptions.some((e) => e.severity === "critical")
     ? "critical"
@@ -964,7 +1070,9 @@ function firewallaSection(ctx: ReportContext, read: ReadResult) {
   if (fresh.state !== "fresh" && state === "healthy") state = fresh.state;
   if (executionUnauthorized(ctx)) state = "unauthorized";
   const filtered = ctx.methodArgs.network ||
-    (ctx.methodArgs.tier && ctx.methodArgs.tier !== "all");
+    (ctx.methodArgs.tier && ctx.methodArgs.tier !== "all") ||
+    (inventory?.skippedByNetwork ?? 0) > 0 ||
+    (inventory?.excludedNetworks.length ?? 0) > 0;
   return {
     id: "firewalla",
     title: "Firewalla",
@@ -979,7 +1087,7 @@ function firewallaSection(ctx: ReportContext, read: ReadResult) {
         ? "requested collector filter"
         : "full collector execution",
       notes: filtered
-        ? "coverage is exact only for the requested filter"
+        ? "coverage is exact only for the requested or collector-reported filter"
         : undefined,
     },
     freshness: fresh,
@@ -1034,7 +1142,7 @@ export async function normalize(
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/dashboard-homelab",
-      extensionVersion: "2026.08.25.1",
+      extensionVersion: "2026.08.25.2",
       modelType,
       modelName: ctx.definition.name,
       modelId: ctx.modelId,

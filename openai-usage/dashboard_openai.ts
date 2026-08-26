@@ -194,7 +194,10 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
-  url: z.string().url().optional(),
+  url: z.string().url().refine(
+    (value) => new URL(value).protocol === "https:",
+    "evidence URLs must use https",
+  ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
     ctx.addIssue({
@@ -347,7 +350,26 @@ export function deriveOverallState(
   let state: DashboardState = required.length === 0 ? "unknown" : "healthy";
 
   for (const section of required) {
-    if (STATE_RANK[section.state] > STATE_RANK[state]) state = section.state;
+    let sectionState = section.state;
+    const evidenceStates: DashboardState[] = [
+      section.freshness.state === "stale"
+        ? "stale"
+        : section.freshness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.completeness.state === "partial"
+        ? "partial"
+        : section.completeness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.coverage.kind === "unknown" ? "unknown" : "healthy",
+    ];
+    for (const evidenceState of evidenceStates) {
+      if (STATE_RANK[evidenceState] > STATE_RANK[sectionState]) {
+        sectionState = evidenceState;
+      }
+    }
+    if (STATE_RANK[sectionState] > STATE_RANK[state]) state = sectionState;
   }
 
   const exceptions = [
@@ -575,10 +597,11 @@ function usageSection(snapshot: Snapshot) {
     return unavailableSection("usage", "API usage", snapshot.usageStatus);
   }
   const partial = snapshot.usageStatus.state === "partial";
+  const sectionState = state(snapshot.usageStatus);
   return DashboardSectionSchema.parse({
     id: "usage",
     title: "API usage",
-    state: partial ? "partial" : "healthy",
+    state: sectionState,
     impact: "required",
     summary: `${snapshot.usage.requests} requests used ${
       snapshot.usage.inputTokens + snapshot.usage.outputTokens
@@ -624,10 +647,12 @@ function usageSection(snapshot: Snapshot) {
     }],
     exceptions: partial
       ? [{
-        id: "openai:usage:partial",
-        severity: "warning",
+        id: `openai:usage:${snapshot.usageStatus.errorKind || "partial"}`,
+        severity: sectionState === "unauthorized" ? "critical" : "warning",
         subject: "API usage",
-        headline: "Usage coverage is partial",
+        headline: sectionState === "unauthorized"
+          ? "Admin API authorization rejected"
+          : "Usage coverage is partial",
         detail: snapshot.usageStatus.message,
         source: "@jpisgeek/openai-usage",
         suppressed: false,
@@ -645,6 +670,7 @@ function costSection(snapshot: Snapshot) {
     return unavailableSection("costs", "Billed cost", snapshot.costStatus);
   }
   const partial = snapshot.costStatus.state === "partial";
+  const sectionState = state(snapshot.costStatus);
   const missingCurrency = snapshot.costs.totals.length === 0;
   const metrics = snapshot.costs.totals.map((total) => ({
     id: `cost-${total.currency}`,
@@ -669,7 +695,7 @@ function costSection(snapshot: Snapshot) {
   return DashboardSectionSchema.parse({
     id: "costs",
     title: "Billed cost",
-    state: partial ? "partial" : missingCurrency ? "unknown" : "healthy",
+    state: missingCurrency ? "unknown" : sectionState,
     impact: "required",
     summary: snapshot.costs.totals.length
       ? snapshot.costs.totals.map((total) =>
@@ -701,10 +727,12 @@ function costSection(snapshot: Snapshot) {
     }],
     exceptions: partial
       ? [{
-        id: "openai:costs:partial",
-        severity: "warning",
+        id: `openai:costs:${snapshot.costStatus.errorKind || "partial"}`,
+        severity: sectionState === "unauthorized" ? "critical" : "warning",
         subject: "Billed cost",
-        headline: "Cost coverage is partial",
+        headline: sectionState === "unauthorized"
+          ? "Admin API authorization rejected"
+          : "Cost coverage is partial",
         detail: snapshot.costStatus.message,
         source: "@jpisgeek/openai-usage",
         suppressed: false,
@@ -740,7 +768,7 @@ export async function normalize(
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/openai-usage",
-      extensionVersion: "2026.08.25.1",
+      extensionVersion: "2026.08.25.2",
       modelType: String(ctx.modelType),
       modelName: ctx.definition.name,
       modelId: ctx.modelId,

@@ -173,22 +173,24 @@ failure (UNAUTHORIZED, UNREACHABLE, TIMEOUT, HTTP_ERROR, MALFORMED_RESPONSE,
 CANCELLED); `endpoint.health` writes every endpoint-side outcome and throws only
 on caller cancellation; the three `probe` methods throw only on a bad token and
 cancellation and record everything else with an `errorKind`. `contextExhausted`
-is a heuristic (finish_reason "length" under the requested cap). Probe instance
-names are `<method>-<slug-of-model-id>-<hash>`, so look them up after a run. The
-daemon model runs `lms ps --json` beside llmster. Set its optional `host`
-argument only when deliberately using LM Studio's supported remote CLI mode.
+is a heuristic (finish_reason "length" under the requested cap) and remains
+unknown when the endpoint omits valid token usage. Probe instance names are
+`<method>-<slug-of-model-id>-<hash>`, so look them up after a run. The daemon
+model runs `lms ps --json` beside llmster. Set its optional `host` argument only
+when deliberately using LM Studio's supported remote CLI mode.
 
 ## Security
 
 The bearer token is marked sensitive, must come from a vault expression (never
 an environment variable, env values persist into `.swamp/data/`), is redacted
 from every response body before it can reach an error, and URLs in logs and
-errors have userinfo and query strings stripped. `http://` is accepted for
-endpoints behind an already-encrypted tunnel, with the caveat that the token
-then travels in cleartext on that hop. Written data: served model ids,
-latencies, token counts, and boolean findings. Caller prompts are not stored.
-Daemon observations retain loaded model identifiers, type, and architecture but
-discard model paths and raw command error output.
+errors have userinfo, query strings, and fragments stripped. Configured base
+URLs containing any of them are rejected. `http://` is accepted for endpoints
+behind an already-encrypted tunnel, with the caveat that the token then travels
+in cleartext on that hop. Written data: served model ids, latencies, optional
+token counts, boolean findings, and short sanitized endpoint error text. Caller
+prompts are not stored. Daemon observations retain loaded model identifiers,
+type, and architecture but discard model paths and raw command error output.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

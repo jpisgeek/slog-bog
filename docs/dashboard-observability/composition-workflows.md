@@ -3,8 +3,8 @@
 ## Decision
 
 `@jpisgeek/dashboard-compose` is an optional workflow-only extension. It has no
-collector, report, vault, driver, or datastore dependency. Operators install
-the renderer, this package if desired, and only the producer/normalizer packages
+collector, report, vault, driver, or datastore dependency. Operators install the
+renderer, this package if desired, and only the producer/normalizer packages
 they actually use.
 
 The five workflows are:
@@ -15,8 +15,8 @@ The five workflows are:
 - `@jpisgeek/dashboard-local-inference-only`
 - `@jpisgeek/dashboard-mixed`
 
-Swamp assigned every workflow ID through `swamp workflow create`; no workflow
-ID was generated or written manually.
+Swamp assigned every workflow ID through `swamp workflow create`; no workflow ID
+was generated or written manually.
 
 ## Composition contract
 
@@ -45,8 +45,8 @@ scaffolds in an isolated public-safe repository and passed
 
 Two mixed-workflow fixture variants then ran successfully:
 
-1. All four domain flags false. The renderer received zero bundles and wrote
-   the visible `coverage:no-bundles` warning. No producer extension or model was
+1. All four domain flags false. The renderer received zero bundles and wrote the
+   visible `coverage:no-bundles` warning. No producer extension or model was
    required.
 2. Homelab true and Swamp, hosted AI, and local inference false. A synthetic
    `.invalid` Netdata fixture produced one normalized homelab bundle. The
@@ -55,4 +55,3 @@ Two mixed-workflow fixture variants then ran successfully:
 
 The fixture contained only reserved synthetic identifiers and contacted no
 private or production system.
-

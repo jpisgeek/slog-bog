@@ -1,5 +1,5 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { normalize } from "./dashboard_subscription.ts";
+import { normalize, report } from "./dashboard_subscription.ts";
 type Json = Record<string, unknown>;
 function context(snapshot: Json | null) {
   const bytes = snapshot
@@ -86,4 +86,14 @@ Deno.test("missing snapshot is informational unknown", async () => {
   const bundle = await normalize(context(null));
   assertEquals(bundle.sections[0].state, "unknown");
   assertEquals(bundle.state, "unknown");
+});
+
+Deno.test("operator strings cannot inject raw Markdown or HTML", async () => {
+  const ctx = context(snapshot({
+    provider: "<script>alert(1)</script>",
+    planName: "[click](javascript:alert(1))",
+  }));
+  const result = await report.execute(ctx);
+  assertEquals(result.markdown.includes("<script>"), false);
+  assertEquals(result.markdown.includes("[click](javascript:"), false);
 });

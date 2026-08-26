@@ -217,17 +217,23 @@ async function readPages(
   }
 }
 
-function records(pages: Record<string, unknown>[]): Record<string, unknown>[] {
+function records(
+  pages: Record<string, unknown>[],
+): Record<string, unknown>[] | null {
   const output: Record<string, unknown>[] = [];
   for (const page of pages) {
-    for (const bucket of page.data as unknown[]) {
-      if (!bucket || typeof bucket !== "object") continue;
+    if (!Array.isArray(page.data)) return null;
+    for (const bucket of page.data) {
+      if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) {
+        return null;
+      }
       const results = (bucket as Record<string, unknown>).results;
-      if (!Array.isArray(results)) continue;
+      if (!Array.isArray(results)) return null;
       for (const result of results) {
-        if (result && typeof result === "object") {
-          output.push(result as Record<string, unknown>);
+        if (!result || typeof result !== "object" || Array.isArray(result)) {
+          return null;
         }
+        output.push(result as Record<string, unknown>);
       }
     }
   }
@@ -242,7 +248,9 @@ function nonnegativeInteger(value: unknown): number | null {
 
 function usageFrom(pages: Record<string, unknown>[]): UsageBreakdown[] | null {
   const output: UsageBreakdown[] = [];
-  for (const item of records(pages)) {
+  const items = records(pages);
+  if (!items) return null;
+  for (const item of items) {
     const input = nonnegativeInteger(item.input_tokens);
     const outputTokens = nonnegativeInteger(item.output_tokens);
     const cached = nonnegativeInteger(item.input_cached_tokens);
@@ -264,7 +272,9 @@ function usageFrom(pages: Record<string, unknown>[]): UsageBreakdown[] | null {
 
 function costsFrom(pages: Record<string, unknown>[]): CostBreakdown[] | null {
   const output: CostBreakdown[] = [];
-  for (const item of records(pages)) {
+  const items = records(pages);
+  if (!items) return null;
+  for (const item of items) {
     const amount = item.amount;
     if (!amount || typeof amount !== "object") return null;
     const value = (amount as Record<string, unknown>).value;
@@ -373,7 +383,7 @@ async function collect(
 
 export const model = {
   type: "@jpisgeek/openai-usage",
-  version: "2026.08.25.1",
+  version: "2026.08.25.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     snapshot: {

@@ -194,7 +194,10 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
-  url: z.string().url().optional(),
+  url: z.string().url().refine(
+    (value) => new URL(value).protocol === "https:",
+    "evidence URLs must use https",
+  ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
     ctx.addIssue({
@@ -347,7 +350,26 @@ export function deriveOverallState(
   let state: DashboardState = required.length === 0 ? "unknown" : "healthy";
 
   for (const section of required) {
-    if (STATE_RANK[section.state] > STATE_RANK[state]) state = section.state;
+    let sectionState = section.state;
+    const evidenceStates: DashboardState[] = [
+      section.freshness.state === "stale"
+        ? "stale"
+        : section.freshness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.completeness.state === "partial"
+        ? "partial"
+        : section.completeness.state === "unknown"
+        ? "unknown"
+        : "healthy",
+      section.coverage.kind === "unknown" ? "unknown" : "healthy",
+    ];
+    for (const evidenceState of evidenceStates) {
+      if (STATE_RANK[evidenceState] > STATE_RANK[sectionState]) {
+        sectionState = evidenceState;
+      }
+    }
+    if (STATE_RANK[sectionState] > STATE_RANK[state]) state = sectionState;
   }
 
   const exceptions = [
@@ -505,21 +527,22 @@ const CompletionSchema = z.object({
   latencyMs: z.number().nonnegative(),
   httpStatus: z.number(),
   finishReason: z.string(),
-  promptTokens: z.number().int().nonnegative(),
-  completionTokens: z.number().int().nonnegative(),
-  totalTokens: z.number().int().nonnegative(),
-  reasoningTokens: z.number().int().nonnegative(),
+  promptTokens: z.number().int().nonnegative().nullable(),
+  completionTokens: z.number().int().nonnegative().nullable(),
+  totalTokens: z.number().int().nonnegative().nullable(),
+  reasoningTokens: z.number().int().nonnegative().nullable(),
   reasoningChars: z.number().int().nonnegative(),
   contentChars: z.number().int().nonnegative(),
   emptyContentWithReasoning: z.boolean(),
-  contextExhausted: z.boolean(),
-  maxTokensHit: z.boolean(),
+  contextExhausted: z.boolean().nullable(),
+  maxTokensHit: z.boolean().nullable(),
   errorKind: z.string(),
   error: z.string(),
   checkedAt: z.iso.datetime(),
 }).superRefine((value, ctx) => {
   if (
-    !value.errorKind &&
+    !value.errorKind && value.totalTokens !== null &&
+    value.promptTokens !== null && value.completionTokens !== null &&
     value.totalTokens !== value.promptTokens + value.completionTokens
   ) {
     ctx.addIssue({
@@ -995,6 +1018,8 @@ function embeddingSection(value: z.infer<typeof EmbeddingSchema>) {
 
 function completionSection(value: z.infer<typeof CompletionSchema>) {
   const successful = value.errorKind === "";
+  const usageKnown = value.promptTokens !== null &&
+    value.completionTokens !== null && value.totalTokens !== null;
   let state: DashboardState = successful
     ? "healthy"
     : failureState(value.errorKind);
@@ -1035,9 +1060,18 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
       value.error || `completion probe reported ${value.errorKind}`,
     ));
   }
+  if (successful && !usageKnown) {
+    state = "partial";
+    exceptions.push(exception(
+      "lmstudio:completion:usage-unavailable",
+      "warning",
+      "Token usage unavailable",
+      "The endpoint completed the request without valid token accounting.",
+    ));
+  }
   const tokenReason = "the request did not complete with valid usage data";
-  const token = (id: string, label: string, value: number) =>
-    successful
+  const token = (id: string, label: string, value: number | null) =>
+    successful && value !== null
       ? observedMetric(id, label, "tokens", value)
       : unavailableMetric(id, label, "tokens", tokenReason);
   return commonSection(
@@ -1050,13 +1084,15 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
       }`
       : value.error || "Completion probe failed",
     value.checkedAt,
-    successful ? { state: "exact", observed: 1, expected: 1, rejected: 0 } : {
-      state: "partial",
-      observed: 1,
-      expected: 1,
-      rejected: 1,
-      reason: tokenReason,
-    },
+    successful && usageKnown
+      ? { state: "exact", observed: 1, expected: 1, rejected: 0 }
+      : {
+        state: "partial",
+        observed: 1,
+        expected: 1,
+        rejected: 1,
+        reason: tokenReason,
+      },
     [
       token("prompt-tokens", "Prompt tokens", value.promptTokens),
       token("completion-tokens", "Completion tokens", value.completionTokens),
@@ -1088,14 +1124,18 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
         id: "context-exhausted",
         label: "Context exhausted",
         value: successful ? value.contextExhausted : null,
-        confidence: successful ? "inferred" : "unknown",
+        confidence: successful && value.contextExhausted !== null
+          ? "inferred"
+          : "unknown",
         sensitivity: "operational",
       },
       {
         id: "max-tokens-hit",
         label: "Output-token cap hit",
         value: successful ? value.maxTokensHit : null,
-        confidence: successful ? "exact" : "unknown",
+        confidence: successful && value.maxTokensHit !== null
+          ? "exact"
+          : "unknown",
         sensitivity: "operational",
       },
       {
@@ -1248,9 +1288,17 @@ export async function normalize(
   ) {
     throw new Error(`unsupported LM Studio source ${modelType}`);
   }
-  const record = await readRecord(ctx);
   let section;
-  if (ctx.executionStatus === "failed" || !record) {
+  let record: Json | null = null;
+  try {
+    record = await readRecord(ctx);
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    section = invalidRecordSection(ctx);
+  }
+  if (section) {
+    // Malformed JSON is a visible invalid record, not a leaked parser error.
+  } else if (ctx.executionStatus === "failed" || !record) {
     section = failedSection(ctx);
   } else {
     try {
@@ -1301,7 +1349,7 @@ export async function normalize(
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/dashboard-lmstudio",
-      extensionVersion: "2026.08.25.2",
+      extensionVersion: "2026.08.25.3",
       modelType,
       modelName: ctx.definition.name,
       modelId: ctx.modelId,
@@ -1326,7 +1374,12 @@ export async function normalize(
 
 function markdown(bundle: DashboardBundleV1): string {
   const section = bundle.sections[0];
-  return `# ${bundle.title}\n\nState: **${bundle.state}**\n\n- ${section.title}: ${section.summary}`;
+  const safe = (value: string) =>
+    value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/([\\`*_[\]{}()#+.!|\-])/g, "\\$1").replace(/[\r\n]+/g, " ");
+  return `# ${safe(bundle.title)}\n\nState: **${bundle.state}**\n\n- ${
+    safe(section.title)
+  }: ${safe(section.summary)}`;
 }
 
 /** LM Studio dashboard normalization report. */

@@ -130,6 +130,18 @@ Deno.test("malformed records become unavailable and never become zero", async ()
   assertEquals(result.usage, null);
 });
 
+Deno.test("malformed buckets become invalid instead of complete zero", async () => {
+  const result = await run((input) =>
+    Promise.resolve(Response.json(
+      String(input).includes("costs")
+        ? page([])
+        : { ...page([]), data: [{ starting_at: 1 }] },
+    ))
+  );
+  assertEquals((result.usageStatus as Json).errorKind, "invalid-response");
+  assertEquals(result.usage, null);
+});
+
 Deno.test("invalid JSON is classified without persisting response text", async () => {
   const result = await run(() =>
     Promise.resolve(

@@ -13,9 +13,17 @@ const GlobalArgsSchema = z.object({
   swampBinary: z.string().min(1).default("swamp").describe(
     "Swamp executable path or name",
   ),
-  server: z.string().url().optional().describe(
-    "Optional swamp serve URL; omit to observe the local repository",
-  ),
+  server: z.string().url().refine(
+    (value) => {
+      const url = new URL(value);
+      return url.protocol === "https:" && !url.username && !url.password &&
+        !url.search && !url.hash;
+    },
+    "server must use https and must not contain URL credentials, query parameters, or fragments",
+  ).optional()
+    .describe(
+      "Optional HTTPS swamp serve URL without userinfo, query, or fragment; omit to observe the local repository",
+    ),
   token: z.string().min(1).optional().meta({ sensitive: true }).describe(
     "Optional serve token; use a vault expression. Passed only in the child environment.",
   ),
@@ -156,7 +164,9 @@ async function query(
     );
     if (callerSignal.aborted) throw callerSignal.reason;
     if (!result.success) {
-      const kind = classifyFailure(`${result.stderr}\n${result.stdout}`);
+      const kind = timeout.aborted
+        ? "timeout"
+        : classifyFailure(`${result.stderr}\n${result.stdout}`);
       return {
         interface: name,
         available: false,
@@ -248,12 +258,12 @@ async function observe(
 /** Public Swamp operational-interface collector. */
 export const model = {
   type: "@jpisgeek/swamp-observability",
-  version: "2026.08.25.1",
+  version: "2026.08.25.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     observation: {
       description:
-        "One sanitized snapshot per documented Swamp operational interface; unavailable interfaces are retained explicitly.",
+        "One verbatim JSON snapshot per documented Swamp operational interface; errors are sanitized and unavailable interfaces are retained explicitly.",
       schema: ObservationSchema,
       lifetime: "30d" as const,
       garbageCollection: 30,
