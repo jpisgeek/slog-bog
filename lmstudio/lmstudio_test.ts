@@ -13,6 +13,7 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { model as endpoint } from "./lmstudio_endpoint.ts";
 import { model as probe } from "./lmstudio_probe.ts";
+import { model as daemon, setCommandRunnerForTest } from "./lmstudio_daemon.ts";
 
 const OK = {
   baseUrl: "https://inference.example.com/v1",
@@ -44,6 +45,23 @@ for (const [label, m] of [["endpoint", endpoint], ["probe", probe]] as const) {
       const baseUrl of [
         "https://user:pass@inference.example.com/v1",
         "https://user@inference.example.com/v1",
+      ]
+    ) {
+      assertEquals(
+        m.globalArguments.safeParse({ ...OK, baseUrl }).success,
+        false,
+        `CREDENTIAL LEAK — accepted: ${baseUrl}`,
+      );
+    }
+  });
+
+  Deno.test(`${label}: baseUrl rejects query strings and fragments`, () => {
+    for (
+      const baseUrl of [
+        "https://inference.example.com/v1?token=private",
+        "https://inference.example.com/v1#private",
+        "https://inference.example.com/v1?",
+        "https://inference.example.com/v1#",
       ]
     ) {
       assertEquals(
@@ -161,6 +179,28 @@ Deno.test("completionProbe: reasoning-budget and context flags are mandatory", (
   );
 });
 
+Deno.test("completionProbe: absent usage remains unknown rather than zero", () => {
+  const parsed = probe.resources.completionProbe.schema.safeParse({
+    model: "example/chat",
+    latencyMs: 1,
+    httpStatus: 200,
+    finishReason: "stop",
+    promptTokens: null,
+    completionTokens: null,
+    totalTokens: null,
+    reasoningTokens: null,
+    reasoningChars: 0,
+    contentChars: 2,
+    emptyContentWithReasoning: false,
+    contextExhausted: null,
+    maxTokensHit: null,
+    errorKind: "",
+    error: "",
+    checkedAt: new Date(0).toISOString(),
+  });
+  assertEquals(parsed.success, true);
+});
+
 Deno.test("health: reachable and authorized are independent booleans", () => {
   // "up but rejecting the token" must be representable distinctly from "down".
   const upButUnauthorized = {
@@ -198,4 +238,243 @@ Deno.test("the package exposes exactly the documented method set", () => {
 Deno.test("the two model types are distinct", () => {
   assertEquals(endpoint.type, "@jpisgeek/lmstudio/endpoint");
   assertEquals(probe.type, "@jpisgeek/lmstudio/probe");
+});
+
+Deno.test("published models migrate existing arguments without mutation", () => {
+  for (const model of [endpoint, probe]) {
+    assertEquals(model.version, "2026.08.25.1");
+    assertEquals(model.upgrades.at(-1)?.toVersion, model.version);
+    const old = { ...OK, timeoutSec: 30 };
+    assertEquals(model.upgrades.at(-1)?.upgradeAttributes(old), old);
+  }
+  assertEquals(daemon.version, "2026.08.25.1");
+  assertEquals("upgrades" in daemon, false);
+});
+
+Deno.test("completion rejects a malformed 2xx envelope", async () => {
+  const originalFetch = globalThis.fetch;
+  let written: Record<string, unknown> | undefined;
+  globalThis.fetch = () =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          choices: [{ finish_reason: "stop" }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+  try {
+    await probe.methods.completion.execute({
+      model: "example/chat",
+      prompt: "hello",
+      maxTokens: 8,
+      temperature: 0,
+    }, {
+      globalArgs: OK,
+      signal: new AbortController().signal,
+      logger: { info: () => {}, warning: () => {} },
+      writeResource: (
+        _spec: string,
+        _name: string,
+        value: Record<string, unknown>,
+      ) => {
+        written = value;
+        return Promise.resolve({ name: "completion" });
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assertEquals(written?.errorKind, "malformed_response");
+  assertEquals(written?.promptTokens, null);
+  assertEquals(written?.completionTokens, null);
+  assertEquals(written?.totalTokens, null);
+});
+
+Deno.test("completion rejects an empty finish reason", async () => {
+  const originalFetch = globalThis.fetch;
+  let written: Record<string, unknown> | undefined;
+  globalThis.fetch = () =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          choices: [{ finish_reason: "", message: { content: "ok" } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+  try {
+    await probe.methods.completion.execute({
+      model: "example/chat",
+      prompt: "hello",
+      maxTokens: 8,
+      temperature: 0,
+    }, {
+      globalArgs: OK,
+      signal: new AbortController().signal,
+      logger: { info: () => {}, warning: () => {} },
+      writeResource: (
+        _spec: string,
+        _name: string,
+        value: Record<string, unknown>,
+      ) => {
+        written = value;
+        return Promise.resolve({ name: "completion" });
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assertEquals(written?.errorKind, "malformed_response");
+  assertEquals(written?.promptTokens, null);
+});
+
+async function runDaemon(
+  runner: Parameters<typeof setCommandRunnerForTest>[0],
+  signal: AbortSignal = new AbortController().signal,
+) {
+  setCommandRunnerForTest(runner);
+  let written: unknown;
+  try {
+    await daemon.methods.observe.execute({}, {
+      globalArgs: {
+        lmsBinary: "lms",
+        host: "inference.example.com",
+        timeoutMs: 100,
+      },
+      signal,
+      writeResource: (_spec: string, _name: string, value: unknown) => {
+        written = value;
+        return Promise.resolve({ name: "daemon" });
+      },
+    });
+    return written as Record<string, unknown>;
+  } finally {
+    setCommandRunnerForTest();
+  }
+}
+
+Deno.test("daemon: remote lms ps records loaded models", async () => {
+  let argv: string[] = [];
+  const value = await runDaemon((_binary, args) => {
+    argv = args;
+    return Promise.resolve({
+      success: true,
+      code: 0,
+      stdout: JSON.stringify([{
+        identifier: "example/chat",
+        type: "llm",
+        architecture: "example",
+        path: "/private/path-is-not-retained",
+      }]),
+      stderr: "",
+    });
+  });
+  assertEquals(argv, [
+    "ps",
+    "--host",
+    "inference.example.com",
+    "--json",
+  ]);
+  assertEquals(value.loadedModelCount, 1);
+  assertEquals(value.daemonRunning, true);
+  assertEquals(JSON.stringify(value).includes("private/path"), false);
+});
+
+Deno.test("daemon: local headless deployment does not invent a host", async () => {
+  setCommandRunnerForTest((_binary, args) => {
+    assertEquals(args, ["ps", "--json"]);
+    return Promise.resolve({
+      success: true,
+      code: 0,
+      stdout: "[]",
+      stderr: "",
+    });
+  });
+  try {
+    await daemon.methods.observe.execute({}, {
+      globalArgs: { lmsBinary: "lms", timeoutMs: 100 },
+      signal: new AbortController().signal,
+      writeResource: () => Promise.resolve({ name: "daemon" }),
+    });
+  } finally {
+    setCommandRunnerForTest();
+  }
+});
+
+Deno.test("daemon: successful empty list is measured zero", async () => {
+  const value = await runDaemon(() =>
+    Promise.resolve({ success: true, code: 0, stdout: "[]", stderr: "" })
+  );
+  assertEquals(value.loadedModelCount, 0);
+  assertEquals(value.errorKind, "");
+});
+
+Deno.test("daemon: unreachable and malformed output remain explicit", async () => {
+  const unreachable = await runDaemon(() =>
+    Promise.resolve({
+      success: false,
+      code: 1,
+      stdout: "",
+      stderr: "connection refused at private-host",
+    })
+  );
+  assertEquals(unreachable.errorKind, "unreachable");
+  assertEquals(JSON.stringify(unreachable).includes("private-host"), false);
+
+  const malformed = await runDaemon(() =>
+    Promise.resolve({ success: true, code: 0, stdout: "{}", stderr: "" })
+  );
+  assertEquals(malformed.errorKind, "invalid-response");
+});
+
+Deno.test("daemon: caller cancellation throws and writes nothing", async () => {
+  const controller = new AbortController();
+  controller.abort(new DOMException("cancelled", "AbortError"));
+  let threw = false;
+  try {
+    await runDaemon(
+      () => Promise.reject(controller.signal.reason),
+      controller.signal,
+    );
+  } catch {
+    threw = true;
+  }
+  assertEquals(threw, true);
+});
+
+Deno.test("daemon: missing CLI and timeout are not false zeroes", async () => {
+  const missing = await runDaemon(() =>
+    Promise.reject(new Deno.errors.NotFound("missing executable"))
+  );
+  assertEquals(missing.cliAvailable, false);
+  assertEquals(missing.errorKind, "cli-unavailable");
+
+  const timedOut = await runDaemon((_binary, _args, signal) =>
+    new Promise((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new DOMException("timed out", "AbortError")),
+        { once: true },
+      );
+    })
+  );
+  assertEquals(timedOut.errorKind, "timeout");
+  assertEquals(timedOut.loadedModelCount, 0);
+  assertEquals(timedOut.daemonRunning, false);
+});
+
+Deno.test("daemon model supports local headless and safe remote hosts", () => {
+  assertEquals(daemon.globalArguments.safeParse({}).success, true);
+  assertEquals(
+    daemon.globalArguments.safeParse({ host: "inference.example.com" }).success,
+    true,
+  );
+  assertEquals(
+    daemon.globalArguments.safeParse({ host: "--help" }).success,
+    false,
+  );
+  assertEquals(daemon.type, "@jpisgeek/lmstudio/daemon");
 });

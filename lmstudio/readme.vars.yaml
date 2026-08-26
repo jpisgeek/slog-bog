@@ -2,6 +2,7 @@ package: "@jpisgeek/lmstudio"
 types:
   - "@jpisgeek/lmstudio/endpoint"
   - "@jpisgeek/lmstudio/probe"
+  - "@jpisgeek/lmstudio/daemon"
 purpose: >-
   Probe and validate an OpenAI-compatible inference endpoint (LM Studio, vLLM,
   llama.cpp server, a gateway in front of one) before you trust it in a
@@ -23,6 +24,9 @@ example: |
   #   swamp model method run my-probe embedding --input model=<model-id>
   #   swamp model method run my-probe completion --input model=<model-id> --input 'prompt=Say hello in one word.'
   #   swamp model method run my-probe capabilities --input model=<model-id>
+  # On the host running llmster (for example, a headless Mac Studio):
+  # swamp model create @jpisgeek/lmstudio/daemon my-daemon --json
+  # swamp model method run my-daemon observe
 caveats: >-
   No default endpoint, `baseUrl` is required. What throws versus what is
   written as data is deliberate and differs per method: `endpoint.models`
@@ -31,14 +35,20 @@ caveats: >-
   outcome and throws only on caller cancellation; the three `probe` methods
   throw only on a bad token and cancellation and record everything else with
   an `errorKind`. `contextExhausted` is a heuristic (finish_reason "length"
-  under the requested cap). Probe instance names are
-  `<method>-<slug-of-model-id>-<hash>`, so look them up after a run.
+  under the requested cap) and remains unknown when the endpoint omits valid
+  token usage. Probe instance names are
+  `<method>-<slug-of-model-id>-<hash>`, so look them up after a run. The daemon
+  model runs `lms ps --json` beside llmster. Set its optional `host` argument
+  only when deliberately using LM Studio's supported remote CLI mode.
 security: >-
   The bearer token is marked sensitive, must come from a vault expression
   (never an environment variable, env values persist into `.swamp/data/`),
   is redacted from every response body before it can reach an error, and URLs
-  in logs and errors have userinfo and query strings stripped. `http://` is
+  in logs and errors have userinfo, query strings, and fragments stripped.
+  Configured base URLs containing any of them are rejected. `http://` is
   accepted for endpoints behind an already-encrypted tunnel, with the caveat
   that the token then travels in cleartext on that hop. Written data: served
-  model ids, latencies, token counts, and boolean findings. Caller prompts
-  are not stored.
+  model ids, latencies, optional token counts, boolean findings, and short
+  sanitized endpoint error text. Caller prompts are not stored. Daemon
+  observations retain loaded model identifiers, type, and architecture but
+  discard model paths and raw command error output.

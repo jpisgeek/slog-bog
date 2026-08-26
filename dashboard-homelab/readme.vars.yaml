@@ -1,0 +1,30 @@
+package: "@jpisgeek/dashboard-homelab"
+purpose: >-
+  Normalizes scoped execution output from the local @jpisgeek/netdata,
+  @jpisgeek/truenas, and @jpisgeek/firewalla collectors into the versioned,
+  provider-neutral dashboard bundle contract. Every record is validated before
+  use, and missing, stale, partial, rejected, and unauthorized observations do
+  not become healthy values or convenient zeros.
+example: |
+  # Require this report on any supported collector definition.
+  reports:
+    require:
+      - '@jpisgeek/dashboard-homelab'
+
+  # After the collector method runs, pass its exact stored JSON artifact:
+  globalArguments:
+    bundles:
+      - ${{ data.latest("netdata", "report-jpisgeek-dashboard-homelab-json").attributes }}
+caveats: >-
+  This package observes only the data handles produced by the collector
+  execution it is attached to. Firewalla filtered runs declare filtered
+  coverage. TrueNAS alerts remain independent from certificate exceptions
+  because the current alert resource exposes no stable certificate identity.
+  The report never guesses a match from message text or list order.
+security: >-
+  The report performs no network, process, environment, or vault operations.
+  It reads only scoped Swamp execution data through the public report context.
+  Source validation errors contain resource names and validation classes, not
+  source payloads. Bundle contents are classified operational and may include
+  host, pool, mount, certificate, machine, and network names; protect rendered
+  dashboards accordingly.

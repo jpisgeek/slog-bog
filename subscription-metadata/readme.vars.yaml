@@ -1,0 +1,38 @@
+package: "@jpisgeek/subscription-metadata"
+purpose: >-
+  Persists explicit operator-supplied plan name, billing cadence, recurring
+  price, currency, renewal window, seats, and provider-declared limits. It
+  keeps subscription facts separate from API metering and never derives
+  remaining quota or per-token cost.
+example: |
+  globalArguments:
+    provider: Example AI
+    planName: Team
+    billingCadence: monthly
+    priceMinor: "2500"
+    currency: USD
+    seats: 4
+    declaredLimits:
+      - name: Included requests
+        value: 1000
+        unit: requests
+        period: month
+  reports:
+    require:
+      - '@jpisgeek/subscription-metadata'
+caveats: >-
+  Values are declarations, not live billing facts, unless the operator cites
+  an authorized stable API in sourceReference. Missing fields remain absent.
+  priceMinor is the recurring plan price in currency minor units and never API
+  usage cost. Limits named as remaining quota, availability, or per-token price
+  are rejected. Currency uses three uppercase letters; price and currency must
+  be supplied together; renewal timestamps use ISO datetime values; limit units
+  use lowercase letters, digits, dot, underscore, or hyphen. This package
+  performs no account-dashboard scraping.
+security: >-
+  This package performs no network, process, environment, or vault operations.
+  Plan, price, renewal, and seat metadata can be commercially sensitive, so
+  protect stored Swamp data and rendered dashboards accordingly. Do not put
+  credentials, private account URLs, or bearer query parameters in
+  sourceReference. References must use HTTPS and cannot contain credentials,
+  query parameters, or fragments.

@@ -1,0 +1,30 @@
+manifestVersion: 1
+name: "@jpisgeek/dashboard-swamp"
+version: 2026.08.25.2
+description: >
+  Local Swamp operational observability. Reads documented run history,
+  stale-run diagnostics, workflow history, and stored-report interfaces into
+  typed resources, then normalizes them into dashboard bundle v1. Missing and
+  unsupported interfaces remain visible coverage gaps.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/dashboard-swamp
+paths:
+  base: manifest
+models:
+  - swamp_observability.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports:
+  - dashboard_swamp.ts
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - dashboard
+  - observability
+  - swamp
+dependencies: []

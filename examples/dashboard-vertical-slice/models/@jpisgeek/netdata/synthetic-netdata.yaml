@@ -1,0 +1,11 @@
+type: "@jpisgeek/netdata"
+typeVersion: 2026.08.25.1
+id: 03be6406-37ac-48b3-9f33-71eaff6ac611
+name: synthetic-netdata
+version: 1
+tags: {}
+globalArguments: {}
+methods: {}
+reports:
+  require:
+    - "@jpisgeek/dashboard-homelab"

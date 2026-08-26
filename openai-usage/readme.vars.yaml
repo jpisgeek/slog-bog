@@ -1,0 +1,30 @@
+package: "@jpisgeek/openai-usage"
+purpose: >-
+  Collects OpenAI organization completion usage and billed costs through the
+  official Admin APIs, then emits dashboard bundle v1. Usage and costs paginate
+  independently so authorization, rate limits, malformed pages, and partial
+  coverage cannot turn into reassuring zeroes.
+example: |
+  globalArguments:
+    apiKey: ${{ vault.get("example-vault", "OPENAI_ADMIN_KEY") }}
+    timeoutMs: 15000
+  reports:
+    require:
+      - '@jpisgeek/openai-usage'
+
+  # Run with an explicit UTC window:
+  # swamp model method run openai-org collect --input startTime=EXAMPLE_UNIX_SECONDS
+caveats: >-
+  This package observes completion usage only; other OpenAI usage endpoint
+  families are not silently included. The Usage and Costs APIs can differ, so
+  billed cost remains a separate dimension and is authoritative for spend.
+  Access requires an eligible OpenAI Admin API credential. This package does
+  not inspect ChatGPT subscriptions, scrape personal dashboards, or infer
+  remaining quota. Breakdown identifiers are retained as operational metadata.
+security: >-
+  Supply the Admin API key through a Swamp vault expression. It is marked
+  sensitive, used only in the Authorization header, and never persisted in
+  resources, errors, report output, or URLs. Response bodies and server error
+  text are not persisted. Requests are fixed to the official HTTPS API origin.
+  Stored project, model, and line-item breakdowns may expose internal workload
+  names, so protect Swamp data and generated dashboards accordingly.

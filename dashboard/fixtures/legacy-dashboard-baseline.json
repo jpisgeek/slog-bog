@@ -1,0 +1,71 @@
+{
+  "t1": [
+    [
+      "node-alpha",
+      {
+        "name": "alpha",
+        "reachable": true,
+        "osName": "Linux",
+        "osVersion": "1",
+        "version": "2",
+        "transport": "https",
+        "claimedToCloud": false
+      }
+    ],
+    [
+      "mount-root",
+      {
+        "node": "alpha",
+        "mount": "/",
+        "usedPercent": 42,
+        "usedGiB": 42,
+        "totalGiB": 100
+      }
+    ]
+  ],
+  "n1": [
+    [
+      "pool-main",
+      {
+        "name": "main",
+        "healthy": true,
+        "status": "ONLINE",
+        "usedPercent": 35
+      }
+    ],
+    [
+      "cert-dashboard",
+      {
+        "name": "dashboard",
+        "expiryKnown": true,
+        "expired": false,
+        "expiringSoon": false,
+        "daysRemaining": 90,
+        "commonName": "dashboard.example.test"
+      }
+    ]
+  ],
+  "f1": [
+    [
+      "machine-tablet",
+      {
+        "name": "tablet",
+        "primaryIp": "192.0.2.20",
+        "deviceType": "mobile",
+        "networks": ["lan"],
+        "online": true
+      }
+    ]
+  ],
+  "h1": [
+    [
+      "run-alpha",
+      {
+        "host": "alpha.example.test",
+        "method": "exec",
+        "exitCode": 0,
+        "stderr": ""
+      }
+    ]
+  ]
+}

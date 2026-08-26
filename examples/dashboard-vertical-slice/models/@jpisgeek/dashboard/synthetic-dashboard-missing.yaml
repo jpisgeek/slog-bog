@@ -1,0 +1,12 @@
+type: "@jpisgeek/dashboard"
+typeVersion: 2026.08.25.1
+id: e4e9fda5-4673-4eca-a798-aefa1ab994f4
+name: synthetic-dashboard-missing
+version: 1
+tags: {}
+globalArguments:
+  title: Missing source proof
+  bundles: []
+  outputPath: ./artifacts/missing-source.html
+  suppress: []
+methods: {}

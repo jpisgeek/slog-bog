@@ -1,0 +1,46 @@
+id: 2e481238-e9ac-422f-b1a3-8c6dc98ac914
+name: "@jpisgeek/dashboard-hosted-ai-only"
+tags: {}
+description: Render only explicitly selected hosted-AI usage and subscription bundles.
+inputs:
+  type: object
+  properties:
+    includeOpenai:
+      type: boolean
+      default: true
+    includeAnthropic:
+      type: boolean
+      default: true
+    includeSubscriptions:
+      type: boolean
+      default: true
+    openaiModel:
+      type: string
+      default: openai-usage
+    anthropicModel:
+      type: string
+      default: anthropic-usage
+    subscriptionModel:
+      type: string
+      default: subscription-metadata
+jobs:
+  - name: main
+    description: Compose selected hosted-AI report bundles and render them.
+    steps:
+      - name: render
+        description: Pass exact hosted-AI normalization reports into the renderer.
+        task:
+          type: model_method
+          modelType: "@jpisgeek/dashboard"
+          modelName: composed-dashboard
+          methodName: render
+          globalArgs:
+            title: Hosted AI usage
+            bundles: '${{ (inputs.includeOpenai ? [data.latest(inputs.openaiModel, "report-jpisgeek-openai-usage-json").attributes] : []) + (inputs.includeAnthropic ? [data.latest(inputs.anthropicModel, "report-jpisgeek-anthropic-usage-json").attributes] : []) + (inputs.includeSubscriptions ? [data.latest(inputs.subscriptionModel, "report-jpisgeek-subscription-metadata-json").attributes] : []) }}'
+            outputPath: ./dashboard/hosted-ai.html
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

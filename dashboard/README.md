@@ -2,13 +2,13 @@
 
 # @jpisgeek/dashboard
 
-Renders one self-contained, exceptions-first HTML status page from resources
-other collector models have already written. Collects nothing, reaches no
-network; if a source has never run, the page says so instead of inventing a
-value. Each exception is also written back as a resource so alerting can be
-built on the same evaluation.
+Renders explicit provider-neutral dashboard bundle v1 values as one
+self-contained, exceptions-first HTML status page. It performs no provider
+discovery and reaches no network. Missing, invalid, stale, partial, unsupported,
+and unauthorized inputs remain visible. Each exception is also written as a
+queryable resource.
 
-**Version** `2026.08.22.2` · **License** MIT · **Source**
+**Version** `2026.08.25.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/dashboard
 
 ## Install
@@ -21,79 +21,58 @@ swamp extension pull @jpisgeek/dashboard
 
 ### Arguments
 
-| argument            | type            | required | default                    | description                                                                                                                                                                         |
-| ------------------- | --------------- | -------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `title`             | string          | no       | `"Homelab"`                |                                                                                                                                                                                     |
-| `sources`           | array of object | yes      |                            |                                                                                                                                                                                     |
-| `sources[].name`    | string          | yes      |                            | Source alias the render rules key off of — not free-text display. Must be exactly one of telemetry, nas, homelab, firewalla; render's exception rules match on these literal names. |
-| `sources[].type`    | string          | yes      |                            | Model type, e.g. @jpisgeek/firewalla                                                                                                                                                |
-| `sources[].id`      | string          | yes      |                            | Model id from `swamp model get <name> --json`                                                                                                                                       |
-| `outputPath`        | string          | no       | `"./dashboard/index.html"` | Where the rendered HTML is written                                                                                                                                                  |
-| `diskWarnPercent`   | number          | no       | `85`                       |                                                                                                                                                                                     |
-| `certWarnDays`      | integer         | no       | `30`                       |                                                                                                                                                                                     |
-| `suppress`          | array of object | no       | `[]`                       | Known-and-accepted states that must not nag. They still appear, listed separately as 'expected', so suppression stays visible rather than becoming a silent blind spot.             |
-| `suppress[].id`     | string          | yes      |                            | Exception id to suppress, e.g. unreachable:host.example.net                                                                                                                         |
-| `suppress[].reason` | string          | yes      |                            | Why this is expected — shown on the page                                                                                                                                            |
+| argument            | type            | required | default                    | description                                                                |
+| ------------------- | --------------- | -------- | -------------------------- | -------------------------------------------------------------------------- |
+| `title`             | string          | no       | `"Operations"`             |                                                                            |
+| `bundles`           | array of any    | no       | `[]`                       | Explicit bundle JSON, normally supplied by CEL data.latest(...).attributes |
+| `outputPath`        | string          | no       | `"./dashboard/index.html"` | Where the self-contained HTML file is written                              |
+| `suppress`          | array of object | no       | `[]`                       | Known conditions retained visibly as expected exceptions                   |
+| `suppress[].id`     | string          | yes      |                            | Exact normalized exception id                                              |
+| `suppress[].reason` | string          | yes      |                            | Why this condition is expected                                             |
 
 ### Methods
 
 #### `render`
 
-Read every source model's latest resources, evaluate exception rules, and write
-a self-contained HTML page. Reads only stored data — never the network.
+Validate explicit bundles and write a self-contained, exceptions-first HTML
+page.
 
 No arguments.
 
 ### Data written
 
-| resource    | lifetime | fields                                                                                                                | description                                                                                                                                                                               |
-| ----------- | -------- | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `exception` | infinite | `id`, `severity`, `subject`, `headline`, `detail`, `source`, `suppressed`, `suppressReason`, `truncated`              | One record per detected exception, including suppressed ones. Queryable independently of the HTML so alerting can be built on the same evaluation rather than a second copy of the logic. |
-| `render`    | infinite | `outputPath`, `bytes`, `exceptions`, `suppressed`, `critical`, `warning`, `sourcesRead`, `sourcesStale`, `renderedAt` | Outcome of the most recent render: counts and staleness.                                                                                                                                  |
+| resource    | lifetime | fields                                                                                                                                                                         | description                                                                     |
+| ----------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| `exception` | infinite | `id`, `severity`, `subject`, `headline`, `detail`, `source`, `sensitivity`, `suppressed`, `suppressReason`, `truncated`                                                        | One queryable normalized or coverage exception, including visible suppressions. |
+| `render`    | infinite | `outputPath`, `bytes`, `exceptions`, `suppressed`, `critical`, `warning`, `bundlesReceived`, `bundlesValid`, `bundleIds`, `coverageStates`, `exceptionResources`, `renderedAt` | Outcome and coverage of the latest explicit bundle render.                      |
 
 ## Example
 
 ```yaml
 globalArguments:
-  title: Homelab
-  sources:
-    - name: telemetry
-      type: "@jpisgeek/netdata"
-      id: <id from `swamp model get <your-netdata-model> --json`>
-    - name: nas
-      type: "@jpisgeek/truenas"
-      id: <id from `swamp model get <your-truenas-model> --json`>
-    - name: firewalla
-      type: "@jpisgeek/firewalla"
-      id: <id from `swamp model get <your-firewalla-model> --json`>
-    - name: homelab
-      type: "@swamp/ssh"
-      id: <id from `swamp model get <your-ssh-fleet-model> --json`>
+  title: Operations
+  bundles:
+    - ${{ data.latest("example-bundle-producer", "report-example-dashboard-json").attributes }}
   outputPath: ./dashboard/index.html
-  diskWarnPercent: 85
-  certWarnDays: 30
   suppress:
-    - id: unreachable:printer
-      reason: powered off outside business hours, expected
+    - id: 14:example-bundle30:condition:accepted-maintenance
+      reason: approved maintenance window
 ```
 
 ## Caveats
 
-The exception rules key off the literal source aliases `telemetry`, `nas`,
-`homelab`, `firewalla` (paired with `@jpisgeek/netdata`, `@jpisgeek/truenas`,
-`@swamp/ssh`, `@jpisgeek/firewalla`). A misspelled alias does not error. That
-source's exceptions just never evaluate, which is why the `known-source-aliases`
-check fails a run missing one of the four (skippable with `--skip-check`). This
-is the opinionated member of the family: a reference dashboard for that specific
-collector set, not a generic renderer. Delivery is out of scope. It writes a
-file, ship it with `@swamp/ssh copy` or similar.
+The renderer accepts bundle v1 only. Unsupported major versions and invalid
+values render as visible coverage exceptions instead of aborting or becoming
+healthy. It does not enumerate models or infer which adapters are installed.
+Delivery remains separate: compose the generated file with the transport model
+appropriate for the deployment.
 
 ## Security
 
-No network, no credentials. Every interpolated value is HTML-escaped. The
-rendered page lists machine names, addresses, mounts, and certificate names from
-your collectors. If you publish it to a web server, put it behind authentication
-or on a trusted network.
+No network, credentials, vault, process, environment, or cross-model repository
+access. Every bundle-derived string is HTML-escaped. Bundle sensitivity metadata
+does not itself enforce access control; protect any published dashboard
+according to the operational data it contains.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

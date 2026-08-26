@@ -1,0 +1,11 @@
+type: "@jpisgeek/dashboard"
+typeVersion: 2026.08.25.1
+id: 39e5777a-d932-4296-9ccd-1aa8660a2f36
+name: synthetic-dashboard
+version: 1
+tags: {}
+globalArguments:
+  title: Dashboard vertical slice
+  bundles: '${{ [data.latest("synthetic-netdata", "report-jpisgeek-dashboard-homelab-json").attributes] }}'
+  outputPath: ./artifacts/dashboard.html
+methods: {}

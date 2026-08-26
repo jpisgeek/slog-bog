@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/lmstudio"
-version: 2026.08.23.1
+version: 2026.08.25.1
 description: >
   Probe and validate an OpenAI-compatible inference endpoint before you trust it.
   Records the MEASURED embedding dimension rather than assuming it from a model
@@ -8,13 +8,16 @@ description: >
   and separates a model that exhausted its context from one that hit max_tokens.
   Also detects reasoning models, which can spend an entire completion budget on
   reasoning and return empty content -- a failure that otherwise looks like the
-  model ignoring its instructions.
+  model ignoring its instructions. Also observes an LM Studio headless daemon
+  and its loaded models through lms ps, locally beside llmster or through
+  optional remote host mode.
 repository: https://github.com/jpisgeek/slog-bog/tree/main/lmstudio
 paths:
   base: manifest
 models:
   - lmstudio_endpoint.ts
   - lmstudio_probe.ts
+  - lmstudio_daemon.ts
 workflows: []
 vaults: []
 drivers: []
@@ -32,4 +35,5 @@ labels:
   - openai-compatible
   - embeddings
   - diagnostics
+  - headless
 dependencies: []

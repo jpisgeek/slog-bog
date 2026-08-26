@@ -1,0 +1,10 @@
+[
+  { "name": "healthy", "state": "healthy" },
+  { "name": "degraded", "state": "degraded" },
+  { "name": "critical", "state": "critical" },
+  { "name": "unknown", "state": "unknown" },
+  { "name": "stale", "state": "stale" },
+  { "name": "partial", "state": "partial" },
+  { "name": "unsupported", "state": "unsupported" },
+  { "name": "unauthorized", "state": "unauthorized" }
+]

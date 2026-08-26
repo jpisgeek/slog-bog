@@ -60,20 +60,22 @@ const GlobalArgsSchema = z.object({
     .string()
     .min(1)
     .refine((v) => {
+      if (v.includes("?") || v.includes("#")) return false;
       try {
         const u = new URL(v);
         // http(s) only, and no embedded credentials: baseUrl is logged and can
         // appear in stored error text, so `https://user:pass@host` would leak.
         // The only credential is apiToken.
         return (u.protocol === "http:" || u.protocol === "https:") &&
-          u.username === "" && u.password === "";
+          u.username === "" && u.password === "" && u.search === "" &&
+          u.hash === "";
       } catch {
         return false;
       }
     }, {
       message:
-        "baseUrl must be a valid http(s) URL with no embedded credentials " +
-        "(user:pass@host); pass the token via apiToken.",
+        "baseUrl must be a valid http(s) URL with no userinfo, query, or " +
+        "fragment; pass the token via apiToken.",
     })
     .describe(
       "Base URL of the OpenAI-compatible inference endpoint, including any " +
@@ -184,10 +186,10 @@ const CompletionProbeSchema = z.object({
   latencyMs: z.number(),
   httpStatus: z.number(),
   finishReason: z.string(),
-  promptTokens: z.number(),
-  completionTokens: z.number(),
-  totalTokens: z.number(),
-  reasoningTokens: z.number(),
+  promptTokens: z.number().nullable(),
+  completionTokens: z.number().nullable(),
+  totalTokens: z.number().nullable(),
+  reasoningTokens: z.number().nullable(),
   reasoningChars: z.number(),
   contentChars: z.number(),
   /**
@@ -204,9 +206,9 @@ const CompletionProbeSchema = z.object({
    * context window. See the comment in completion() for why this is an
    * inference rather than a fact read directly from the API.
    */
-  contextExhausted: z.boolean(),
+  contextExhausted: z.boolean().nullable(),
   /** True when finish_reason is "length" and the requested cap was reached. */
-  maxTokensHit: z.boolean(),
+  maxTokensHit: z.boolean().nullable(),
   /** "" | "model_not_found" | "malformed_response" | "unreachable" | "timeout" | "http_error" -- "unauthorized" and cancellation are never stored here; both throw instead (see chatCompletion). */
   errorKind: z.string(),
   error: z.string(),
@@ -315,7 +317,7 @@ function classifyFetchError(
   }
   return {
     kind: "unreachable",
-    message: `could not reach endpoint: ${err?.message ?? String(e)}`,
+    message: "could not reach endpoint",
   };
 }
 
@@ -403,10 +405,10 @@ interface ChatResult {
   content: string;
   reasoningContent: string;
   finishReason: string;
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  reasoningTokens: number;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+  reasoningTokens: number | null;
   latencyMs: number;
 }
 
@@ -435,10 +437,10 @@ async function chatCompletion(
     content: "",
     reasoningContent: "",
     finishReason: "",
-    promptTokens: 0,
-    completionTokens: 0,
-    totalTokens: 0,
-    reasoningTokens: 0,
+    promptTokens: null,
+    completionTokens: null,
+    totalTokens: null,
+    reasoningTokens: null,
     latencyMs: 0,
   };
 
@@ -448,6 +450,7 @@ async function chatCompletion(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       response = await fetch(`${base}/chat/completions`, {
+        redirect: "error",
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -530,7 +533,7 @@ async function chatCompletion(
   let json: Record<string, unknown>;
   try {
     json = await finalResponse.json() as Record<string, unknown>;
-  } catch (e) {
+  } catch {
     // A malformed 2xx body used to be swallowed by `.catch(() => ({}))` and
     // scored as `ok: true` with every field empty -- indistinguishable from
     // a real completion that happened to say nothing. Recorded as data, not
@@ -538,7 +541,7 @@ async function chatCompletion(
     // about the endpoint, not a configuration fault on our end.
     result.errorKind = "malformed_response";
     result.error = `endpoint returned HTTP ${finalResponse.status} but the ` +
-      `body was not valid JSON: ${e instanceof Error ? e.message : String(e)}`;
+      "body was not valid JSON";
     return result;
   }
 
@@ -555,24 +558,71 @@ async function chatCompletion(
     return result;
   }
 
-  const choice = choices[0] as Record<string, unknown>;
-  const message = (choice.message ?? {}) as Record<string, unknown>;
-  const usage = (json.usage ?? {}) as Record<string, unknown>;
-  const usageDetails = (usage.completion_tokens_details ?? {}) as Record<
-    string,
-    unknown
-  >;
+  const tokenCount = (value: unknown) =>
+    typeof value === "number" && Number.isInteger(value) && value >= 0
+      ? value
+      : null;
+  const choice = choices[0];
+  const validObject = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  const validFinishReasons = new Set([
+    "stop",
+    "length",
+    "tool_calls",
+    "content_filter",
+    "function_call",
+  ]);
+  if (
+    !validObject(choice) || !validObject(choice.message) ||
+    typeof choice.finish_reason !== "string" ||
+    !validFinishReasons.has(choice.finish_reason)
+  ) {
+    result.errorKind = "malformed_response";
+    result.error = "completion choice, message, or finish reason was malformed";
+    return result;
+  }
+  const message = choice.message;
+  if (
+    !(typeof message.content === "string" || message.content === null) ||
+    !(message.reasoning_content === undefined ||
+      typeof message.reasoning_content === "string")
+  ) {
+    result.errorKind = "malformed_response";
+    result.error = "completion message content was malformed";
+    return result;
+  }
+  if (!validObject(json.usage)) {
+    result.errorKind = "malformed_response";
+    result.error = "completion token usage was missing or malformed";
+    return result;
+  }
+  const usage = json.usage;
+  const promptTokens = tokenCount(usage.prompt_tokens);
+  const completionTokens = tokenCount(usage.completion_tokens);
+  const totalTokens = tokenCount(usage.total_tokens);
+  if (
+    promptTokens === null || completionTokens === null ||
+    totalTokens === null ||
+    totalTokens !== promptTokens + completionTokens
+  ) {
+    result.errorKind = "malformed_response";
+    result.error = "completion token usage was inconsistent or malformed";
+    return result;
+  }
+  const usageDetails = validObject(usage.completion_tokens_details)
+    ? usage.completion_tokens_details
+    : {};
 
   result.ok = true;
   result.content = typeof message.content === "string" ? message.content : "";
   result.reasoningContent = typeof message.reasoning_content === "string"
     ? message.reasoning_content
     : "";
-  result.finishReason = String(choice.finish_reason ?? "");
-  result.promptTokens = Number(usage.prompt_tokens ?? 0);
-  result.completionTokens = Number(usage.completion_tokens ?? 0);
-  result.totalTokens = Number(usage.total_tokens ?? 0);
-  result.reasoningTokens = Number(usageDetails.reasoning_tokens ?? 0);
+  result.finishReason = choice.finish_reason;
+  result.promptTokens = promptTokens;
+  result.completionTokens = completionTokens;
+  result.totalTokens = totalTokens;
+  result.reasoningTokens = tokenCount(usageDetails.reasoning_tokens);
   return result;
 }
 
@@ -599,6 +649,7 @@ async function embedding(
   let response: Response | undefined;
   try {
     response = await fetch(`${base}/embeddings`, {
+      redirect: "error",
       method: "POST",
       headers: {
         Authorization: `Bearer ${g.apiToken}`,
@@ -626,25 +677,32 @@ async function embedding(
       let json: Record<string, unknown>;
       try {
         json = await response.json() as Record<string, unknown>;
-      } catch (e) {
+      } catch {
         // A malformed 2xx body used to be swallowed by `.catch(() => ({}))`
         // and scored identically to "endpoint returned 200 with no vector" --
         // recorded here as its own kind so a broken JSON body isn't
         // misread as a genuine "no embedding capability" finding.
         errorKind = "malformed_response";
         error = `endpoint returned HTTP ${response.status} but the body ` +
-          `was not valid JSON: ${e instanceof Error ? e.message : String(e)}`;
+          "was not valid JSON";
         json = {};
       }
       const data = Array.isArray(json.data) ? json.data : [];
       const first = (data[0] ?? {}) as Record<string, unknown>;
       const vector = Array.isArray(first.embedding) ? first.embedding : [];
+      const numericVector = vector.every((value) =>
+        typeof value === "number" && Number.isFinite(value)
+      );
+      if (vector.length > 0 && !numericVector) {
+        errorKind = "malformed_response";
+        error = "endpoint returned a nonnumeric embedding vector";
+      }
       // Measured, never assumed: a configured dimension that disagrees with
       // what the model actually returns corrupts a vector index. This is
       // read from the real response, not derived from the model's name or
       // reputation.
-      measuredDimension = vector.length;
-      dimensionKnown = vector.length > 0;
+      measuredDimension = numericVector ? vector.length : 0;
+      dimensionKnown = numericVector && vector.length > 0;
       servesEmbeddings = dimensionKnown;
       if (!dimensionKnown && !errorKind) {
         errorKind = "empty_response";
@@ -757,7 +815,7 @@ async function completion(
   // an empty answer. Without this flag that looks exactly like a model that
   // ignored its instructions.
   const emptyContentWithReasoning = result.ok && contentChars === 0 &&
-    (reasoningChars > 0 || result.reasoningTokens > 0);
+    (reasoningChars > 0 || (result.reasoningTokens ?? 0) > 0);
 
   // contextExhausted is a heuristic, not a fact read directly from the API.
   // An OpenAI-compatible /v1/models listing does not reliably expose a
@@ -771,8 +829,12 @@ async function completion(
   // inference from one call's usage numbers, not a guarantee. An endpoint
   // that exposes real context-length metadata would let this be tightened.
   const hitLength = result.ok && result.finishReason === "length";
-  const maxTokensHit = hitLength && result.completionTokens >= a.maxTokens;
-  const contextExhausted = hitLength && result.completionTokens < a.maxTokens;
+  const maxTokensHit = hitLength && result.completionTokens !== null
+    ? result.completionTokens >= a.maxTokens
+    : null;
+  const contextExhausted = hitLength && result.completionTokens !== null
+    ? result.completionTokens < a.maxTokens
+    : null;
 
   const name = await instanceName("completion", a.model);
   const handle = await ctx.writeResource("completionProbe", name, {
@@ -874,7 +936,7 @@ async function capabilities(
   } else {
     checksCompleted = 1;
     emitsReasoning = reasoningCheck.reasoningContent.length > 0 ||
-      reasoningCheck.reasoningTokens > 0;
+      (reasoningCheck.reasoningTokens ?? 0) > 0;
     // A response cut off at max_tokens before finishing its answer is a
     // truncated reply, not a measurement that reasoning is absent -- without
     // this flag the two are indistinguishable in the stored result.
@@ -998,8 +1060,13 @@ async function capabilities(
  */
 export const model = {
   type: "@jpisgeek/lmstudio/probe",
-  version: "2026.08.23.1",
+  version: "2026.08.25.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [{
+    toVersion: "2026.08.25.1",
+    description: "Tighten probe validation with no argument schema changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }],
 
   resources: {
     embeddingProbe: {
