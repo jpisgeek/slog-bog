@@ -1,0 +1,82 @@
+{
+  "extension": "@jpisgeek/mise",
+  "version": "2026.08.24.1",
+  "reviewedAt": "2026-08-28T06:00:00Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "pass",
+      "note": "Screening runs on every value that reaches stored data, resource names, tags and logs, including keys (tool names, config paths, declared-tool tags) and the operator's own node labels, which were the last exemption. The URL rule is inverted -- a source URL needs scheme, host and path, so any username, password, query or fragment is withheld -- and it fails closed when the value will not parse. Covers scp-style and scheme-relative locations including bracketed IPv6, auth schemes with no minimum token length, and environment-variable-shaped names where the keyword sits mid-string. Checked in both directions against real install paths, nix store paths, registry host:port references and email addresses; no false positives. Residual, recorded as an operator-decision on the security verdict: this is shape rules, not a proof."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "pass",
+      "note": "The error field is a closed set of codes; no host text reaches it. Every logged value is made printable, and resource names read back out of the datastore are screened before logging, since nothing upstream vouches for them. Partial readings and dropped entries each emit a warning naming what was missed."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "pass",
+      "note": "Every host problem returns a RunResult; the only throw is the caller's own cancellation, which is never written down as an observation about a host. The per-command deadline has its own AbortController so a timeout stays distinguishable from a generic remote failure. Deno's abort-without-throw behaviour is handled explicitly."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "137 tests over the exported surface. Notably includes the case a fixed-string fake binary cannot reach: a producer that never stops, which is the only thing that exercises the output cap. Writing it found a real bug -- the cap fired but Promise.all still waited on the other stream, so the sweep hung to the deadline. Gap worth naming: no test drives a real remote host, so the ssh argument vector is asserted by property rather than by behaviour."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "pass",
+      "note": "discover is read-only and re-runnable; the subcommand list is fixed and contains no mutating call. Pruning happens only on a full sweep, and an unmeasured or degraded host's rows are retained rather than read as gone. A single-node run deletes nothing and does not rewrite the fleet summary."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "pass",
+      "note": "The README is generated from the code, so drift is caught mechanically at publish. Several genuine doc/code mismatches were found and fixed during review -- unparseable applying only to the ls probe, the ssh destination argument shape, the basename rule, errorDetail's scope, the closed-set error claim -- which is the argument for keeping the generator rather than evidence against the contract."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "The deadline timer is cleared in finally. Both process streams are read against a byte cap and cancelled rather than drained, and the child is killed at the moment either stream runs over, before the other is awaited. Verified against an unbounded producer: 40s to 500ms."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "The identifier scanner reports zero hits across all four published files. Caveat worth recording: these runs had SLOG_BOG_DENYLIST unset, so only the generic rules ran -- private addresses, local paths, secret shapes, control bytes. The operator-specific denylist has not been exercised against this code. The scanner did catch a real hit during review: an example IPv6 address inside an explanatory comment."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "Responses are validated, never cast. The two JSON entry points narrow rather than assert, so an array where an object was promised is a failed answer instead of rows keyed 0, 1, 2. Fields a measurement depends on are required, so an empty object cannot parse into a measured tool. .loose() was removed from all four response schemas: zod's default already tolerates unknown fields without failing, so .loose() was adding passthrough of unvalidated remote data and nothing else."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "A full sweep deletes every record it did not write, with one documented exception: a record whose node attribution is ambiguous is held when the candidates disagree, because keeping a stale row is recoverable and deleting a live one is not. Ambiguity is now rare by construction -- resource names separate the node component with a double dash, which no slug can contain."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "pass",
+      "note": "Read-only by design: discover is the only method and there is no create, update or delete surface. Deletion exists solely as the prune of records this model itself wrote, and is guarded by validation before any delete."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "pass",
+      "note": "Operator values are refused at parse time rather than repaired: dir and misePath by charset, misePath additionally by basename, ssh host and user by hostname and username shapes, node labels by printability, length and credential screening. A half-fixed path that silently measures the wrong directory is worse than a config error."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "Names carry the full SHA-256 of the identity key, not a truncation, and the readable half is bounded. The escape used to build them is injective -- it escapes its own introducer -- so a tool whose name contains a real control character and one literally named with the escape sequence can no longer collide into a single record."
+    },
+    {
+      "id": "data-access",
+      "verdict": "pass",
+      "note": "Every lookup keyed by a remote string is guarded with Object.hasOwn, and maps built from remote keys use a null prototype, so a tool called __proto__ cannot read a function off the prototype chain. Records read back from the datastore are validated before the prune acts on them, because a loop that deletes has to check what it reads."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "pass",
+      "note": "NOTE BEFORE FIRST UPGRADE: the resource-name separator changed during this review, so records written by an earlier version carry the old single-dash form, and the first full sweep after upgrading will delete and rewrite every tool and config record. That is the designed path rather than a fault: legacy prefixes are held in their own map and matched only against legacy-shaped names, so an unmeasured host's old rows survive the migration while a measured host's are pruned and the migration completes. Tested in both directions. It has not been run against production data."
+    }
+  ]
+}
