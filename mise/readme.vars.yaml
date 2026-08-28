@@ -142,7 +142,12 @@ security: >-
   the JSON its subcommand promises.
   The `errorDetail` option turns that off and stores a bounded excerpt of the
   host's own text beside the code, for a private fleet whose datastore you own
-  and need to debug. It is off by default and should stay off wherever the
+  and need to debug. It covers unmeasured hosts only -- the probe that decides
+  whether a host answered at all. A host that answered and then lost a
+  follow-up probe is degraded rather than unmeasured, and names that probe in
+  `failedSubcommands` instead of storing its text, so `errorDetail` on such a
+  node is null even with the option on. It is off by default and should stay
+  off wherever the
   datastore is shared, because host error text routinely carries
   credential-bearing URLs, tokens, private hostnames and home paths. The trade
   is real either way: with it off, a failure nobody wrote a pattern for reads

@@ -343,8 +343,12 @@ export const GlobalArgsSchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "Store a bounded excerpt of a failing host's own error text alongside " +
-        "the classification code, for diagnosis. OFF by default, and it " +
+      "Store a bounded excerpt of an UNMEASURED host's own error text " +
+        "alongside the classification code, for diagnosis. Only the probe " +
+        "that decides whether a host was measured at all carries text here: " +
+        "a host that answered and then had a follow-up probe fail is " +
+        "degraded, and names the probe in failedSubcommands rather than " +
+        "storing its text. OFF by default, and it " +
         "should stay off wherever the datastore is not fully trusted: host " +
         "error text routinely carries credential-bearing URLs, tokens, " +
         "private hostnames and home paths, and resource data is durable and " +
@@ -918,10 +922,21 @@ function safeDetail(text: string): string | undefined {
   // three whitespace-separated tokens and no single one of them is an
   // assignment, so per-token screening walked straight past it. Here the
   // assignment and whatever follows it are replaced together.
-  const deassigned = printable.replace(
-    /\b(token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\b\s*[=:]\s*\S+/gi,
-    "$1=[withheld]",
-  );
+  const deassigned = printable
+    .replace(
+      /\b(token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\b\s*[=:]\s*\S+/gi,
+      "$1=[withheld]",
+    )
+    // Same reason, different shape. `Bearer abc123` is two whitespace-
+    // separated tokens and neither is a credential on its own -- the scheme
+    // word is a word and the token is an opaque string with nothing about it
+    // to match. Only the pair means anything, so the pair is matched here,
+    // with no minimum length: what follows an auth scheme is a credential
+    // however short it is.
+    .replace(
+      /\b(bearer|basic|digest|negotiate|authorization)\s+\S+/gi,
+      "$1 [withheld]",
+    );
   const kept = deassigned
     .split(/(\s+)/)
     .map((tok) =>
@@ -1909,7 +1924,12 @@ export const model = {
               !n.measured || n.failedSubcommands.includes(sub)
             );
           const outdatedComplete = !anyFailed("outdated");
-          const configComplete = !anyFailed("config");
+          // Drops count here as well as probe failures. Config entries that
+          // no parser would accept are missing configs, so a fleet total of
+          // zero computed across them says "no config drift" about configs
+          // nobody read.
+          const configComplete = !anyFailed("config") &&
+            nodeStates.every((n) => (n.droppedEntries ?? 0) === 0);
           // Every tool-derived total rests on the ls probe, so a host that
           // never answered at all takes all of them with it. The first pass
           // at this only covered outdated and config, which left the sweep

@@ -2206,3 +2206,54 @@ Deno.test("a tool whose outdated entry was malformed is unmeasured, not current"
     "a tool that answered is not marked unmeasured",
   );
 });
+
+Deno.test("an auth scheme and its token are withheld together", async () => {
+  // `Bearer abc123` is two whitespace-separated tokens and neither is a
+  // credential on its own: the scheme word is a word, and the token is
+  // opaque with nothing about it to match. Only the pair means anything,
+  // and per-token screening walked straight through it.
+  const m = await fakeMise({
+    stderr: "auth failed: Bearer shortOpaqueToken123 rejected",
+    exit: 1,
+  });
+  try {
+    const c = mockCtx({
+      nodes: [{ name: "host", misePath: m.path }],
+      errorDetail: true,
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    const detail = String(node.errorDetail);
+    assertEquals(
+      detail.includes("shortOpaqueToken123"),
+      false,
+      `the token survived screening: ${detail}`,
+    );
+    assertStringIncludes(detail, "[withheld]");
+    assertStringIncludes(
+      detail,
+      "auth failed",
+      "the sentence around it is still worth keeping",
+    );
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a spaced assignment is withheld across its tokens", async () => {
+  const m = await fakeMise({
+    stderr: "config error: password = swordfish",
+    exit: 1,
+  });
+  try {
+    const c = mockCtx({
+      nodes: [{ name: "host", misePath: m.path }],
+      errorDetail: true,
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(String(node.errorDetail).includes("swordfish"), false);
+  } finally {
+    await m.cleanup();
+  }
+});
