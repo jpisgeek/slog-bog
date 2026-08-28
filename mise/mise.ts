@@ -112,6 +112,7 @@ const MAX_VALUE_CHARS = 4096;
 async function readCapped(
   stream: ReadableStream<Uint8Array>,
   cap: number,
+  onOverflow?: () => void,
 ): Promise<{ text: string; truncated: boolean }> {
   const decoder = new TextDecoder();
   const reader = stream.getReader();
@@ -125,6 +126,13 @@ async function readCapped(
       if (total + value.byteLength > cap) {
         chunks.push(value.subarray(0, cap - total));
         truncated = true;
+        // Kill the child HERE, not after both streams settle. Waiting on
+        // Promise.all meant this stream stopped reading while the other one
+        // sat waiting for an EOF that only arrives when the child exits --
+        // which a runaway producer never does. The cap fired and the sweep
+        // still hung until the deadline, so the bound existed and bought
+        // nothing.
+        onOverflow?.();
         break;
       }
       chunks.push(value);
@@ -159,18 +167,22 @@ async function cappedOutput(
   cmd: Deno.Command,
 ): Promise<{ success: boolean; code: number; stdout: string; stderr: string }> {
   const child = cmd.spawn();
-  const [o, e] = await Promise.all([
-    readCapped(child.stdout, MAX_OUTPUT_BYTES),
-    readCapped(child.stderr, MAX_OUTPUT_BYTES),
-  ]);
-  if (o.truncated || e.truncated) {
+  let killed = false;
+  const kill = () => {
+    if (killed) return;
+    killed = true;
     // The answer is already unusable, so there is nothing to gain by letting
-    // the child keep producing. Killing may race a process that has already
-    // exited, which is not an error worth reporting.
+    // the child keep producing -- and everything to lose, because the other
+    // stream cannot reach EOF until it exits. Killing may race a process
+    // that has already exited, which is not an error worth reporting.
     try {
       child.kill("SIGKILL");
     } catch { /* already gone */ }
-  }
+  };
+  const [o, e] = await Promise.all([
+    readCapped(child.stdout, MAX_OUTPUT_BYTES, kill),
+    readCapped(child.stderr, MAX_OUTPUT_BYTES, kill),
+  ]);
   const status = await child.status;
   return {
     success: status.success && !o.truncated && !e.truncated,

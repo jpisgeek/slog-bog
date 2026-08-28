@@ -2646,3 +2646,48 @@ Deno.test("an environment-variable-shaped secret name is caught", () => {
     assertEquals(safeRemoteString(v), v, `must survive: ${v}`);
   }
 });
+
+Deno.test("a host that will not stop talking is cut off, not buffered", async () => {
+  // The first version of this bound decoded whatever Deno.Command.output()
+  // had already buffered, which is not a bound at all: output() reads the
+  // child to completion first. This exercises the real path -- a producer
+  // that would run indefinitely -- so the test only terminates if the
+  // collector stops reading and kills it.
+  const dir = await Deno.makeTempDir();
+  const path = `${dir}/mise`;
+  await Deno.writeTextFile(
+    path,
+    [
+      "#!/bin/sh",
+      "while :; do",
+      "  head -c 65536 /dev/zero | tr '\\0' 'x'",
+      "done",
+    ]
+      .join("\n"),
+  );
+  await Deno.chmod(path, 0o755);
+  try {
+    const started = Date.now();
+    const r = await runMise(
+      GlobalArgsSchema.parse({ nodes: [{ name: "loud", misePath: path }] })
+        .nodes[0],
+      SUB_LS,
+      30,
+      new AbortController().signal,
+    );
+    // It must come back, and quickly -- an unbounded read would still be
+    // going, and a full 30s deadline would mean the cap never fired.
+    assertEquals(
+      Date.now() - started < 25_000,
+      true,
+      "must not wait for the deadline",
+    );
+    assertEquals(
+      r.ok,
+      false,
+      "a truncated answer is a failed one, not a short one",
+    );
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
