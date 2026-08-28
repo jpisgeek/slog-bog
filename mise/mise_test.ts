@@ -877,7 +877,9 @@ Deno.test("a failed outdated probe is degraded, not a clean zero", async () => {
     assertEquals(node.measured, true, "the tool list did come back");
     assertEquals(node.degraded, true);
     assertEquals(node.failedSubcommands, ["outdated"]);
-    assertStringIncludes(String(node.error), "outdated");
+    // A code, not a sentence. Which probe went quiet is on the record above,
+    // in the field whose job that is.
+    assertEquals(node.error, "partially-measured");
     const summary = c.written.find((w) => w.spec === "summary")!.data;
     assertEquals(summary.nodesMeasured, 1);
     assertEquals(
@@ -2111,4 +2113,39 @@ Deno.test("a tool declared but never installed is still a measurement", () => {
   assertEquals(rows.length, 1);
   assertEquals(rows[0].resolvedVersion, null);
   assertEquals(rows[0].installPath, null);
+});
+
+Deno.test("a summary total is null, not zero, when a probe went unanswered", async () => {
+  // The node record refuses to write zero for a failed probe, and then the
+  // summary used to add those refusals up into a fleet zero and publish it
+  // as good news -- the same mistake one level up.
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN, fail: ["outdated"] });
+  try {
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const summary = c.written.find((w) => w.spec === "summary")!.data;
+    assertEquals(summary.outdated, null);
+    assertEquals(
+      summary.configsNotInEffect,
+      0,
+      "the config probe did answer, so its total is a real zero",
+    );
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("misePath has to name a mise binary", () => {
+  // The charset rule alone let it name any executable on the box. The
+  // subcommands are fixed, so this was a guarantee the schema advertised
+  // and did not keep, rather than a live exploit.
+  const ok = (p: string) =>
+    GlobalArgsSchema.safeParse({
+      nodes: [{ name: "a", misePath: p }],
+    }).success;
+  assertEquals(ok("/opt/homebrew/bin/mise"), true);
+  assertEquals(ok("mise"), true);
+  assertEquals(ok("/usr/local/bin/mise.exe"), true);
+  assertEquals(ok("/bin/sh"), false);
+  assertEquals(ok("/usr/bin/curl"), false);
 });

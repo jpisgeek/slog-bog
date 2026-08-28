@@ -27,6 +27,19 @@ import { z } from "npm:zod@4";
 const SAFE_ABS_PATH = /^\/[A-Za-z0-9._/-]*$/;
 /** Same character class, but a bare command name like `mise` is also fine. */
 const SAFE_BIN_PATH = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * The basename `misePath` is allowed to have.
+ *
+ * The charset rule alone let `misePath` name any executable on the box --
+ * `/bin/sh` satisfied it -- which sits badly next to a model that advertises
+ * itself as read-only. The subcommands are fixed and none of them does damage
+ * under a different binary, so this is not a live exploit; it is a guarantee
+ * the schema was not actually keeping. It keeps it now. The point of the
+ * argument is to say WHERE mise is when it is not on the PATH, and every
+ * legitimate answer to that ends in mise.
+ */
+const MISE_BASENAME = /(?:^|\/)mise(?:\.[A-Za-z0-9]+)?$/;
 /**
  * Make process-controlled text printable before it reaches data, tags, or
  * logs. Escaping instead of dropping the byte keeps two hostile names from
@@ -273,10 +286,15 @@ export const NodeSchema = z.object({
     ),
   misePath: z
     .string()
-    .refine((v) => SAFE_BIN_PATH.test(v) && !v.startsWith("-"), {
-      message:
-        "misePath must match [A-Za-z0-9._/-] and must not start with '-'",
-    })
+    .refine(
+      (v) =>
+        SAFE_BIN_PATH.test(v) && !v.startsWith("-") && MISE_BASENAME.test(v),
+      {
+        message:
+          "misePath must match [A-Za-z0-9._/-], must not start with '-', " +
+          "and must name a mise binary",
+      },
+    )
     .default("mise")
     .describe(
       "Path to the mise binary. Worth setting for SSH hosts: a non-login " +
@@ -1665,7 +1683,12 @@ export const model = {
                 // A degraded host is not a clean host, so it does not get to
                 // report a null error while quietly missing a reading.
                 error: failed.length > 0
-                  ? `part measured, no answer from: ${failed.join(", ")}`
+                  // A code, not a sentence. `error` is documented as a
+                  // closed set, and this path was writing prose into it --
+                  // which is exactly the field a reader is told they can
+                  // match on. Which subcommands went quiet is already on
+                  // the record, in failedSubcommands, where it belongs.
+                  ? "partially-measured"
                   : null,
                 // Names our own subcommands, not host text: nothing extra
                 // to withhold.

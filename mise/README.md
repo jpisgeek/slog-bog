@@ -156,45 +156,51 @@ operator-supplied values reach the remote command: `dir`, single-quoted, and
 `misePath`, unquoted. Each is safe because its schema refuses at parse time any
 value containing a character a shell would act on, rather than repairing it: a
 half-fixed path that measures the wrong directory silently is worse than a
-config error. `ssh.host` and `ssh.user` are a different case, and a stronger
-one. Neither reaches a shell at all. The two are combined into the single
-positional destination argument `user@host` and handed straight to `ssh` as one
-argv element, so the only thing their schema has to refuse is a leading dash,
-which would otherwise let the destination be read as an ssh option such as
-`-oProxyCommand=`. They carry no shell charset rule and do not need one. Node
-labels refuse terminal controls at parse time. Every string returned by a host
-is made printable before it reaches a resource field, tag, or log parameter. C0
-and C1 bytes, including ESC, are written as visible `\uNNNN` text instead of
-being handed to a terminal. SSH passes both `BatchMode=yes` and
-`StrictHostKeyChecking=yes` on the command line, so an unknown host key fails
-closed. BatchMode alone would not do that: it removes the prompt but leaves the
-decision to ambient ssh_config, which can be set to accept a key it has never
-seen, and passing the policy as an argument beats any config file. Errors never
-quote host output by default. stderr is read to classify a failure and then
-discarded; what is stored in `error` is one of a closed set of codes,
-`unparseable-output` among them for a host that exits zero without the JSON its
-subcommand promises. The `errorDetail` option turns that off and stores a
-bounded excerpt of the host's own text beside the code, for a private fleet
-whose datastore you own and need to debug. It is off by default and should stay
-off wherever the datastore is shared, because host error text routinely carries
-credential-bearing URLs, tokens, private hostnames and home paths. The trade is
-real either way: with it off, a failure nobody wrote a pattern for reads as
-`unclassified` and the detail that would explain it is gone. Quoting even a
-truncated excerpt would publish whatever the host happened to print, which
-routinely includes URLs carrying credentials. Written data: host labels, the
-measured directory, mise version, tool names and versions, install paths, tool
-source types and source paths, and config file paths. Install and config paths
-embed the remote account's home directory and real project directory names. A
-source path is whatever registry or repository a tool came from, so it can name
-a private repository URL, an internal domain, an account identifier, and the
-shape of a project. All of it also appears in readable form in resource names
-and in tags, which are the surface a casual query returns first -- there is no
-field here that is stored but not displayed. Credential-bearing values are
-withheld before any of that: a source or install URL carrying a username, a
-password, a query or a fragment is dropped rather than redacted, and a tool name
-or config path that screens the same way takes its whole entry with it. What
-remains is still infrastructure detail. Treat the datastore, and the sweep logs
-alongside it, as infrastructure-sensitive.
+config error. `misePath` is held to one thing more: its basename has to be mise.
+The charset rule alone let it name any executable on the box, which is a
+guarantee this model advertises and was not actually keeping. `ssh.host` and
+`ssh.user` are a different case, and a stronger one. Neither reaches a shell at
+all. The two are combined into the single positional destination argument
+`user@host` and handed straight to `ssh` as one argv element, so the only thing
+their schema has to refuse is a leading dash, which would otherwise let the
+destination be read as an ssh option such as `-oProxyCommand=`. They carry no
+shell charset rule and do not need one. Node labels refuse terminal controls at
+parse time. Every string returned by a host is made printable before it reaches
+a resource field, tag, or log parameter. C0 and C1 bytes, including ESC, are
+written as visible `\uNNNN` text instead of being handed to a terminal. SSH
+passes both `BatchMode=yes` and `StrictHostKeyChecking=yes` on the command line,
+so an unknown host key fails closed. BatchMode alone would not do that: it
+removes the prompt but leaves the decision to ambient ssh_config, which can be
+set to accept a key it has never seen, and passing the policy as an argument
+beats any config file. Errors never quote host output by default. stderr is read
+to classify a failure and then discarded; what is stored in `error` is one of a
+closed set of codes, `unparseable-output` among them for a host that exits zero
+without the JSON its subcommand promises. The `errorDetail` option turns that
+off and stores a bounded excerpt of the host's own text beside the code, for a
+private fleet whose datastore you own and need to debug. It is off by default
+and should stay off wherever the datastore is shared, because host error text
+routinely carries credential-bearing URLs, tokens, private hostnames and home
+paths. The trade is real either way: with it off, a failure nobody wrote a
+pattern for reads as `unclassified` and the detail that would explain it is
+gone. Quoting even a truncated excerpt would publish whatever the host happened
+to print, which routinely includes URLs carrying credentials. Written data: host
+labels, the measured directory, mise version, tool names and versions, install
+paths, tool source types and source paths, and config file paths. Install and
+config paths embed the remote account's home directory and real project
+directory names. A source path is whatever registry or repository a tool came
+from, so it can name a private repository URL, an internal domain, Some of it
+also appears in readable form outside the resource data itself, and it is worth
+knowing exactly which: resource NAMES carry the host label, the tool name, and
+the config path; TAGS carry the host label, the tool name, the transport, and
+the measured, degraded and drift states. Install paths, source paths and
+versions appear in the data only. Credential-bearing values are withheld before
+any of that: a source or install URL carrying a username, a password, a query or
+a fragment is dropped rather than redacted, and a tool name or config path that
+screens the same way takes its whole entry with it. Screening is a set of shape
+rules, not a proof -- it catches the forms a credential usually takes, and a
+secret shaped like an ordinary path will pass. What remains is infrastructure
+detail regardless. Treat the datastore, and the sweep logs alongside it, as
+infrastructure-sensitive.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

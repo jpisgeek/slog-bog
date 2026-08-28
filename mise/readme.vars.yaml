@@ -100,7 +100,10 @@ security: >-
   single-quoted, and `misePath`, unquoted. Each is safe because its schema
   refuses at parse time any value containing a character a shell would act on,
   rather than repairing it: a half-fixed path that measures the wrong
-  directory silently is worse than a config error. `ssh.host` and `ssh.user`
+  directory silently is worse than a config error. `misePath` is held to one
+  thing more: its basename has to be mise. The charset rule alone let it name
+  any executable on the box, which is a guarantee this model advertises and
+  was not actually keeping. `ssh.host` and `ssh.user`
   are a different case, and a stronger one. Neither reaches a shell at all.
   The two are combined into the single positional destination argument
   `user@host` and handed straight to `ssh` as one argv element, so the only
@@ -134,12 +137,15 @@ security: >-
   Install and config paths embed the remote account's home directory and real
   project directory names. A source path is whatever registry or repository a
   tool came from, so it can name a private repository URL, an internal domain,
-  an account identifier, and the shape of a project. All of it also appears in
-  readable form in resource names and in tags, which are the surface a casual
-  query returns first -- there is no field here that is stored but not
-  displayed. Credential-bearing values are withheld before any of that: a
-  source or install URL carrying a username, a password, a query or a fragment
-  is dropped rather than redacted, and a tool name or config path that screens
-  the same way takes its whole entry with it. What remains is still
-  infrastructure detail. Treat the datastore, and the sweep logs alongside it,
-  as infrastructure-sensitive.
+  Some of it also appears in readable form outside the resource data itself,
+  and it is worth knowing exactly which: resource NAMES carry the host label,
+  the tool name, and the config path; TAGS carry the host label, the tool
+  name, the transport, and the measured, degraded and drift states. Install
+  paths, source paths and versions appear in the data only. Credential-bearing
+  values are withheld before any of that: a source or install URL carrying a
+  username, a password, a query or a fragment is dropped rather than redacted,
+  and a tool name or config path that screens the same way takes its whole
+  entry with it. Screening is a set of shape rules, not a proof -- it catches
+  the forms a credential usually takes, and a secret shaped like an ordinary
+  path will pass. What remains is infrastructure detail regardless. Treat the
+  datastore, and the sweep logs alongside it, as infrastructure-sensitive.
