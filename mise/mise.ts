@@ -1748,8 +1748,42 @@ function currentDir(): string | null {
  */
 export const model = {
   type: "@jpisgeek/mise",
-  version: "2026.08.28.1",
+  version: "2026.08.28.2",
   globalArguments: GlobalArgsSchema,
+  /**
+   * Nothing to transform, and the reasons are worth stating rather than
+   * assuming, because "no-op" can mean two different things.
+   *
+   * One field has been added since 2026.08.24.1: `errorDetail`, which carries
+   * `.default(false)`. An instance stored without it parses and comes back
+   * off by default, which is the safe direction for the one argument that
+   * persists host text, so there is no attribute to write.
+   *
+   * The rest of the changes are narrowings of validation on arguments that
+   * already existed -- misePath must now name mise, ssh.host and ssh.user
+   * are held to hostname and username charsets, and a node label is screened
+   * the way a host's strings are. An upgrade function cannot help there, and
+   * should not try: a config that used to parse and now does not is a config
+   * this model refuses rather than repairs, which is the same rule it applies
+   * to `dir` and `misePath` everywhere else. A half-fixed value that measures
+   * the wrong thing silently is worse than a loud config error.
+   *
+   * So this exists to move `typeVersion` on existing instances, which is what
+   * it is for. Targeting 2026.08.28.2 rather than .1 on purpose: instances
+   * are filtered on `toVersion > typeVersion`, so an entry naming a version
+   * already installed would never run, and this one reaches instances sitting
+   * at both 2026.08.24.1 and 2026.08.28.1.
+   */
+  upgrades: [
+    {
+      toVersion: "2026.08.28.2",
+      description:
+        "Security hardening; no globalArguments migration. errorDetail was " +
+        "added with a default, and the other changes tighten validation on " +
+        "existing arguments rather than reshaping them.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     node: {
       description:

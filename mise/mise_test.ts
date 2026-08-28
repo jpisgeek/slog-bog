@@ -2776,3 +2776,25 @@ Deno.test("a credential-bearing node label is refused at parse time", () => {
   // across two identities, and unlike a host's answer this is something the
   // operator can just rewrite.
 });
+
+Deno.test("the upgrade chain reaches every published version and changes nothing", () => {
+  // Instances are filtered on toVersion > typeVersion, so an entry naming a
+  // version already installed never runs. This one has to sit above both
+  // published versions to reach instances at either.
+  const ups = model.upgrades;
+  assertEquals(ups.length, 1);
+  assertEquals(ups[0].toVersion, model.version);
+  assertEquals(ups[0].toVersion > "2026.08.28.1", true);
+  assertEquals(ups[0].toVersion > "2026.08.24.1", true);
+  // A no-op on the data: the one field added since carries a default, and
+  // the rest of the changes tighten validation rather than reshaping it.
+  const before = { timeoutSec: 15, nodes: [{ name: "a" }] };
+  assertEquals(ups[0].upgradeAttributes(before), before);
+});
+
+Deno.test("an instance stored before errorDetail existed parses safely off", () => {
+  // The reason no attribute has to be written: the default is the safe
+  // direction for the one argument that persists host text.
+  const g = GlobalArgsSchema.parse({ nodes: [{ name: "a" }] });
+  assertEquals(g.errorDetail, false);
+});
