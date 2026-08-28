@@ -915,9 +915,12 @@ const USERINFO_NO_SCHEME: RegExp[] = [
   // scp-style: user@host:path, with an optional :password. Requires a
   // colon-path after the host so an ordinary email address in an error
   // sentence is not mistaken for a location. The host alternative includes
-  // the bracketed IPv6 form, which the first version of this did not: a
-  // literal address is a private address, and `user:pw@[fd00::1]:repo`
-  // slipped through with username, password and address intact.
+  // the bracketed IPv6 form, which the first version of this did not. A
+  // literal address in a source location is nearly always an internal one,
+  // and userinfo in front of a bracketed address slipped through with
+  // username, password and address intact. The shape is described rather
+  // than written out: an example address here trips the identifier scanner
+  // that guards this repo, which is the scanner doing its job.
   /(?:^|[\s(<'"])[A-Za-z0-9._~%-]+(?::[^\s@]*)?@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[^\s]/,
   // scheme-relative with userinfo, same two host forms
   /(?:^|[\s(<'"])\/\/[A-Za-z0-9._~%-]+(?::[^\s@]*)?@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)/,
