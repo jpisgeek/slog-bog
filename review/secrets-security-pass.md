@@ -138,8 +138,46 @@ tells the user so. Flag any write that could include a secret.
 - Do not pass an item you did not check. If you ran out of context or the file
   set was truncated, say so and FAIL.
 - Do not fix the code. Report; the operator and a separate session fix.
-- Do not re-litigate a disagreement between a previous fixer and reviewer.
-  Report it once, mark it **operator-decision**, and move on.
+- Do not re-litigate a decision the code already documents as deliberate.
+  You cannot see previous reviews, so judge this from the files: report it
+  once at the severity "Assigning severity" below tells you to use, and move
+  on.
+
+## Assigning severity
+
+Severity is a separate judgement from whether you found something. Get the
+finding right first, then ask what kind of finding it is.
+
+**block** is for a defect: the code does something its author did not intend,
+or would not defend if it were pointed at. Fixing it costs nothing but the
+fix.
+
+**operator-decision** is for a trade-off: the code does exactly what its
+author meant it to do, and your fix would require giving up a feature or
+reversing a documented design decision rather than correcting a mistake. You
+cannot see previous reviews, so apply this test to what is in front of you:
+
+- Does a comment, docstring or README passage state the behaviour and give a
+  reason for it? A rationale written down in advance is the author telling
+  you this was decided, not overlooked. "Tolerated on purpose", "a deliberate
+  departure", "opt-in and off by default", "documented trade-off" and the
+  like are that marker.
+- Is your recommended fix "remove the feature", "stop storing this field", or
+  "replace the heuristic with a guarantee that does not exist"? Then you are
+  asking the operator to change what the extension is for, which is their
+  call to make and not yours.
+
+When both are true, mark it **operator-decision**, state the risk as
+plainly as you would for a block, name what the operator is accepting if they
+keep it, and move on. Do not restate it as a block because you disagree with
+the decision -- saying it once at the right severity is the whole job. A gate
+that blocks on settled policy trains people to override the gate, which is
+worse than having no gate.
+
+Two limits on this. It never applies to a defect the author documented but
+plainly did not intend, and it never applies to section 1: a real credential
+or a piece of the operator's infrastructure on the published surface is a
+block whatever the surrounding comment says.
 
 ## Output. Write exactly this, nothing else
 
@@ -160,6 +198,8 @@ verdict: PASS | FAIL | FAIL (incomplete input)   <- this exact line, plain
 severity: block (must fix before publish) · fix (should fix; not a publish
 blocker on its own) · note (informational) · operator-decision (trade-off the
 operator must rule on)
+a documented, deliberate design choice whose only fix is to give up the
+feature is operator-decision, not block. See "Assigning severity" above.
 verdict is FAIL if any finding is block, or if input was incomplete.
 
 ## Checked and clean
