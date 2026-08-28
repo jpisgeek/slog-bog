@@ -946,6 +946,17 @@ function safeDetail(text: string): string | undefined {
  */
 export interface DropSink {
   dropped: number;
+  /**
+   * Tool names whose outdated entry was dropped.
+   *
+   * The count alone was not enough here. `outdated` is read by asking whether
+   * a tool is a key in the map, so a tool whose entry was malformed fell out
+   * of the map and came back as "not outdated" -- absence read as health, the
+   * exact failure this model exists to prevent, one level below where it was
+   * already being prevented. A name in this set means "nobody measured this
+   * tool", which classifies as unmeasured rather than current.
+   */
+  unmeasuredTools?: Set<string>;
 }
 
 function noteDrop(sink: DropSink | undefined): void {
@@ -1139,6 +1150,10 @@ export function parseOutdated(
     const parsed = OutdatedEntrySchema.safeParse(v);
     if (!parsed.success) {
       noteDrop(sink);
+      // The value was malformed, but the key still names a real tool, and
+      // that name is what stops its row reading as current.
+      const named = safeRemoteString(tool);
+      if (named !== null) sink?.unmeasuredTools?.add(named);
       continue;
     }
     const name = safeRemoteKey(tool, sink);
@@ -1574,7 +1589,10 @@ export const model = {
               // One sink for the whole node: every parser adds to it, so a
               // host that answers badly in several places is degraded once
               // with a total, rather than per-parser.
-              const drops: DropSink = { dropped: 0 };
+              const drops: DropSink = {
+                dropped: 0,
+                unmeasuredTools: new Set<string>(),
+              };
               const rows = parseLsCurrent(lsJson, drops);
               const ver = await run(SUB_VERSION);
               const cfg = await run(SUB_CONFIG);
@@ -1654,7 +1672,11 @@ export const model = {
                 const expectFail = expected !== undefined &&
                   r.resolvedVersion !== null &&
                   !satisfiesExpect(expected, r.resolvedVersion);
-                const isOutdated = outdated === null
+                // Three states, not two. The probe failed for everyone
+                // (null), the probe failed for this tool alone (null), or
+                // the probe answered (a boolean).
+                const isOutdated = outdated === null ||
+                    drops.unmeasuredTools?.has(r.tool)
                   ? null
                   : Object.hasOwn(outdated, r.tool);
                 const drift = classifyTool(r, {
@@ -1895,7 +1917,12 @@ export const model = {
           // nobody answered -- an incomplete sweep wearing the shape of a
           // healthy one, which is the exact failure this whole model is
           // built around not committing.
-          const toolsComplete = nodeStates.every((n) => n.measured);
+          // A host that answered but whose answer contained entries no
+          // parser would accept is not a host that was fully measured, so
+          // its totals cannot be added into a fleet total either.
+          const toolsComplete = nodeStates.every((n) =>
+            n.measured && (n.droppedEntries ?? 0) === 0
+          );
           const num = (ok: boolean, v: number) => ok ? v : null;
           handles.push(
             await ctx.writeResource("summary", "summary", {

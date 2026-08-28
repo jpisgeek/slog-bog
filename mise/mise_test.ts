@@ -2186,3 +2186,23 @@ Deno.test("a sweep never offers the agent or a display to a remote host", () => 
   assertEquals(sshOpt(a, "ForwardX11Trusted"), "no");
   assertEquals(sshOpt(a, "ClearAllForwardings"), "yes");
 });
+
+Deno.test("a tool whose outdated entry was malformed is unmeasured, not current", () => {
+  // outdated is read by asking whether a tool is a key in the map, so a
+  // dropped entry fell out of the map and came back as "not outdated":
+  // absence read as health, one level below where that was already being
+  // prevented.
+  const sink = { dropped: 0, unmeasuredTools: new Set<string>() };
+  const outdated = parseOutdated(
+    '{"node":{"latest":"22.2.0"},"python":{"latest":7}}',
+    sink,
+  );
+  assertEquals(Object.hasOwn(outdated, "node"), true);
+  assertEquals(Object.hasOwn(outdated, "python"), false);
+  assertEquals(sink.unmeasuredTools.has("python"), true);
+  assertEquals(
+    sink.unmeasuredTools.has("node"),
+    false,
+    "a tool that answered is not marked unmeasured",
+  );
+});
