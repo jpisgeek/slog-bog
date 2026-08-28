@@ -2761,3 +2761,18 @@ Deno.test("ssh refuses to reuse a multiplexed connection", () => {
   assertEquals(sshOpt(a, "ControlMaster"), "no");
   assertEquals(sshOpt(a, "ControlPath"), "none");
 });
+
+Deno.test("a credential-bearing node label is refused at parse time", () => {
+  // A label is operator config rather than remote input, which is why it was
+  // exempt -- but it is the most widely published value this model handles:
+  // resource data, resource names, a tag on every row, and log lines.
+  const ok = (name: string) =>
+    GlobalArgsSchema.safeParse({ nodes: [{ name }] }).success;
+  assertEquals(ok("workstation"), true);
+  assertEquals(ok("web-server-01"), true);
+  assertEquals(ok("https://u:p@git.internal/x"), false);
+  assertEquals(ok("GITHUB_TOKEN=ghp_abc123"), false);
+  // Refused, not silently renamed: a renamed node would scatter its history
+  // across two identities, and unlike a host's answer this is something the
+  // operator can just rewrite.
+});

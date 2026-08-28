@@ -311,6 +311,17 @@ const NodeLabelSchema = z
   .max(MAX_SLUG_CHARS)
   .refine((v) => printableRemoteText(v) === v, {
     message: "name must not contain terminal control characters",
+  })
+  // Screened the same way a host's strings are. A label is operator config
+  // rather than remote input, which is why it was exempt -- but it is the
+  // single most widely published value this model handles: it reaches
+  // resource data, resource names, tags on every row, and log lines, and
+  // none of the host-facing screening ever saw it. Refused at parse time
+  // rather than dropped, because unlike a host's answer this is something
+  // the operator can simply rewrite, and a silently renamed node would
+  // scatter its history across two identities.
+  .refine((v) => safeRemoteString(v) !== null, {
+    message: "name must not look like a credential or a URL carrying one",
   });
 
 export const NodeSchema = z.object({
