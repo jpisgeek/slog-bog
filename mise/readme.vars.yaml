@@ -118,7 +118,16 @@ security: >-
   `StrictHostKeyChecking=yes` on the command line, so an unknown host key fails
   closed. BatchMode alone would not do that: it removes the prompt but leaves
   the decision to ambient ssh_config, which can be set to accept a key it has
-  never seen, and passing the policy as an argument beats any config file.
+  never seen, and passing the policy as an argument beats any config file. The
+  same reasoning applies to what the connection hands the host rather than what
+  it trusts about it: `ForwardAgent`, `ForwardX11`, `ForwardX11Trusted` and
+  `ClearAllForwardings` are all set on the command line too. ssh inherits
+  ambient config, and a `ForwardAgent` in the operator's `~/.ssh/config` --
+  perfectly ordinary to have there for hosts you use interactively -- would
+  otherwise expose the authentication agent to every host this model sweeps.
+  An agent socket on a remote box signs for the key it holds, which for a fleet
+  key is every host that trusts it. A read-only inventory probe has no business
+  offering that.
   Errors never quote host output by default. stderr is read to classify a
   failure and then discarded; what is stored in `error` is one of a closed set
   of codes, `unparseable-output` among them for a host that exits zero without

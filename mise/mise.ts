@@ -506,6 +506,23 @@ export function sshArgs(
     // than the operator's environment's.
     "-o",
     "StrictHostKeyChecking=yes",
+    // Same reasoning, applied to what this connection hands the remote host
+    // rather than what it trusts about it. ssh inherits ambient config, so a
+    // ForwardAgent in the operator's ~/.ssh/config -- a perfectly ordinary
+    // thing to have there for hosts you use interactively -- would expose
+    // the authentication agent to every host this model sweeps. An agent
+    // socket on a remote box can sign for the key it holds, which for a
+    // fleet key is every host that trusts it. A read-only inventory probe
+    // has no business offering that, so all four forwardings are refused on
+    // the command line where no config file can put them back.
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "ForwardX11Trusted=no",
+    "-o",
+    "ClearAllForwardings=yes",
     "-o",
     `ConnectTimeout=${Math.min(timeoutSec, 10)}`,
     "-p",
@@ -897,7 +914,15 @@ export function safeRemoteString(v: unknown): string | null {
 function safeDetail(text: string): string | undefined {
   const printable = printableRemoteText(text).trim();
   if (printable === "") return undefined;
-  const kept = printable
+  // Whole-string pass first, before tokenizing. `password = swordfish` is
+  // three whitespace-separated tokens and no single one of them is an
+  // assignment, so per-token screening walked straight past it. Here the
+  // assignment and whatever follows it are replaced together.
+  const deassigned = printable.replace(
+    /\b(token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\b\s*[=:]\s*\S+/gi,
+    "$1=[withheld]",
+  );
+  const kept = deassigned
     .split(/(\s+)/)
     .map((tok) =>
       (/\s/.test(tok) || safeRemoteString(tok) !== null) ? tok : "[withheld]"

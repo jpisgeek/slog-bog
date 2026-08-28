@@ -2149,3 +2149,15 @@ Deno.test("misePath has to name a mise binary", () => {
   assertEquals(ok("/bin/sh"), false);
   assertEquals(ok("/usr/bin/curl"), false);
 });
+
+Deno.test("a sweep never offers the agent or a display to a remote host", () => {
+  // ssh inherits ambient config. A ForwardAgent in the operator's ~/.ssh/config
+  // -- ordinary to have there for hosts you use interactively -- would put the
+  // authentication agent on every host this model sweeps, where it can sign
+  // for the key it holds.
+  const a = sshArgs({ host: "h", user: "u", port: 22 }, 10, "mise ls");
+  assertEquals(sshOpt(a, "ForwardAgent"), "no");
+  assertEquals(sshOpt(a, "ForwardX11"), "no");
+  assertEquals(sshOpt(a, "ForwardX11Trusted"), "no");
+  assertEquals(sshOpt(a, "ClearAllForwardings"), "yes");
+});
