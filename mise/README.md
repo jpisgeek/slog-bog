@@ -179,47 +179,51 @@ passes both `BatchMode=yes` and `StrictHostKeyChecking=yes` on the command line,
 so an unknown host key fails closed. BatchMode alone would not do that: it
 removes the prompt but leaves the decision to ambient ssh_config, which can be
 set to accept a key it has never seen, and passing the policy as an argument
-beats any config file. The same reasoning applies to what the connection hands
-the host rather than what it trusts about it: `ForwardAgent`, `ForwardX11`,
-`ForwardX11Trusted` and `ClearAllForwardings` are all set on the command line
-too. ssh inherits ambient config, and a `ForwardAgent` in the operator's
-`~/.ssh/config` -- perfectly ordinary to have there for hosts you use
-interactively -- would otherwise expose the authentication agent to every host
-this model sweeps. An agent socket on a remote box signs for the key it holds,
-which for a fleet key is every host that trusts it. A read-only inventory probe
-has no business offering that. Errors never quote host output by default. stderr
-is read to classify a failure and then discarded; what is stored in `error` is
-one of a closed set of codes, `unparseable-output` among them for a host that
-exits zero without the JSON its subcommand promises. The `errorDetail` option
-turns that off and stores a bounded excerpt of the host's own text beside the
-code, for a private fleet whose datastore you own and need to debug. It covers
-unmeasured hosts only -- the probe that decides whether a host answered at all.
-A host that answered and then lost a follow-up probe is degraded rather than
-unmeasured, and names that probe in `failedSubcommands` instead of storing its
-text, so `errorDetail` on such a node is null even with the option on. It is off
-by default and should stay off wherever the datastore is shared, because host
-error text routinely carries credential-bearing URLs, tokens, private hostnames
-and home paths. The trade is real either way: with it off, a failure nobody
-wrote a pattern for reads as `unclassified` and the detail that would explain it
-is gone. Quoting even a truncated excerpt would publish whatever the host
-happened to print, which routinely includes URLs carrying credentials. Written
-data: host labels, the measured directory, mise version, tool names and
-versions, install paths, tool source types and source paths, and config file
-paths. Install and config paths embed the remote account's home directory and
-real project directory names. A source path is whatever registry or repository a
-tool came from, so it can name a private repository URL, an internal domain,
-Some of it also appears in readable form outside the resource data itself, and
-it is worth knowing exactly which: resource NAMES carry the host label, the tool
-name, and the config path; TAGS carry the host label, the tool name, the
-transport, and the measured, degraded and drift states. Install paths, source
-paths and versions appear in the data only. Credential-bearing values are
-withheld before any of that: a source or install URL carrying a username, a
-password, a query or a fragment is dropped rather than redacted, and a tool name
-or config path that screens the same way takes its whole entry with it.
-Screening is a set of shape rules, not a proof -- it catches the forms a
-credential usually takes, and a secret shaped like an ordinary path will pass.
-What remains is infrastructure detail regardless. Treat the datastore, and the
-sweep logs alongside it, as infrastructure-sensitive.
+beats any config file. `ProxyCommand` and `PermitLocalCommand` are set on the
+command line for the same reason and are the sharper case: both run a shell
+command, and ssh expands `%h` and `%u` into them, so an operator config written
+for interactive use would turn every value in the node list into local shell
+input. The same reasoning applies to what the connection hands the host rather
+than what it trusts about it: `ForwardAgent`, `ForwardX11`, `ForwardX11Trusted`
+and `ClearAllForwardings` are all set on the command line too. ssh inherits
+ambient config, and a `ForwardAgent` in the operator's `~/.ssh/config` --
+perfectly ordinary to have there for hosts you use interactively -- would
+otherwise expose the authentication agent to every host this model sweeps. An
+agent socket on a remote box signs for the key it holds, which for a fleet key
+is every host that trusts it. A read-only inventory probe has no business
+offering that. Errors never quote host output by default. stderr is read to
+classify a failure and then discarded; what is stored in `error` is one of a
+closed set of codes, `unparseable-output` among them for a host that exits zero
+without the JSON its subcommand promises. The `errorDetail` option turns that
+off and stores a bounded excerpt of the host's own text beside the code, for a
+private fleet whose datastore you own and need to debug. It covers unmeasured
+hosts only -- the probe that decides whether a host answered at all. A host that
+answered and then lost a follow-up probe is degraded rather than unmeasured, and
+names that probe in `failedSubcommands` instead of storing its text, so
+`errorDetail` on such a node is null even with the option on. It is off by
+default and should stay off wherever the datastore is shared, because host error
+text routinely carries credential-bearing URLs, tokens, private hostnames and
+home paths. The trade is real either way: with it off, a failure nobody wrote a
+pattern for reads as `unclassified` and the detail that would explain it is
+gone. Quoting even a truncated excerpt would publish whatever the host happened
+to print, which routinely includes URLs carrying credentials. Written data: host
+labels, the measured directory, mise version, tool names and versions, install
+paths, tool source types and source paths, and config file paths. Install and
+config paths embed the remote account's home directory and real project
+directory names. A source path is whatever registry or repository a tool came
+from, so it can name a private repository URL, an internal domain, Some of it
+also appears in readable form outside the resource data itself, and it is worth
+knowing exactly which: resource NAMES carry the host label, the tool name, and
+the config path; TAGS carry the host label, the tool name, the transport, and
+the measured, degraded and drift states. Install paths, source paths and
+versions appear in the data only. Credential-bearing values are withheld before
+any of that: a source or install URL carrying a username, a password, a query or
+a fragment is dropped rather than redacted, and a tool name or config path that
+screens the same way takes its whole entry with it. Screening is a set of shape
+rules, not a proof -- it catches the forms a credential usually takes, and a
+secret shaped like an ordinary path will pass. What remains is infrastructure
+detail regardless. Treat the datastore, and the sweep logs alongside it, as
+infrastructure-sensitive.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

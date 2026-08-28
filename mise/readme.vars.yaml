@@ -127,7 +127,12 @@ security: >-
   `StrictHostKeyChecking=yes` on the command line, so an unknown host key fails
   closed. BatchMode alone would not do that: it removes the prompt but leaves
   the decision to ambient ssh_config, which can be set to accept a key it has
-  never seen, and passing the policy as an argument beats any config file. The
+  never seen, and passing the policy as an argument beats any config file.
+  `ProxyCommand` and `PermitLocalCommand` are set on the command line for the
+  same reason and are the sharper case: both run a shell command, and ssh
+  expands `%h` and `%u` into them, so an operator config written for
+  interactive use would turn every value in the node list into local shell
+  input. The
   same reasoning applies to what the connection hands the host rather than what
   it trusts about it: `ForwardAgent`, `ForwardX11`, `ForwardX11Trusted` and
   `ClearAllForwardings` are all set on the command line too. ssh inherits

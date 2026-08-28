@@ -239,8 +239,13 @@ Deno.test("ssh flags fail closed and never spawn a local shell", () => {
   assertEquals(args[args.length - 2], "reader@host.example.com");
   assertEquals(args[args.length - 1], "mise ls --current --json");
   assertEquals(args.includes("2222"), true);
-  // Nothing that could reach a local shell.
-  assertEquals(args.some((a) => a.includes("ProxyCommand")), false);
+  // Nothing that could reach a local shell. Not merely "we do not pass one":
+  // ProxyCommand and LocalCommand are ambient directives that run a shell
+  // command, and ssh expands %h and %u into them, so an operator config
+  // written for interactive use would turn every value in this model's node
+  // list into local shell input. Both are refused on the command line.
+  assertEquals(sshOpt(args, "ProxyCommand"), "none");
+  assertEquals(sshOpt(args, "PermitLocalCommand"), "no");
 });
 
 Deno.test("an unknown host key is never accepted on the ssh command line", () => {
@@ -2406,11 +2411,16 @@ Deno.test("scp-style and scheme-relative locations are screened too", () => {
   }
 });
 
-Deno.test("an unmeasured host does not hold another host's stale rows", async () => {
+Deno.test("a record that cannot be attributed to one node is held, not deleted", async () => {
   // Both slugs may contain the separator, so `tool-web-` is a prefix of a
-  // record belonging to `web` and of one belonging to `web-server`. The
-  // unmeasured host used to hold the other's rows indefinitely, leaving
-  // stored data that contradicts the sweep.
+  // record belonging to `web` and of one belonging to `web-server`, and the
+  // hash covers the pair rather than the node, so there is nothing in the
+  // name to break the tie. Longest-match was the first answer and it is
+  // wrong in the other direction: a row belonging to `web` whose tool slug
+  // begins with `server-` matches `tool-web-server-` more specifically and
+  // would be handed to the wrong node -- and then deleted. Keeping a stale
+  // row is recoverable by the next sweep that can attribute it. Deleting a
+  // live one is not.
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
     const stale = "tool-web-server-ruby-" + "0".repeat(64);
@@ -2426,9 +2436,9 @@ Deno.test("an unmeasured host does not hold another host's stale rows", async ()
     await model.methods.discover.execute({}, c.ctx);
     assertEquals(
       c.deleted.includes(stale),
-      true,
-      "web-server answered, so its departed row is gone even though " +
-        "unmeasured `web` shares its name prefix",
+      false,
+      "the row matches both configured nodes, so it is held rather than " +
+        "attributed to a guess",
     );
   } finally {
     await m.cleanup();
@@ -2503,4 +2513,47 @@ Deno.test("a URL-shaped value that will not parse fails closed", () => {
     safeRemoteString("registry.internal:5000/image"),
     "registry.internal:5000/image",
   );
+});
+
+Deno.test("escaping is injective, so two tools cannot become one", () => {
+  // The escape did not escape its own introducer, so a tool whose name
+  // contains a real newline and a tool literally named "\\u000a" rendered
+  // as the same string -- same resource name, same identity hash, one
+  // silently overwriting the other.
+  const rows = parseLsCurrent(
+    JSON.stringify({
+      "a\nb": [{ installed: true, active: true, version: "1.0.0" }],
+      "a\\u000ab": [{ installed: true, active: true, version: "2.0.0" }],
+    }),
+  );
+  assertEquals(rows.length, 2);
+  assertEquals(
+    rows[0].tool === rows[1].tool,
+    false,
+    "distinct inputs must stay distinct after escaping",
+  );
+});
+
+Deno.test("a repeated config path is counted, not silently overwritten", () => {
+  // Two rows under one resource name: the second overwrites the first while
+  // both are counted in the summary, so the data and the total disagree.
+  const sink = { dropped: 0 };
+  const cfgs = parseConfigLs(
+    '[{"path":"/etc/mise.toml","tools":["node"]},' +
+      '{"path":"/etc/mise.toml","tools":["python"]}]',
+    sink,
+  );
+  assertEquals(cfgs.length, 1);
+  assertEquals(cfgs[0].tools, ["node"], "the first reading wins");
+  assertEquals(sink.dropped, 1, "and the repeat marks the host degraded");
+});
+
+Deno.test("ssh host and user are held to hostname and username shapes", () => {
+  const ok = (ssh: Record<string, unknown>) =>
+    GlobalArgsSchema.safeParse({ nodes: [{ name: "a", ssh }] }).success;
+  assertEquals(ok({ host: "h.example.com", user: "reader" }), true);
+  // An @ or : inside either silently changes which host is contacted.
+  assertEquals(ok({ host: "h.example.com", user: "u@elsewhere" }), false);
+  assertEquals(ok({ host: "a@b.example.com", user: "u" }), false);
+  assertEquals(ok({ host: "-oProxyCommand=x", user: "u" }), false);
 });

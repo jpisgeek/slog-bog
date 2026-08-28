@@ -190,6 +190,15 @@ function printableRemoteText(value: string): string {
     if (UNSAFE_TEXT_RE.test(char)) {
       const cp = char.codePointAt(0) ?? 0;
       printable += `\\u${cp.toString(16).padStart(4, "0")}`;
+    } else if (char === "\\") {
+      // The escape has to escape its own introducer or it is not injective,
+      // and this one is used to build resource NAMES. A tool whose name
+      // contains a real newline and a tool literally named "\\u000a" both
+      // rendered as the same string, so they shared a resource name and an
+      // identity hash: one silently overwrote the other, and the datastore
+      // reported one tool where there were two. Doubling the backslash makes
+      // the mapping reversible, so distinct inputs stay distinct.
+      printable += "\\\\";
     } else {
       printable += char;
     }
@@ -252,11 +261,18 @@ export function remoteErrorCode(value: string): RemoteErrorCode {
 const SshSchema = z.object({
   // host/user become the positional `user@host` argument to ssh. A value
   // starting with "-" would be read as an ssh option (-oProxyCommand=...).
-  host: z.string().min(1).refine((v) => !v.startsWith("-"), {
-    message: "ssh.host must not start with '-'",
+  // Refusing a leading dash stops either being read as an option. These
+  // charsets are the rest of the answer: neither reaches a shell here, but
+  // both are interpolated into a destination that ssh itself parses, and an
+  // `@` or a `:` inside one silently changes which host is contacted. Held
+  // to what a hostname and a username can actually contain.
+  host: z.string().min(1).max(253).regex(/^[A-Za-z0-9]([A-Za-z0-9._-]*)$/, {
+    message: "ssh.host must be a hostname: letters, digits, dot, dash, " +
+      "underscore, and must not start with '-'",
   }),
-  user: z.string().min(1).refine((v) => !v.startsWith("-"), {
-    message: "ssh.user must not start with '-'",
+  user: z.string().min(1).max(64).regex(/^[A-Za-z0-9_][A-Za-z0-9._-]*$/, {
+    message: "ssh.user must be a username: letters, digits, dot, dash, " +
+      "underscore, and must not start with '-'",
   }),
   port: z.number().int().positive().default(22),
 });
@@ -561,6 +577,16 @@ export function sshArgs(
     // fleet key is every host that trusts it. A read-only inventory probe
     // has no business offering that, so all four forwardings are refused on
     // the command line where no config file can put them back.
+    // ProxyCommand and LocalCommand are the two ambient directives that run
+    // a shell command, and ssh expands %h and %u into them -- so an operator
+    // config written for interactive use turns every value in this model's
+    // node list into shell input on the local machine. Same class as the
+    // forwardings below, and the same answer: state it on the command line,
+    // where no config file can put it back.
+    "-o",
+    "ProxyCommand=none",
+    "-o",
+    "PermitLocalCommand=no",
     "-o",
     "ForwardAgent=no",
     "-o",
@@ -1214,6 +1240,7 @@ export function parseConfigLs(
   const arr = parseJsonArray(json);
   if (arr === null) return [];
   const out: { path: string; tools: string[] }[] = [];
+  const seen = new Set<string>();
   for (const raw of arr) {
     // Validated, not cast. The cast let a number or null through and then
     // read `.path` off it, which is undefined rather than an error.
@@ -1224,6 +1251,16 @@ export function parseConfigLs(
     }
     const path = safeRemoteKey(parsed.data.path, sink);
     if (path === null) continue;
+    // A repeated path is two rows that will be written under one resource
+    // name, so the second silently overwrites the first while both are
+    // counted in the summary -- contradictory data and a total that does
+    // not match it. The first wins and the repeat is counted as a drop,
+    // which marks the host degraded and says the reading is partial.
+    if (seen.has(path)) {
+      noteDrop(sink);
+      continue;
+    }
+    seen.add(path);
     // A declared tool name becomes a tag, so it is screened the same way. A
     // dropped name is counted: the config still parsed, but the list of what
     // it declares is now short, and a short list reads as "declares less".
@@ -1553,15 +1590,22 @@ function nodePrefix(prefix: string, node: string): string {
  * exactly what the prune is for.
  */
 function holdsRecord(prefixHeld: Map<string, boolean>, name: string): boolean {
-  let best = "";
-  let held = false;
+  const matches: boolean[] = [];
   for (const [prefix, isHeld] of prefixHeld) {
-    if (name.startsWith(prefix) && prefix.length > best.length) {
-      best = prefix;
-      held = isHeld;
-    }
+    if (name.startsWith(prefix)) matches.push(isHeld);
   }
-  return best !== "" && held;
+  if (matches.length === 0) return false;
+  // One match is an unambiguous attribution: that node's state decides.
+  if (matches.length === 1) return matches[0];
+  // More than one and the record cannot be attributed at all. Longest-match
+  // was the first answer here and it is wrong in the other direction: a row
+  // belonging to node `web` whose tool slug begins with `server-` matches
+  // `tool-web-server-` too, and more specifically, so it would be handed to
+  // the wrong node. There is nothing in the name to break the tie -- the
+  // hash covers the pair, not the node alone. So an ambiguous record is
+  // held. Keeping a stale row is recoverable by the next sweep that can
+  // attribute it; deleting a live one is not.
+  return true;
 }
 
 /**
