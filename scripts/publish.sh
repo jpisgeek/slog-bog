@@ -15,7 +15,8 @@
 # Environment:
 #   SLOG_BOG_DENYLIST   path to the private identifier denylist (outside the
 #                       repo). Strongly recommended; warns if unset.
-#   REVIEW_MODEL        model for the security review (default claude-fable-5)
+#   REVIEW_MODEL        model for the security review
+#                       (default gpt-daybreak-blue-latest, via `codex exec`)
 #
 # Gates, in order:
 #   1 swamp extension fmt --check
@@ -23,7 +24,7 @@
 #   3 swamp extension quality
 #   4 gen-readme.ts --check           README equals the generated one
 #   5 scan-identifiers.sh             generic rules + private denylist
-#   6 security review                 Fable pass → reviews/<name>/<hash>.md, must be PASS
+#   6 security review                 codex pass → reviews/<name>/<hash>.md, must be PASS
 #   7 swamp extension push --dry-run  (built-in adversarial review forced fresh)
 #   8 STOP for operator approval, then push
 set -euo pipefail
@@ -52,7 +53,7 @@ done
 
 manifest="$name/manifest.yaml"
 [ -f "$manifest" ] || { echo "no manifest at $manifest" >&2; exit 2; }
-model="${REVIEW_MODEL:-claude-fable-5}"
+model="${REVIEW_MODEL:-gpt-daybreak-blue-latest}"
 # Read once, up front: the publish summary (gate 8) needs these even when the
 # review branch is skipped because a PASS verdict is already on file.
 version="$(grep -m1 -E '^version:' "$manifest" | sed 's/version:[[:space:]]*//' | tr -d '"'"'"'')"
@@ -95,12 +96,24 @@ step "6/8 secrets & security review ($model)"
 hash="$(deno run --allow-read scripts/content-hash.ts "$manifest")"
 verdict="reviews/$name/$hash.md"
 mkdir -p "reviews/$name"
+# A verdict is keyed on the content hash, so an unchanged extension keeps the
+# verdict it already has. That is deliberate policy, not merely a saved API
+# call. The security reviewer changed from claude-fable-5 to
+# gpt-daybreak-blue-latest on 2026-08-28, and the ruling was that existing
+# verdicts stand for the versions they were bound to: those exact bytes were
+# reviewed by what was the gate of record at the time, and re-reviewing
+# already-published code changes nothing about what is already public.
+#
+# Any NEW content hash gets the new reviewer. Change one byte of a published
+# extension and it is reviewed afresh -- that is the property that matters,
+# and it is why the cache is keyed on content rather than on version.
 if [ -f "$verdict" ]; then
   echo "verdict already on file for ${hash:0:12}…: $verdict"
 elif [ "$skip_review" -eq 1 ]; then
   echo "--skip-review given but no verdict exists for ${hash:0:12}…" >&2; exit 1
 else
-  command -v claude >/dev/null || { echo "claude CLI not found" >&2; exit 1; }
+  command -v codex >/dev/null || { echo "codex CLI not found" >&2; exit 1; }
+  prompt="$(mktemp)"
   {
     cat review/secrets-security-pass.md
     printf '\n\n# INPUT\nextension: %s\nversion: %s\ncontent-hash: %s\ndate: %s\n\n' \
@@ -108,7 +121,15 @@ else
     for f in "${published[@]}"; do
       printf '=== FILE: %s ===\n' "$f"; cat "$f"; printf '\n=== END FILE ===\n\n'
     done
-  } | claude -p --model "$model" --output-format text > "$verdict.tmp"
+  } > "$prompt"
+  # -o writes ONLY the model's final message. Without it the whole transcript
+  # -- hook lines, token counts, ANSI -- lands in the committed verdict, and
+  # the PASS grep below would be matching against decoration rather than a
+  # verdict. --cd is required because codex exec refuses to run outside a
+  # trusted git directory.
+  codex exec --model "$model" --cd "$root" -o "$verdict.tmp" - < "$prompt" >/dev/null
+  rm -f "$prompt"
+  [ -s "$verdict.tmp" ] || { echo "review produced no output" >&2; rm -f "$verdict.tmp"; exit 1; }
   mv "$verdict.tmp" "$verdict"
   echo "wrote $verdict"
 fi
@@ -122,7 +143,7 @@ fi
 [ "$review_only" -eq 1 ] && { echo "--review-only: stopping after the review."; exit 0; }
 
 step "7/8 swamp extension push --dry-run"
-# Our gate of record is the Fable verdict in reviews/ (gate 6, PASS above),
+# Our gate of record is the security verdict in reviews/ (gate 6, PASS above),
 # which is a stricter superset of swamp's built-in adversarial-review
 # dimensions. swamp still emits a "no adversarial-review report recorded"
 # warning of its own; per swamp's docs that is NOT a hard block, it is a

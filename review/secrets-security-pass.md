@@ -19,6 +19,33 @@ delimited as:
 If a file the manifest publishes is missing from your input, the review is
 **FAIL (incomplete input)**. Do not grade what you were not shown.
 
+## Accepted decisions. Do NOT report these as findings
+
+These are settled, deliberate choices by the operator. Reporting them wastes a
+review cycle re-litigating a decision that has already been made, and a gate
+that blocks on accepted policy trains people to override the gate -- which is
+worse than having no gate.
+
+This is a CLOSED list. It is not a general licence to publish identity, and
+everything in section 1 still applies to anything not named here.
+
+- **The publisher's name in `LICENSE`.** Copyright requires a legal identity.
+  It is in every extension's LICENSE on purpose.
+- **The publishing handle and package scope** (`@<handle>/<name>`). This is a
+  public registry identity; publishing under it is the entire point.
+- **The public repository name and its `repository:` URLs.** The repo is public
+  by design. A URL pointing at the public repo is not a leak.
+- **Product and vendor names that ARE the extension** -- the thing an extension
+  integrates with must be nameable, or it cannot be described or found.
+
+What remains a finding, and the distinction that matters: the operator's
+*infrastructure* is still off limits. Real hostnames, machine names, private
+domains and subdomains, local filesystem paths, secret-store item names, LAN
+addresses, account and tenant IDs. The published identity of a publisher is
+public; the private identity of their fleet is not. If you are unsure which
+side a string falls on, report it -- a false positive costs a sentence, a
+false negative costs a disclosure.
+
 ## What to attack
 
 Work through every section. For each, look at code, comments, string literals,
@@ -120,7 +147,7 @@ tells the user so. Flag any write that could include a secret.
 # Secrets & Security Review
 extension: <name>            version: <manifest version>
 content-hash: <sha256 given in the input>
-reviewer: claude-fable-5      date: <YYYY-MM-DD>
+reviewer: <the model that produced this verdict>   date: <YYYY-MM-DD>
 verdict: PASS | FAIL | FAIL (incomplete input)   <- this exact line, plain
                                                     text: no bold, no extra
                                                     words, never omitted

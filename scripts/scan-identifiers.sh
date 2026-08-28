@@ -2,7 +2,7 @@
 # scan-identifiers.sh — mechanical pre-filter for private/identifying content
 # on the published surface of a swamp extension.
 #
-# This is NOT the gate of record (that is the Fable secrets & security pass in
+# This is NOT the gate of record (that is the secrets & security pass in
 # review/secrets-security-pass.md). It exists to fail fast and cheaply on the
 # things a regex can catch, so a review is never spent on an obvious leak.
 #
