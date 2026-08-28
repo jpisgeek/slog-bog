@@ -2047,3 +2047,68 @@ Deno.test("safeRemoteKey screens the same shapes as safeRemoteString", () => {
   assertEquals(safeRemoteKey("", sink), null);
   assertEquals(sink.dropped, 2);
 });
+
+Deno.test("screening keeps ordinary values and drops credential-bearing ones", () => {
+  // Both halves matter equally. A screen that drops real install paths makes
+  // the model useless, and one that keeps a token makes it dangerous.
+  const keep = [
+    "/opt/homebrew/bin/node",
+    "/Users/alice/.local/share/mise/installs/node/22.1.0/bin/node",
+    "https://nodejs.org/dist/v22.1.0/node-v22.1.0-darwin-arm64.tar.gz",
+    "/nix/store/9zm3s1kqlp0v5hbc7d8xj2wq4nf6rytg-node-22.1.0/bin/node",
+    "core:node",
+    "22.1.0",
+  ];
+  for (const v of keep) {
+    assertEquals(safeRemoteString(v), v, `must survive screening: ${v}`);
+  }
+  const drop = [
+    "https://deploybot@git.internal/x.git",
+    "https://u:p@reg.internal/n.tgz",
+    "https://reg.internal/n.tgz?sv=2024",
+    // Wrapped in punctuation: the anchored form never saw this one.
+    "(https://tok@reg.internal/n.tgz)",
+    "fetched from https://a:b@h/x and failed",
+    // A bare assignment with no URL separator in front of it.
+    "token=aX9fQ2LmZ",
+    "api_key: 8f3a9c",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    // Spacing changed inside the header.
+    "-----BEGIN  RSA  PRIVATE  KEY-----",
+    // A bare key with nothing around it to name it.
+    "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+  ];
+  for (const v of drop) {
+    assertEquals(safeRemoteString(v), null, `must be withheld: ${v}`);
+  }
+});
+
+Deno.test("a version must be a version all the way through", () => {
+  // Unanchored, "1evil" matched its leading digit, was accepted, and kept
+  // the host off the degraded list -- the opposite of what the check is for.
+  assertEquals(parseVersion("1evil"), null);
+  assertEquals(parseVersion("2025.1.0-rc1 macos"), "2025.1.0-rc1");
+  assertEquals(parseVersion("2025.1.0"), "2025.1.0");
+  assertEquals(parseVersion("mise 2025.1.0"), null);
+});
+
+Deno.test("an ls entry missing the measurement is not a measured tool", () => {
+  // `{}` used to parse into a row saying not-installed, not-active, null
+  // versions -- a complete-looking reading of a host that said nothing.
+  const sink = { dropped: 0 };
+  const rows = parseLsCurrent(
+    '{"a":[{}],"b":[{"installed":true,"active":true,"version":"1.0.0"}]}',
+    sink,
+  );
+  assertEquals(rows.map((r) => r.tool), ["b"]);
+  assertEquals(sink.dropped, 1);
+});
+
+Deno.test("a tool declared but never installed is still a measurement", () => {
+  // The other half: absent version and path are what mise genuinely returns
+  // for a declared-but-uninstalled tool, and that absence is the finding.
+  const rows = parseLsCurrent('{"a":[{"installed":false,"active":false}]}');
+  assertEquals(rows.length, 1);
+  assertEquals(rows[0].resolvedVersion, null);
+  assertEquals(rows[0].installPath, null);
+});

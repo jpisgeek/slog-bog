@@ -57,7 +57,11 @@ caveats: >-
   trust line, a name that screens as credential-bearing. Those are counted in
   `droppedEntries` rather than dropped in silence, and any count above zero
   marks the host degraded too. While `nodesDegraded` is above zero, read the
-  drift totals as a floor rather than as everything there is to find.
+  drift totals as a floor rather than as everything there is to find. The
+  summary goes one step further and refuses to add up totals it cannot stand
+  behind: `outdated` and `configsNotInEffect` are null, not zero, whenever any
+  host's contributing probe went unanswered. Zero is a fleet with no drift of
+  that kind; null is a fleet where some of it was never measured.
   Tool rows carry the same flag as a `degraded` tag, so a query over
   rows alone cannot mistake a partial sweep for a clean one.
   mise config is directory-scoped, so `dir` decides which config is being
@@ -113,7 +117,9 @@ security: >-
   the decision to ambient ssh_config, which can be set to accept a key it has
   never seen, and passing the policy as an argument beats any config file.
   Errors never quote host output by default. stderr is read to classify a
-  failure and then discarded; what is stored is one of a closed set of codes.
+  failure and then discarded; what is stored in `error` is one of a closed set
+  of codes, `unparseable-output` among them for a host that exits zero without
+  the JSON its subcommand promises.
   The `errorDetail` option turns that off and stores a bounded excerpt of the
   host's own text beside the code, for a private fleet whose datastore you own
   and need to debug. It is off by default and should stay off wherever the

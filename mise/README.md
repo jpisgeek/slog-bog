@@ -114,32 +114,36 @@ malformed tool row, an unreadable trust line, a name that screens as
 credential-bearing. Those are counted in `droppedEntries` rather than dropped in
 silence, and any count above zero marks the host degraded too. While
 `nodesDegraded` is above zero, read the drift totals as a floor rather than as
-everything there is to find. Tool rows carry the same flag as a `degraded` tag,
-so a query over rows alone cannot mistake a partial sweep for a clean one. mise
-config is directory-scoped, so `dir` decides which config is being judged. Leave
-it off and you measure the swamp working directory locally and the login
-directory over SSH, which is rarely the question you meant to ask. The node
-record's `dir` field names the directory the reading actually came from, so what
-a sweep judged is never left to guesswork. It is null in two cases: an ssh node
-with no `dir` set, where the reading comes from wherever the login lands, and a
-local node whose working directory could not be read, which is what a deleted
-working directory looks like. Trust is recorded but never treated as drift. A
-plain `[tools]` file reports as untrusted while applying perfectly, because mise
-only demands trust for configs that can execute something. `expect` can only
-police tools a host's own config declares. Hold the fleet to `{node: "22"}` and
-a host whose config never mentions node records no `expected` drift at all,
-which is not the same as passing. A tool no config on that host declares
-produces no record for that host at all, so its absence is invisible in the
-drift counts rather than surfacing under some other class. To hold a host to a
-tool, the tool has to be in that host's config. A full sweep deletes every
-stored record it did not write that time, so dropping a host from `nodes`
-removes its node record along with its tool and config rows. A run limited to
-one node with `--node` is a diagnostic and touches only that host. It deletes
-nothing, and it does not write the `summary` either, because one host's totals
-under a fleet-wide name would read as the fleet. The standing summary keeps its
-own `sweptAt`, which is the honest way to see how old it is. Node, tool, and
-config resource names all carry a hash suffix, so find them with
-`swamp data list <model>` rather than building the name by hand.
+everything there is to find. The summary goes one step further and refuses to
+add up totals it cannot stand behind: `outdated` and `configsNotInEffect` are
+null, not zero, whenever any host's contributing probe went unanswered. Zero is
+a fleet with no drift of that kind; null is a fleet where some of it was never
+measured. Tool rows carry the same flag as a `degraded` tag, so a query over
+rows alone cannot mistake a partial sweep for a clean one. mise config is
+directory-scoped, so `dir` decides which config is being judged. Leave it off
+and you measure the swamp working directory locally and the login directory over
+SSH, which is rarely the question you meant to ask. The node record's `dir`
+field names the directory the reading actually came from, so what a sweep judged
+is never left to guesswork. It is null in two cases: an ssh node with no `dir`
+set, where the reading comes from wherever the login lands, and a local node
+whose working directory could not be read, which is what a deleted working
+directory looks like. Trust is recorded but never treated as drift. A plain
+`[tools]` file reports as untrusted while applying perfectly, because mise only
+demands trust for configs that can execute something. `expect` can only police
+tools a host's own config declares. Hold the fleet to `{node: "22"}` and a host
+whose config never mentions node records no `expected` drift at all, which is
+not the same as passing. A tool no config on that host declares produces no
+record for that host at all, so its absence is invisible in the drift counts
+rather than surfacing under some other class. To hold a host to a tool, the tool
+has to be in that host's config. A full sweep deletes every stored record it did
+not write that time, so dropping a host from `nodes` removes its node record
+along with its tool and config rows. A run limited to one node with `--node` is
+a diagnostic and touches only that host. It deletes nothing, and it does not
+write the `summary` either, because one host's totals under a fleet-wide name
+would read as the fleet. The standing summary keeps its own `sweptAt`, which is
+the honest way to see how old it is. Node, tool, and config resource names all
+carry a hash suffix, so find them with `swamp data list <model>` rather than
+building the name by hand.
 
 ## Security
 
@@ -167,28 +171,30 @@ closed. BatchMode alone would not do that: it removes the prompt but leaves the
 decision to ambient ssh_config, which can be set to accept a key it has never
 seen, and passing the policy as an argument beats any config file. Errors never
 quote host output by default. stderr is read to classify a failure and then
-discarded; what is stored is one of a closed set of codes. The `errorDetail`
-option turns that off and stores a bounded excerpt of the host's own text beside
-the code, for a private fleet whose datastore you own and need to debug. It is
-off by default and should stay off wherever the datastore is shared, because
-host error text routinely carries credential-bearing URLs, tokens, private
-hostnames and home paths. The trade is real either way: with it off, a failure
-nobody wrote a pattern for reads as `unclassified` and the detail that would
-explain it is gone. Quoting even a truncated excerpt would publish whatever the
-host happened to print, which routinely includes URLs carrying credentials.
-Written data: host labels, the measured directory, mise version, tool names and
-versions, install paths, tool source types and source paths, and config file
-paths. Install and config paths embed the remote account's home directory and
-real project directory names. A source path is whatever registry or repository a
-tool came from, so it can name a private repository URL, an internal domain, an
-account identifier, and the shape of a project. All of it also appears in
-readable form in resource names and in tags, which are the surface a casual
-query returns first -- there is no field here that is stored but not displayed.
-Credential-bearing values are withheld before any of that: a source or install
-URL carrying a username, a password, a query or a fragment is dropped rather
-than redacted, and a tool name or config path that screens the same way takes
-its whole entry with it. What remains is still infrastructure detail. Treat the
-datastore, and the sweep logs alongside it, as infrastructure-sensitive.
+discarded; what is stored in `error` is one of a closed set of codes,
+`unparseable-output` among them for a host that exits zero without the JSON its
+subcommand promises. The `errorDetail` option turns that off and stores a
+bounded excerpt of the host's own text beside the code, for a private fleet
+whose datastore you own and need to debug. It is off by default and should stay
+off wherever the datastore is shared, because host error text routinely carries
+credential-bearing URLs, tokens, private hostnames and home paths. The trade is
+real either way: with it off, a failure nobody wrote a pattern for reads as
+`unclassified` and the detail that would explain it is gone. Quoting even a
+truncated excerpt would publish whatever the host happened to print, which
+routinely includes URLs carrying credentials. Written data: host labels, the
+measured directory, mise version, tool names and versions, install paths, tool
+source types and source paths, and config file paths. Install and config paths
+embed the remote account's home directory and real project directory names. A
+source path is whatever registry or repository a tool came from, so it can name
+a private repository URL, an internal domain, an account identifier, and the
+shape of a project. All of it also appears in readable form in resource names
+and in tags, which are the surface a casual query returns first -- there is no
+field here that is stored but not displayed. Credential-bearing values are
+withheld before any of that: a source or install URL carrying a username, a
+password, a query or a fragment is dropped rather than redacted, and a tool name
+or config path that screens the same way takes its whole entry with it. What
+remains is still infrastructure detail. Treat the datastore, and the sweep logs
+alongside it, as infrastructure-sensitive.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

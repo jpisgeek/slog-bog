@@ -69,20 +69,88 @@ const MAX_SLUG_CHARS = 64;
 const MAX_DETAIL_CHARS = 160;
 
 /**
- * Decode a process stream, refusing to hold more than the ceiling.
+ * Read one process stream, stopping at the ceiling instead of after it.
  *
- * Truncation is marked rather than silent: a JSON payload cut in half fails
- * to parse and is already handled as an unreadable response, and a cut stderr
- * still classifies. Silently returning the first 4 MB as though it were the
- * whole answer is the one behaviour that would turn a hostile host into a
- * wrong measurement instead of a failed one.
+ * The first version of this bound decoded whatever `Deno.Command.output()`
+ * had already buffered, which is not a bound at all: output() reads the child
+ * to completion first, so a host emitting gigabytes exhausted memory before
+ * the check ever ran. The limit has to be enforced where the bytes arrive.
+ *
+ * Truncation is reported rather than papered over. A JSON payload cut short
+ * fails to parse and is already handled as an unreadable answer, and a cut
+ * stderr still classifies. Returning the first few megabytes as though they
+ * were the whole answer is the one behaviour that would turn a hostile host
+ * into a wrong measurement rather than a failed one.
  */
-function boundedDecode(buf: Uint8Array): string {
-  if (buf.byteLength <= MAX_OUTPUT_BYTES) {
-    return new TextDecoder().decode(buf);
+async function readCapped(
+  stream: ReadableStream<Uint8Array>,
+  cap: number,
+): Promise<{ text: string; truncated: boolean }> {
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (total + value.byteLength > cap) {
+        chunks.push(value.subarray(0, cap - total));
+        truncated = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    // Cancel rather than drain. Draining a hostile stream to be polite is
+    // the same unbounded read this exists to prevent.
+    await reader.cancel().catch(() => {});
   }
-  return new TextDecoder().decode(buf.subarray(0, MAX_OUTPUT_BYTES)) +
-    "\n[truncated: output exceeded the size limit]";
+  const buf = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0));
+  let at = 0;
+  for (const c of chunks) {
+    buf.set(c, at);
+    at += c.byteLength;
+  }
+  const text = decoder.decode(buf);
+  return {
+    text: truncated
+      ? text + "\n[truncated: output exceeded the size limit]"
+      : text,
+    truncated,
+  };
+}
+
+/**
+ * Spawn and collect, with both streams capped and the child killed the moment
+ * either one runs over. Same result shape as `Deno.Command.output()`, minus
+ * the unbounded buffering.
+ */
+async function cappedOutput(
+  cmd: Deno.Command,
+): Promise<{ success: boolean; code: number; stdout: string; stderr: string }> {
+  const child = cmd.spawn();
+  const [o, e] = await Promise.all([
+    readCapped(child.stdout, MAX_OUTPUT_BYTES),
+    readCapped(child.stderr, MAX_OUTPUT_BYTES),
+  ]);
+  if (o.truncated || e.truncated) {
+    // The answer is already unusable, so there is nothing to gain by letting
+    // the child keep producing. Killing may race a process that has already
+    // exited, which is not an error worth reporting.
+    try {
+      child.kill("SIGKILL");
+    } catch { /* already gone */ }
+  }
+  const status = await child.status;
+  return {
+    success: status.success && !o.truncated && !e.truncated,
+    code: status.code,
+    stdout: o.text,
+    stderr: e.text,
+  };
 }
 
 const UNSAFE_TEXT_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
@@ -358,7 +426,12 @@ export const SUB_OUTDATED = ["outdated", "--json"];
  */
 export function parseVersion(stdout: string): string | null {
   const first = printableRemoteText(stdout.trim()).split(/\s+/)[0] ?? "";
-  return /^v?\d+(\.\d+)*/.test(first) ? first : null;
+  // Anchored at both ends. Unanchored, "1evil" matched its leading digit and
+  // was accepted as a version, which is exactly the banner case this check
+  // exists to catch -- and being accepted, it kept the host off the degraded
+  // list. mise versions are calendar-style dotted numbers, optionally with a
+  // pre-release suffix, and nothing else is a version this model will report.
+  return /^v?\d+(\.\d+){0,3}(-[0-9A-Za-z.]+)?$/.test(first) ? first : null;
 }
 
 /** Confirms mise answered at all and records which build ran, for the node record's miseVersion field. */
@@ -540,7 +613,7 @@ export async function runMise(
     });
 
   try {
-    const out = await cmd.output();
+    const out = await cappedOutput(cmd);
     // Deno does not throw when a signal aborts a running command. It kills
     // the child and hands back success: false with SIGTERM, which is the
     // same shape as a host whose mise fell over on its own. So the caller's
@@ -559,7 +632,7 @@ export async function runMise(
     if (deadline.signal.aborted) {
       return { ok: false, kind: "failed", error: "timed-out" };
     }
-    const stderr = boundedDecode(out.stderr).trim();
+    const stderr = out.stderr.trim();
     if (!out.success) {
       return {
         ok: false,
@@ -568,7 +641,7 @@ export async function runMise(
         detail: safeDetail(stderr),
       };
     }
-    return { ok: true, stdout: boundedDecode(out.stdout) };
+    return { ok: true, stdout: out.stdout };
   } catch (e) {
     // Cancellation leaves by this door, whether it was raised just above or
     // thrown by a spawn that never got off the ground. The caller pulling
@@ -711,16 +784,35 @@ const str = (v: unknown): string | null =>
 const CREDENTIAL_SHAPES: RegExp[] = [
   // bearer/authorization material inline
   /\b(?:bearer|authorization)\s+[A-Za-z0-9._~+\/-]{12,}/i,
-  // a private key body, which has no business in a path field
-  /-----BEGIN[A-Z ]*PRIVATE KEY-----/,
+  // A private key body. Matched on BEGIN and PRIVATE KEY separately rather
+  // than as one run of text, because the previous single pattern missed a
+  // header whose internal spacing had been changed or wrapped.
+  /-----BEGIN[\s\S]{0,40}PRIVATE\s*KEY/i,
+  // A secret-looking assignment anywhere, not only after a URL separator.
+  // The previous form required ? & or # in front, so a bare `token=...` in
+  // a path or an error sentence passed untouched.
+  /\b(?:token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\s*[=:]\s*\S/i,
+  // A long unbroken high-entropy-looking run: the shape of a bare key sitting
+  // on its own with nothing around it to name it. Deliberately conservative
+  // about length so ordinary hashes in paths -- a nix store path, a git sha
+  // -- are not caught, and deliberately requiring mixed case and digits so
+  // hex digests and lowercase words are not.
+  /(?=[A-Za-z0-9_-]{40,})(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{40,}/,
 ];
 
 /**
- * Anything that looks like it could be a URL, so the URL rule gets a look at
- * it. Deliberately loose: the cost of testing a non-URL is one failed parse,
- * and the cost of missing one is publishing a credential.
+ * Anything that looks like it could be a URL, anywhere in the value.
+ *
+ * This was anchored at the start, so a URL wrapped in punctuation or sitting
+ * inside a longer string -- `(https://u@host/x)`, or a source field that
+ * names a path and then a URL -- never reached the URL rule at all. It is
+ * unanchored now and the match is extracted before parsing, so the rule
+ * applies wherever the URL happens to be.
+ *
+ * Deliberately loose: the cost of testing something that is not a URL is one
+ * failed parse, and the cost of missing one is publishing a credential.
  */
-const URLISH_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+const URLISH_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi;
 
 /**
  * Does this URL carry anything beyond the location of a thing?
@@ -758,7 +850,14 @@ function urlCarriesMoreThanLocation(value: string): boolean {
 export function safeRemoteString(v: unknown): string | null {
   const s = str(v);
   if (s === null) return null;
-  if (URLISH_RE.test(s) && urlCarriesMoreThanLocation(s)) return null;
+  // Every URL-shaped run in the value, not just one anchored at the start.
+  // Trailing punctuation is trimmed before parsing so `(https://u@h/x)`
+  // is judged as the URL it contains rather than failing to parse and
+  // passing.
+  for (const m of s.matchAll(URLISH_RE)) {
+    const candidate = m[0].replace(/[)\]}>.,;'"]+$/, "");
+    if (urlCarriesMoreThanLocation(candidate)) return null;
+  }
   for (const re of CREDENTIAL_SHAPES) if (re.test(s)) return null;
   return s;
 }
@@ -842,12 +941,26 @@ export function safeRemoteKey(v: unknown, sink?: DropSink): string | null {
  * than the one strictness would prevent. Types of the fields we READ are what
  * matter, and those are enforced.
  */
+/**
+ * One entry of `mise ls --current --json`.
+ *
+ * `installed` and `active` are required, because they are the measurement.
+ * They were optional, and `e.installed === true` read a missing field as
+ * false -- so `{}` parsed cleanly into a row saying the tool is present in
+ * the config, not installed, not active, with null versions, and nothing
+ * anywhere said the host had not actually answered. An entry that does not
+ * carry both is not a reading and is dropped and counted.
+ *
+ * The version and path fields stay optional because mise genuinely omits
+ * them: a tool declared but never installed has no install path and no
+ * resolved version, and that absence is itself the measurement.
+ */
 const LsEntrySchema = z.object({
   version: z.string().optional(),
   requested_version: z.string().optional(),
   install_path: z.string().optional(),
-  installed: z.boolean().optional(),
-  active: z.boolean().optional(),
+  installed: z.boolean(),
+  active: z.boolean(),
   source: z.object({
     type: z.string().optional(),
     path: z.string().optional(),
@@ -867,6 +980,12 @@ const ConfigEntrySchema = z.object({
   path: z.string(),
   tools: z.array(z.string()),
 }).loose();
+
+/**
+ * The one field the prune reads off a stored record. Validated because the
+ * loop that reads it deletes.
+ */
+const StoredRecordSchema = z.object({ name: z.string().min(1) }).loose();
 
 const OutdatedEntrySchema = z.object({
   latest: z.string().optional(),
@@ -1128,8 +1247,15 @@ const SummarySchema = z.object({
   tools: z.number(),
   notinstalled: z.number(),
   notactive: z.number(),
-  configsNotInEffect: z.number(),
-  outdated: z.number(),
+  /**
+   * Null when any host's config probe went unanswered. Zero is a fleet with
+   * no config drift; null is a fleet where some of it went unmeasured, and
+   * publishing the second as the first is the whole failure this model
+   * exists to prevent.
+   */
+  configsNotInEffect: z.number().nullable(),
+  /** Null when any host's outdated probe went unanswered. See configsNotInEffect. */
+  outdated: z.number().nullable(),
   expected: z.number(),
   sweptAt: z.string(),
 });
@@ -1366,9 +1492,7 @@ export const model = {
               const lsJson = jsonStdout(ls, "object");
               if (lsJson === null) {
                 const kind = ls.ok ? "unparseable" : ls.kind;
-                const err = ls.ok
-                  ? "mise exited zero without the JSON object it promises"
-                  : ls.error;
+                const err = ls.ok ? "unparseable-output" : ls.error;
                 const detail = ls.ok ? undefined : ls.detail;
                 // The honesty case. Counts stay null so that "we could not
                 // ask" never reads downstream as "there was nothing to find".
@@ -1580,9 +1704,13 @@ export const model = {
                 failureKind: "failed",
                 transport,
                 error: msg,
+                // Through the same screening as every other stored excerpt.
+                // This path built its own printable-and-truncate inline and
+                // so was the one place a credential-bearing token could be
+                // stored whole, which is the sort of thing an inline
+                // reimplementation is always eventually for.
                 errorDetail: g.errorDetail
-                  ? printableRemoteText((e as Error)?.message ?? String(e))
-                    .slice(0, 160)
+                  ? (safeDetail((e as Error)?.message ?? String(e)) ?? null)
                   : null,
                 miseVersion: null,
                 dir,
@@ -1695,6 +1823,18 @@ export const model = {
           const count = (d: Drift) =>
             toolStates.filter((t) => t.drift.includes(d)).length;
           const degradedCount = nodeStates.filter((n) => n.degraded).length;
+          // A count is only a count if everything that feeds it answered.
+          // The model refuses to write zero for a host whose probe failed,
+          // and then the summary added those refusals up into a fleet zero
+          // and published it as good news -- the same mistake one level up.
+          // A total whose inputs are incomplete is null here, which is the
+          // word this model already uses for "nobody measured that".
+          const anyFailed = (sub: string) =>
+            nodeStates.some((n) =>
+              !n.measured || n.failedSubcommands.includes(sub)
+            );
+          const outdatedComplete = !anyFailed("outdated");
+          const configComplete = !anyFailed("config");
           handles.push(
             await ctx.writeResource("summary", "summary", {
               nodes: nodeStates.length,
@@ -1704,10 +1844,11 @@ export const model = {
               tools: toolStates.length,
               notinstalled: count("notinstalled"),
               notactive: count("notactive"),
-              configsNotInEffect: configStates.filter((c) =>
-                c.toolsNotInEffect.length > 0
-              ).length,
-              outdated: count("outdated"),
+              configsNotInEffect: configComplete
+                ? configStates.filter((c) => c.toolsNotInEffect.length > 0)
+                  .length
+                : null,
+              outdated: outdatedComplete ? count("outdated") : null,
               expected: count("expected"),
               sweptAt: new Date().toISOString(),
             }, {
@@ -1731,11 +1872,25 @@ export const model = {
             ctx.modelType,
             ctx.modelId,
           );
-          for (const rec of existing as { name: string }[]) {
-            if (live.has(rec.name)) continue;
-            if (protectedPrefixes.some((p) => rec.name.startsWith(p))) continue;
-            await ctx.deleteResource(rec.name);
-            ctx.logger.info("pruned {name}", { name: rec.name });
+          // Validated, not cast. This loop deletes, so what it reads has to
+          // be checked: `existing as {name: string}[]` on a repository that
+          // returned anything else produced records whose `name` was
+          // undefined, and `undefined.startsWith` throws mid-prune, after
+          // some deletions and before the rest.
+          for (const raw of existing) {
+            const rec = StoredRecordSchema.safeParse(raw);
+            if (!rec.success) {
+              ctx.logger.warning(
+                "skipped a stored record with no readable name during prune",
+              );
+              continue;
+            }
+            if (live.has(rec.data.name)) continue;
+            if (
+              protectedPrefixes.some((p) => rec.data.name.startsWith(p))
+            ) continue;
+            await ctx.deleteResource(rec.data.name);
+            ctx.logger.info("pruned {name}", { name: rec.data.name });
           }
         }
 
