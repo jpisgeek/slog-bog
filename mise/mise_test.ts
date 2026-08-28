@@ -854,10 +854,35 @@ Deno.test("summary totals agree with the per-node counts", async () => {
     assertEquals(summary.nodesMeasured, 1);
     assertEquals(summary.nodesUnmeasured, 1);
     assertEquals(summary.nodesDegraded, 0);
-    assertEquals(summary.tools, 1);
+    // Not 1. One of the two hosts never answered, so a tool total counted
+    // across the fleet is a total nobody can stand behind -- and `tools: 1`
+    // reads as a fleet with one tool rather than a sweep half missing.
+    assertEquals(summary.tools, null);
+    assertEquals(summary.notinstalled, null);
+    assertEquals(summary.notactive, null);
+    assertEquals(summary.expected, null);
   } finally {
     await m.cleanup();
   }
+});
+
+Deno.test("summary totals are real numbers when the whole fleet answered", () => {
+  // The other half. Nulling on incompleteness is only honest if a complete
+  // sweep still produces counts.
+  return (async () => {
+    const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+    try {
+      const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+      await model.methods.discover.execute({}, c.ctx);
+      const summary = c.written.find((w) => w.spec === "summary")!.data;
+      assertEquals(summary.nodesUnmeasured, 0);
+      assertEquals(summary.tools, 1);
+      assertEquals(summary.notinstalled, 0);
+      assertEquals(summary.outdated, 0);
+    } finally {
+      await m.cleanup();
+    }
+  })();
 });
 
 // ---- partial readings -----------------------------------------------------

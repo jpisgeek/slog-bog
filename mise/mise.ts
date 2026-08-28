@@ -1287,9 +1287,14 @@ const SummarySchema = z.object({
    * half the fleet still reports the outdated it found, and no more.
    */
   nodesDegraded: z.number(),
-  tools: z.number(),
-  notinstalled: z.number(),
-  notactive: z.number(),
+  /**
+   * Every total below rests on the ls probe. Null when any host went
+   * unmeasured, because a fleet where nobody answered reporting `tools: 0`
+   * is an incomplete sweep wearing the shape of a healthy one.
+   */
+  tools: z.number().nullable(),
+  notinstalled: z.number().nullable(),
+  notactive: z.number().nullable(),
   /**
    * Null when any host's config probe went unanswered. Zero is a fleet with
    * no config drift; null is a fleet where some of it went unmeasured, and
@@ -1299,7 +1304,7 @@ const SummarySchema = z.object({
   configsNotInEffect: z.number().nullable(),
   /** Null when any host's outdated probe went unanswered. See configsNotInEffect. */
   outdated: z.number().nullable(),
-  expected: z.number(),
+  expected: z.number().nullable(),
   sweptAt: z.string(),
 });
 
@@ -1883,21 +1888,34 @@ export const model = {
             );
           const outdatedComplete = !anyFailed("outdated");
           const configComplete = !anyFailed("config");
+          // Every tool-derived total rests on the ls probe, so a host that
+          // never answered at all takes all of them with it. The first pass
+          // at this only covered outdated and config, which left the sweep
+          // able to report `tools: 0, notinstalled: 0` for a fleet where
+          // nobody answered -- an incomplete sweep wearing the shape of a
+          // healthy one, which is the exact failure this whole model is
+          // built around not committing.
+          const toolsComplete = nodeStates.every((n) => n.measured);
+          const num = (ok: boolean, v: number) => ok ? v : null;
           handles.push(
             await ctx.writeResource("summary", "summary", {
               nodes: nodeStates.length,
               nodesMeasured: nodeStates.filter((n) => n.measured).length,
               nodesUnmeasured: nodeStates.filter((n) => !n.measured).length,
               nodesDegraded: degradedCount,
-              tools: toolStates.length,
-              notinstalled: count("notinstalled"),
-              notactive: count("notactive"),
-              configsNotInEffect: configComplete
-                ? configStates.filter((c) => c.toolsNotInEffect.length > 0)
-                  .length
-                : null,
-              outdated: outdatedComplete ? count("outdated") : null,
-              expected: count("expected"),
+              tools: num(toolsComplete, toolStates.length),
+              notinstalled: num(toolsComplete, count("notinstalled")),
+              notactive: num(toolsComplete, count("notactive")),
+              configsNotInEffect: num(
+                configComplete,
+                configStates.filter((c) => c.toolsNotInEffect.length > 0)
+                  .length,
+              ),
+              outdated: num(
+                toolsComplete && outdatedComplete,
+                count("outdated"),
+              ),
+              expected: num(toolsComplete, count("expected")),
               sweptAt: new Date().toISOString(),
             }, {
               tags: {
