@@ -522,7 +522,7 @@ export const SUB_OUTDATED = ["outdated", "--json"];
 /**
  * The version mise reported, or null if it did not report one.
  *
- * `mise --version` prints "2025.1.0 macos-arm64 (...)", so the first token is
+ * `mise version` prints "2025.1.0 macos-arm64 (...)", so the first token is
  * the version. Anything that is not version-shaped is a host printing over
  * the answer, and null is how that gets said -- which in turn marks the node
  * degraded rather than letting a banner stand in for a version.
@@ -537,8 +537,22 @@ export function parseVersion(stdout: string): string | null {
   return /^v?\d+(\.\d+){0,3}(-[0-9A-Za-z.]+)?$/.test(first) ? first : null;
 }
 
-/** Confirms mise answered at all and records which build ran, for the node record's miseVersion field. */
-export const SUB_VERSION = ["--version"];
+/**
+ * Confirms mise answered at all and records which build ran, for the node
+ * record's miseVersion field.
+ *
+ * The `version` SUBCOMMAND, not the `--version` flag. Every invocation this
+ * model makes is prefixed with `-C <dir>` whenever a node sets `dir`, and
+ * `mise -C <dir> --version` is not a form mise accepts: it prints its full
+ * help to stdout and exits 1. That read as a failed probe, so every node with
+ * `dir` set -- the configuration this model's own documentation recommends --
+ * came back permanently degraded with `version` in failedSubcommands and a
+ * null miseVersion, which in turn nulled `outdated` and `configsNotInEffect`
+ * on the summary. `mise -C <dir> version` prints the same string the flag
+ * does and exits 0. Note this was the only SUB_* that was a top-level flag
+ * rather than a subcommand; keep it that way.
+ */
+export const SUB_VERSION = ["version"];
 /** Per-config trust state, recorded for context only. See parseTrustShow for why it never drives drift on its own. */
 export const SUB_TRUST = ["trust", "--show"];
 
@@ -1748,7 +1762,7 @@ function currentDir(): string | null {
  */
 export const model = {
   type: "@jpisgeek/mise",
-  version: "2026.08.28.2",
+  version: "2026.08.28.3",
   globalArguments: GlobalArgsSchema,
   /**
    * Nothing to transform, and the reasons are worth stating rather than
@@ -1781,6 +1795,17 @@ export const model = {
         "Security hardening; no globalArguments migration. errorDetail was " +
         "added with a default, and the other changes tighten validation on " +
         "existing arguments rather than reshaping them.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.08.28.3",
+      description:
+        "Probes `mise version` instead of the `--version` flag, which mise " +
+        "refuses behind the `-C <dir>` every node with `dir` set carries. No " +
+        "globalArguments change: an existing config is already correct and " +
+        "needs no edit. Stored records are not migrated either -- the stale " +
+        "`degraded` rows and null miseVersion clear on the next full sweep, " +
+        "which rewrites them from a probe that now answers.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1946,7 +1971,7 @@ export const model = {
               // The two JSON probes are held to their promised shape as
               // well as to the exit code, and the shapes differ: config ls
               // lists files, outdated is keyed by tool. `trust --show` and
-              // `--version` are plain text with no JSON shape to fail, so
+              // `version` are plain text with no JSON shape to fail, so
               // they are judged on whether the text itself parsed.
               const cfgJson = jsonStdout(cfg, "array");
               const outdJson = jsonStdout(outd, "object");

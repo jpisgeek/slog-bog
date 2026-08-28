@@ -9,7 +9,7 @@ declared in a config that never took, or simply behind. Installs nothing and
 upgrades nothing. mise already does that job. This one wades through the fleet,
 writes down what it finds, and leaves the acting to whatever workflow wants it.
 
-**Version** `2026.08.28.2` · **License** MIT · **Source**
+**Version** `2026.08.28.3` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/mise
 
 ## Install
@@ -98,7 +98,7 @@ exits zero and hands back something other than the JSON that `ls --current`
 promises records `failureKind: unparseable` and stays unmeasured, because that
 is the probe the whole reading rests on. The follow-up subcommands are judged
 the same way but cost less: a wrong shape from `config ls` or `outdated`, a
-banner from `--version`, or unreadable text from `trust --show` names that
+banner from `version`, or unreadable text from `trust --show` names that
 subcommand in `failedSubcommands` and leaves the host measured-but-degraded
 rather than unmeasured. An unparseable answer is usually a login shell printing
 a banner over the top of the answer, so the repair belongs on the host. A host
@@ -106,7 +106,7 @@ can also answer in part. When a follow-up subcommand goes quiet, or answers in a
 shape this model cannot read, the record is marked `degraded` and names it in
 `failedSubcommands`, and `nodesDegraded` on the summary counts how many hosts
 that happened to. Answering in a shape this model cannot read counts as going
-quiet: `mise --version` that returns a banner instead of a version, and
+quiet: `mise version` that returns a banner instead of a version, and
 `mise trust --show` that returns text with no readable line in it, both mark the
 host degraded even though they exited zero. A host can also answer in the right
 shape and still return individual entries no parser will vouch for -- a
@@ -153,61 +153,61 @@ name by hand.
 ## Security
 
 Read-only throughout. The model runs `ls --current`, `config ls`, `outdated`,
-`trust --show`, and `--version`, and nothing else. It never calls
-`mise install`, `mise upgrade`, `mise token`, `mise settings`, or `mise trust`
-without `--show`. Be precise about what that guarantees and what it does not:
-the argument list is fixed, so this model will not ask a host to change. It
-cannot promise the same about the binary that receives those arguments.
-`misePath` names an executable, and while its schema constrains the charset,
-refuses a leading dash and requires the basename to be exactly mise or mise.exe,
-a file called mise can be anything -- `/tmp/mise` passes. That is operator
-config, trusted the way the node list itself is trusted, and it is worth knowing
-it is trusted rather than verified. Point it at a mise you put there. Local
-hosts are invoked as an argv array that never reaches a shell. Over SSH, two
-operator-supplied values reach the remote command: `dir`, single-quoted, and
-`misePath`, unquoted. Each is safe because its schema refuses at parse time any
-value containing a character a shell would act on, rather than repairing it: a
-half-fixed path that measures the wrong directory silently is worse than a
-config error. `misePath` is held to one thing more: its basename has to be mise.
-The charset rule alone let it name any executable on the box, which is a
-guarantee this model advertises and was not actually keeping. `ssh.host` and
-`ssh.user` are a different case, and a stronger one. Neither reaches a shell at
-all. The two are combined into the single positional destination argument
-`user@host` and handed straight to `ssh` as one argv element, so the only first
-thing their schema refuses is a leading dash, which would otherwise let the
-destination be read as an ssh option such as `-oProxyCommand=`. It refuses more
-than that: both are held to hostname and username charsets, so an `@` or a `:`
-inside either cannot silently change which host is contacted. They carry no
-shell charset rule and do not need one. Node labels refuse terminal controls at
-parse time. Every string returned by a host is made printable before it reaches
-a resource field, tag, or log parameter. C0 and C1 bytes, including ESC, are
-written as visible `\uNNNN` text instead of being handed to a terminal. SSH
-passes both `BatchMode=yes` and `StrictHostKeyChecking=yes` on the command line,
-so an unknown host key fails closed. BatchMode alone would not do that: it
-removes the prompt but leaves the decision to ambient ssh_config, which can be
-set to accept a key it has never seen, and passing the policy as an argument
-beats any config file. `ProxyCommand` and `PermitLocalCommand` are set on the
-command line for the same reason and are the sharper case: both run a shell
-command, and ssh expands `%h` and `%u` into them, so an operator config written
-for interactive use would turn every value in the node list into local shell
-input. `ControlMaster` and `ControlPath` go the same way and are the sharpest of
-the group: with a multiplexing socket already open ssh hands the session to the
-existing connection and consults none of these options, so a connection opened
-earlier under a weaker host-key policy would carry this one. One gap is left
-open and is worth naming rather than papering over: `SendEnv` and `SetEnv` in
-the operator's own config can ship local environment to a target, and the
-command line cannot clear them -- `-o SendEnv=-*` looks like it does and does
-not, because options are read before config files and SendEnv accumulates. It
-takes a matching `AcceptEnv` on the target to have any effect, and closing it
-locally would mean `-F /dev/null` and the loss of the per-host `IdentityFile`
-and `ProxyJump` settings a real fleet depends on. Keep secrets out of the
-environment this runs in, which is where they should not be anyway. input. The
-same reasoning applies to what the connection hands the host rather than what it
-trusts about it: `ForwardAgent`, `ForwardX11`, `ForwardX11Trusted` and
-`ClearAllForwardings` are all set on the command line too. ssh inherits ambient
-config, and a `ForwardAgent` in the operator's `~/.ssh/config` -- perfectly
-ordinary to have there for hosts you use interactively -- would otherwise expose
-the authentication agent to every host this model sweeps. An agent socket on a
+`trust --show`, and `version`, and nothing else. It never calls `mise install`,
+`mise upgrade`, `mise token`, `mise settings`, or `mise trust` without `--show`.
+Be precise about what that guarantees and what it does not: the argument list is
+fixed, so this model will not ask a host to change. It cannot promise the same
+about the binary that receives those arguments. `misePath` names an executable,
+and while its schema constrains the charset, refuses a leading dash and requires
+the basename to be exactly mise or mise.exe, a file called mise can be anything
+-- `/tmp/mise` passes. That is operator config, trusted the way the node list
+itself is trusted, and it is worth knowing it is trusted rather than verified.
+Point it at a mise you put there. Local hosts are invoked as an argv array that
+never reaches a shell. Over SSH, two operator-supplied values reach the remote
+command: `dir`, single-quoted, and `misePath`, unquoted. Each is safe because
+its schema refuses at parse time any value containing a character a shell would
+act on, rather than repairing it: a half-fixed path that measures the wrong
+directory silently is worse than a config error. `misePath` is held to one thing
+more: its basename has to be mise. The charset rule alone let it name any
+executable on the box, which is a guarantee this model advertises and was not
+actually keeping. `ssh.host` and `ssh.user` are a different case, and a stronger
+one. Neither reaches a shell at all. The two are combined into the single
+positional destination argument `user@host` and handed straight to `ssh` as one
+argv element, so the only first thing their schema refuses is a leading dash,
+which would otherwise let the destination be read as an ssh option such as
+`-oProxyCommand=`. It refuses more than that: both are held to hostname and
+username charsets, so an `@` or a `:` inside either cannot silently change which
+host is contacted. They carry no shell charset rule and do not need one. Node
+labels refuse terminal controls at parse time. Every string returned by a host
+is made printable before it reaches a resource field, tag, or log parameter. C0
+and C1 bytes, including ESC, are written as visible `\uNNNN` text instead of
+being handed to a terminal. SSH passes both `BatchMode=yes` and
+`StrictHostKeyChecking=yes` on the command line, so an unknown host key fails
+closed. BatchMode alone would not do that: it removes the prompt but leaves the
+decision to ambient ssh_config, which can be set to accept a key it has never
+seen, and passing the policy as an argument beats any config file.
+`ProxyCommand` and `PermitLocalCommand` are set on the command line for the same
+reason and are the sharper case: both run a shell command, and ssh expands `%h`
+and `%u` into them, so an operator config written for interactive use would turn
+every value in the node list into local shell input. `ControlMaster` and
+`ControlPath` go the same way and are the sharpest of the group: with a
+multiplexing socket already open ssh hands the session to the existing
+connection and consults none of these options, so a connection opened earlier
+under a weaker host-key policy would carry this one. One gap is left open and is
+worth naming rather than papering over: `SendEnv` and `SetEnv` in the operator's
+own config can ship local environment to a target, and the command line cannot
+clear them -- `-o SendEnv=-*` looks like it does and does not, because options
+are read before config files and SendEnv accumulates. It takes a matching
+`AcceptEnv` on the target to have any effect, and closing it locally would mean
+`-F /dev/null` and the loss of the per-host `IdentityFile` and `ProxyJump`
+settings a real fleet depends on. Keep secrets out of the environment this runs
+in, which is where they should not be anyway. input. The same reasoning applies
+to what the connection hands the host rather than what it trusts about it:
+`ForwardAgent`, `ForwardX11`, `ForwardX11Trusted` and `ClearAllForwardings` are
+all set on the command line too. ssh inherits ambient config, and a
+`ForwardAgent` in the operator's `~/.ssh/config` -- perfectly ordinary to have
+there for hosts you use interactively -- would otherwise expose the
+authentication agent to every host this model sweeps. An agent socket on a
 remote box signs for the key it holds, which for a fleet key is every host that
 trusts it. A read-only inventory probe has no business offering that. Errors
 never quote host output by default. stderr is read to classify a failure and

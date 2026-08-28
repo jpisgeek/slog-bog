@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/mise"
-version: 2026.08.28.2
+version: 2026.08.28.3
 description: >
   Read-only sweep of mise toolchain state across a fleet. Records which tool
   versions each host is actually running and where that disagrees with the

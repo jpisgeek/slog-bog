@@ -39,7 +39,7 @@ caveats: >-
   `ls --current` promises records `failureKind: unparseable` and stays
   unmeasured, because that is the probe the whole reading rests on. The
   follow-up subcommands are judged the same way but cost less: a wrong shape
-  from `config ls` or `outdated`, a banner from `--version`, or unreadable
+  from `config ls` or `outdated`, a banner from `version`, or unreadable
   text from `trust --show` names that subcommand in `failedSubcommands` and
   leaves the host measured-but-degraded rather than unmeasured.
   An unparseable answer is usually a login shell printing a banner over the
@@ -49,7 +49,7 @@ caveats: >-
   cannot read, the record is marked
   `degraded` and names it in `failedSubcommands`, and `nodesDegraded` on the
   summary counts how many hosts that happened to. Answering in a shape this
-  model cannot read counts as going quiet: `mise --version` that returns a
+  model cannot read counts as going quiet: `mise version` that returns a
   banner instead of a version, and `mise trust --show` that returns text with
   no readable line in it, both mark the host degraded even though they exited
   zero. A host can also answer in the right shape and still return individual
@@ -97,7 +97,7 @@ caveats: >-
   than building the name by hand.
 security: >-
   Read-only throughout. The model runs `ls --current`, `config ls`, `outdated`,
-  `trust --show`, and `--version`, and nothing else. It never calls
+  `trust --show`, and `version`, and nothing else. It never calls
   `mise install`, `mise upgrade`, `mise token`, `mise settings`, or `mise
   trust` without `--show`. Be precise about what that guarantees and what it
   does not: the argument list is fixed, so this model will not ask a host to

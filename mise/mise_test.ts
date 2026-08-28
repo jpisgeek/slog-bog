@@ -38,7 +38,11 @@ import {
   safeRemoteString,
   satisfiesExpect,
   sshArgs,
+  SUB_CONFIG,
   SUB_LS,
+  SUB_OUTDATED,
+  SUB_TRUST,
+  SUB_VERSION,
 } from "./mise.ts";
 
 const okNode = { name: "workstation" };
@@ -186,6 +190,30 @@ Deno.test("local invocation is an argv array with no shell involved", () => {
     "--json",
   ]);
   assertEquals(localArgs(undefined, SUB_LS), ["ls", "--current", "--json"]);
+});
+
+Deno.test("every probe is a subcommand, so -C <dir> can precede it", () => {
+  // The bug this guards: SUB_VERSION was `["--version"]`, a top-level FLAG
+  // rather than a subcommand. Every probe is prefixed with `-C <dir>` when a
+  // node sets `dir`, and `mise -C <dir> --version` is not a form mise
+  // accepts -- it prints its help to stdout and exits 1. That read as a
+  // failed probe, so every node configured the way the README recommends came
+  // back permanently degraded. A leading dash here is the whole defect.
+  for (
+    const sub of [SUB_LS, SUB_CONFIG, SUB_OUTDATED, SUB_VERSION, SUB_TRUST]
+  ) {
+    assertEquals(
+      sub[0].startsWith("-"),
+      false,
+      `${sub[0]} must be a subcommand, not a flag`,
+    );
+  }
+  assertEquals(SUB_VERSION, ["version"]);
+  assertEquals(localArgs("/srv/project", SUB_VERSION), [
+    "-C",
+    "/srv/project",
+    "version",
+  ]);
 });
 
 Deno.test("remote command single-quotes the dir and nothing else", () => {
@@ -691,9 +719,27 @@ async function fakeMiseSuite(
     }\nfi`;
   const script = [
     "#!/bin/sh",
-    "# skip a leading -C <dir> so the fake accepts the same argv as the real one",
-    'if [ "$1" = "-C" ]; then shift 2; fi',
-    `if [ "$1" = "--version" ]; then\n${
+    "# skip a leading -C <dir> so the fake accepts the same argv as the real one,",
+    "# but REMEMBER that it was there -- see the --version branch below.",
+    "had_cd=0",
+    'if [ "$1" = "-C" ]; then had_cd=1; shift 2; fi',
+    // Real mise does not accept the `--version` FLAG behind `-C <dir>`: it
+    // prints its whole help to stdout and exits 1. The fake used to skip -C
+    // and then answer `--version` happily, which is how a shipped build spent
+    // a release marking every node that set `dir` as degraded while the suite
+    // stayed green. The fake now refuses exactly where the real binary does,
+    // so a probe that goes back to the flag fails here first.
+    `if [ "$1" = "--version" ]; then\n` +
+    `  if [ "$had_cd" = "1" ]; then\n` +
+    `    echo "Usage: mise [FLAGS] [TASK] <SUBCOMMAND>"\n` +
+    `    exit 1\n` +
+    `  fi\n` +
+    `${
+      failing.has("version")
+        ? refuse("version")
+        : '  echo "2026.8.12 test"\n  exit 0'
+    }\nfi`,
+    `if [ "$1" = "version" ]; then\n${
       failing.has("version")
         ? refuse("version")
         : 'echo "2026.8.12 test"\nexit 0'
@@ -763,6 +809,34 @@ Deno.test("a clean host writes tool rows with no drift", async () => {
     );
   } finally {
     await m.cleanup();
+  }
+});
+
+Deno.test("a node with dir set is not degraded by the version probe", async () => {
+  // The regression, end to end rather than by argv inspection. Every probe is
+  // prefixed with `-C <dir>` once a node sets `dir`, and SUB_VERSION used to
+  // be the `--version` FLAG -- a form real mise refuses, printing its help to
+  // stdout and exiting 1. The fake refuses it in the same place, so a probe
+  // that reverts to the flag surfaces here as a degraded node carrying
+  // `version` in failedSubcommands and a null miseVersion, which is precisely
+  // what shipped. No fake-driven test set `dir` before this one, which is how
+  // the suite stayed green through a release that degraded every host
+  // configured the way the README recommends.
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  const dir = await Deno.makeTempDir();
+  try {
+    const c = mockCtx({
+      nodes: [{ name: "workstation", misePath: m.path, dir }],
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.measured, true);
+    assertEquals(node.failedSubcommands, []);
+    assertEquals(node.degraded, false);
+    assertEquals(node.miseVersion, "2026.8.12");
+  } finally {
+    await m.cleanup();
+    await Deno.remove(dir, { recursive: true });
   }
 });
 
@@ -2782,14 +2856,30 @@ Deno.test("the upgrade chain reaches every published version and changes nothing
   // version already installed never runs. This one has to sit above both
   // published versions to reach instances at either.
   const ups = model.upgrades;
-  assertEquals(ups.length, 1);
-  assertEquals(ups[0].toVersion, model.version);
-  assertEquals(ups[0].toVersion > "2026.08.28.1", true);
-  assertEquals(ups[0].toVersion > "2026.08.24.1", true);
-  // A no-op on the data: the one field added since carries a default, and
-  // the rest of the changes tighten validation rather than reshaping it.
+  const versions = ups.map((u) => u.toVersion);
+
+  // Written against the chain rather than against a fixed length. The
+  // previous form asserted `ups.length === 1` and indexed `ups[0]`, so the
+  // first release that legitimately added a second entry failed the test for
+  // growing rather than for being wrong.
+  assertEquals([...versions].sort(), versions, "entries must ascend");
+  assertEquals(
+    versions[versions.length - 1],
+    model.version,
+    "the chain must end at the version this build declares",
+  );
+
+  // Every version ever published. The newest entry has to sit above all of
+  // them or an instance sitting at one is never moved.
+  for (const published of ["2026.08.24.1", "2026.08.28.1", "2026.08.28.2"]) {
+    assertEquals(model.version > published, true, `above ${published}`);
+  }
+
+  // A no-op on the data, every entry: fields added since carry defaults, and
+  // the rest tighten validation or repair a probe rather than reshaping
+  // stored config.
   const before = { timeoutSec: 15, nodes: [{ name: "a" }] };
-  assertEquals(ups[0].upgradeAttributes(before), before);
+  for (const u of ups) assertEquals(u.upgradeAttributes(before), before);
 });
 
 Deno.test("an instance stored before errorDetail existed parses safely off", () => {
