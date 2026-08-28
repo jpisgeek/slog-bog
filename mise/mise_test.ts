@@ -1891,7 +1891,6 @@ Deno.test("a misspelled drift class never reaches stored data", () => {
   );
 });
 
-
 Deno.test("a bidi override in a tool name is escaped, not rendered", () => {
   // U+202E flips the rendering of everything after it, so a name stored as
   // "nod‮elbat" reads on screen as a different tool than the one the row
