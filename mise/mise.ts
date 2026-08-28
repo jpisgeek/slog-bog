@@ -595,6 +595,26 @@ export function sshArgs(
     // node list into shell input on the local machine. Same class as the
     // forwardings below, and the same answer: state it on the command line,
     // where no config file can put it back.
+    // Multiplexing has to be off, and this is the sharpest of the ambient
+    // problems: with a ControlMaster socket already open, ssh hands the
+    // session to the existing connection and every option below is simply
+    // not consulted. The strict host-key policy this model insists on would
+    // be bypassed by a connection someone opened earlier under a weaker one.
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+    // SendEnv is deliberately NOT set here. `-o SendEnv=-*` looks like it
+    // clears the list and does not: command-line options are read before
+    // config files, and SendEnv accumulates, so a `SendEnv AWS_*` in the
+    // operator's config is added afterwards and survives. Verified against
+    // ssh -G rather than assumed. Shipping the option anyway would put a
+    // guarantee in the argv that the argv does not keep, which is worse than
+    // the gap. The residual is documented in the README instead: it needs a
+    // SendEnv or SetEnv in the operator's own config AND a matching
+    // AcceptEnv on the target, and `-F /dev/null` would close it only by
+    // discarding the per-host IdentityFile and ProxyJump settings a real
+    // fleet depends on.
     "-o",
     "ProxyCommand=none",
     "-o",
@@ -2104,6 +2124,7 @@ export const model = {
         // node a stored name belongs to needs the whole field to compare
         // against. See holdsRecord below.
         const prefixHeld = new Map<string, boolean>();
+        const legacyHeld = new Map<string, boolean>();
 
         for (const n of nodeStates) {
           const name = await resourceName("node", n.name);
@@ -2124,6 +2145,22 @@ export const model = {
             ]
           ) {
             prefixHeld.set(p, (prefixHeld.get(p) ?? false) || held);
+          }
+          // The pre-PART_SEP forms, kept in their own map. Records written
+          // before the separator changed match none of the new prefixes, so
+          // a full sweep would delete an unmeasured host's legacy rows --
+          // breaking the retention guarantee precisely during the migration,
+          // when there is most to lose. They cannot go in the map above:
+          // `tool-web-` is a prefix of `tool-web-server--ruby-...` too, and
+          // mixing them would hand back the ambiguity PART_SEP removed. A
+          // name is matched against one map or the other by its own shape.
+          for (
+            const p of [
+              `tool-${slugPart(n.name)}-`,
+              `config-${slugPart(n.name)}-`,
+            ]
+          ) {
+            legacyHeld.set(p, (legacyHeld.get(p) ?? false) || held);
           }
           handles.push(
             await ctx.writeResource(
@@ -2250,7 +2287,15 @@ export const model = {
                 toolsComplete && outdatedComplete,
                 count("outdated"),
               ),
-              expected: num(toolsComplete, count("expected")),
+              // An expectation that was never evaluated is not an
+              // expectation that passed. A tool with no resolved version
+              // classifies as unmeasured and its `expect` rule is skipped,
+              // so counting `expected` across it reported zero failures
+              // where there had been zero checks.
+              expected: num(
+                toolsComplete && count("unmeasured") === 0,
+                count("expected"),
+              ),
               sweptAt: new Date().toISOString(),
             }, {
               tags: {
@@ -2287,7 +2332,12 @@ export const model = {
               continue;
             }
             if (live.has(rec.data.name)) continue;
-            if (holdsRecord(prefixHeld, rec.data.name)) continue;
+            // Matched against one map or the other by the record's own
+            // shape, never both.
+            const byShape = rec.data.name.includes(PART_SEP)
+              ? prefixHeld
+              : legacyHeld;
+            if (holdsRecord(byShape, rec.data.name)) continue;
             await ctx.deleteResource(rec.data.name);
             // Screened before it is logged, not merely checked for
             // printability. This name came out of the datastore rather than

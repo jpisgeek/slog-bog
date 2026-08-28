@@ -2691,3 +2691,73 @@ Deno.test("a host that will not stop talking is cut off, not buffered", async ()
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test("a legacy-format row of an unmeasured host survives the migration", async () => {
+  // Records written before the separator changed match none of the new
+  // prefixes, so a full sweep would have deleted an unmeasured host's rows
+  // exactly during the migration -- when there is most to lose.
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const legacy = "tool-gone-go-1234abcd";
+    const c = mockCtx(
+      {
+        nodes: [
+          { name: "gone", misePath: "/nonexistent/mise" },
+          { name: "workstation", misePath: m.path },
+        ],
+      },
+      { existing: [legacy] },
+    );
+    await model.methods.discover.execute({}, c.ctx);
+    assertEquals(c.deleted.includes(legacy), false);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("a legacy-format row of a measured host is pruned, so migration ends", async () => {
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const legacy = "tool-workstation-go-1234abcd";
+    const c = mockCtx(
+      { nodes: [{ name: "workstation", misePath: m.path }] },
+      { existing: [legacy] },
+    );
+    await model.methods.discover.execute({}, c.ctx);
+    assertEquals(c.deleted.includes(legacy), true);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("expected is unknown when a tool was never version-checked", async () => {
+  // An expectation that was never evaluated is not one that passed: a tool
+  // with no resolved version classifies as unmeasured and its expect rule
+  // is skipped, so counting across it reported zero failures where there
+  // had been zero checks.
+  const m = await fakeMiseSuite({
+    ls: '{"node":[{"installed":true,"active":true}]}',
+  });
+  try {
+    const c = mockCtx({
+      nodes: [{ name: "workstation", misePath: m.path }],
+      expect: { node: "22" },
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const summary = c.written.find((w) => w.spec === "summary")!.data;
+    assertEquals(summary.expected, null);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("ssh refuses to reuse a multiplexed connection", () => {
+  // The sharpest of the ambient problems: with a ControlMaster socket
+  // already open, ssh hands the session to the existing connection and
+  // every other option is simply not consulted -- so the strict host-key
+  // policy would be bypassed by a connection opened earlier under a weaker
+  // one.
+  const a = sshArgs({ host: "h.example.com", user: "u", port: 22 }, 10, "x");
+  assertEquals(sshOpt(a, "ControlMaster"), "no");
+  assertEquals(sshOpt(a, "ControlPath"), "none");
+});
