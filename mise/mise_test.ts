@@ -2617,3 +2617,32 @@ Deno.test("a record every candidate node measured is still pruned", () => {
     }
   })();
 });
+
+Deno.test("an environment-variable-shaped secret name is caught", () => {
+  // `\b(token)` does not match inside GITHUB_TOKEN, because underscore is a
+  // word character -- so the commonest way a secret is actually written
+  // down walked past the rule meant to catch it.
+  for (
+    const v of [
+      "GITHUB_TOKEN=ghp_abc123",
+      "SESSION_ID=deadbeef",
+      "MY_API_KEY: xyz",
+      "Set-Cookie: sid=abc",
+      // Keyword in the middle, not at either end.
+      "AWS_SECRET_ACCESS_KEY=abc",
+    ]
+  ) {
+    assertEquals(safeRemoteString(v), null, `must be withheld: ${v}`);
+  }
+  // A name that merely contains a keyword, with nothing assigned to it, is
+  // an ordinary value.
+  for (
+    const v of [
+      "tokenizer",
+      "password-manager-cli",
+      "/opt/tools/session-recorder/bin/rec",
+    ]
+  ) {
+    assertEquals(safeRemoteString(v), v, `must survive: ${v}`);
+  }
+});

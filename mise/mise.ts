@@ -890,6 +890,18 @@ const str = (v: unknown): string | null =>
  * carry userinfo or a token in its query -- at which point publishing it is
  * publishing a credential.
  */
+/**
+ * The names a credential is written down under, with an optional prefix.
+ *
+ * The prefix alternative is the point: `\b(token)` does not match inside
+ * GITHUB_TOKEN, because underscore is a word character, so every
+ * environment-variable-shaped name walked past the rule that was supposed to
+ * catch it. Shared between the field filter and the free-text one so the two
+ * cannot drift apart again, which they already did once.
+ */
+const CREDENTIAL_KEYWORDS =
+  "(?:[A-Za-z0-9]+[_-])*(?:token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|secret|password|passwd|passphrase|pwd|credential|client[_-]?secret|session|session[_-]?id|sessionid|cookie|set[_-]?cookie|auth|pat|sig|signature)(?:[_-][A-Za-z0-9]+)*";
+
 const CREDENTIAL_SHAPES: RegExp[] = [
   // Auth material inline. This required twelve characters and knew only
   // about bearer, while the free-text filter had already been widened to
@@ -909,7 +921,14 @@ const CREDENTIAL_SHAPES: RegExp[] = [
   // A secret-looking assignment anywhere, not only after a URL separator.
   // The previous form required ? & or # in front, so a bare `token=...` in
   // a path or an error sentence passed untouched.
-  /\b(?:token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\s*[=:]\s*(?!\[withheld\])\S/i,
+  // The keyword may carry a prefix. `\b(token)` does not match inside
+  // GITHUB_TOKEN, because underscore is a word character, so every
+  // environment-variable-shaped name -- the commonest way a secret is
+  // actually written down -- walked past this rule untouched.
+  new RegExp(
+    `\\b${CREDENTIAL_KEYWORDS}\\s*[=:]\\s*(?!\\[withheld\\])\\S`,
+    "i",
+  ),
   // A long unbroken high-entropy-looking run: the shape of a bare key sitting
   // on its own with nothing around it to name it. Deliberately conservative
   // about length so ordinary hashes in paths -- a nix store path, a git sha
@@ -1047,7 +1066,7 @@ function safeDetail(text: string): string | undefined {
       // spaces, and stopping at the first one withheld its opening word and
       // published the rest -- worse than withholding nothing, because it
       // reads as though the screening worked.
-      /\b(token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\b\s*[=:].*/gi,
+      new RegExp(`\\b(${CREDENTIAL_KEYWORDS})\\s*[=:].*`, "gi"),
       "$1=[withheld]",
     )
     // Same reason, different shape. `Bearer abc123` is two whitespace-
@@ -2258,7 +2277,16 @@ export const model = {
             if (live.has(rec.data.name)) continue;
             if (holdsRecord(prefixHeld, rec.data.name)) continue;
             await ctx.deleteResource(rec.data.name);
-            ctx.logger.info("pruned {name}", { name: rec.data.name });
+            // Screened before it is logged, not merely checked for
+            // printability. This name came out of the datastore rather than
+            // off a host, so nothing upstream vouches for it: a record
+            // written by an older version of this model, or by anything else
+            // sharing the store, can carry a credential or an infrastructure
+            // identifier in its name, and the prune would have copied it
+            // verbatim into a log line.
+            ctx.logger.info("pruned {name}", {
+              name: safeRemoteString(rec.data.name) ?? "<withheld>",
+            });
           }
         }
 
