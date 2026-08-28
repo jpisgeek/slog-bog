@@ -66,6 +66,7 @@ const SAFE_BIN_PATH = /^[A-Za-z0-9._/-]+$/;
  */
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_SLUG_CHARS = 64;
+const MAX_DETAIL_CHARS = 160;
 
 /**
  * Decode a process stream, refusing to hold more than the ceiling.
@@ -564,7 +565,7 @@ export async function runMise(
         ok: false,
         kind: classifyFailure(out.code, stderr),
         error: stderr ? remoteErrorCode(stderr) : "nonzero-exit",
-        detail: stderr ? printableRemoteText(stderr).slice(0, 160) : undefined,
+        detail: safeDetail(stderr),
       };
     }
     return { ok: true, stdout: boundedDecode(out.stdout) };
@@ -587,7 +588,7 @@ export async function runMise(
       error: e instanceof Deno.errors.NotFound
         ? "binary-missing"
         : remoteErrorCode(msg),
-      detail: printableRemoteText(msg).slice(0, 160),
+      detail: safeDetail(msg),
     };
   } finally {
     // A long-lived process running many probes would otherwise accumulate one
@@ -665,12 +666,33 @@ function jsonStdout(r: RunResult, shape: JsonShape): string | null {
 }
 
 /** JSON.parse that yields a fallback instead of throwing mid-sweep. */
-function parseJson<T>(raw: string, fallback: T): T {
+/**
+ * JSON.parse, narrowed rather than asserted.
+ *
+ * The generic form of this took a type parameter and returned `v as T`, which
+ * is a promise the caller makes about a remote host's output rather than
+ * anything checked. `parseJson<Record<string, unknown>>` on an array returned
+ * the array, and Object.entries over it produced rows keyed "0", "1", "2".
+ * These two return null on the wrong shape so the caller has to say what that
+ * means, which for every caller here is "the host did not answer".
+ */
+function parseJsonObject(raw: string): Record<string, unknown> | null {
   try {
-    const v = JSON.parse(raw);
-    return v == null ? fallback : v as T;
+    const v: unknown = JSON.parse(raw);
+    return typeof v === "object" && v !== null && !Array.isArray(v)
+      ? v as Record<string, unknown>
+      : null;
   } catch {
-    return fallback;
+    return null;
+  }
+}
+
+function parseJsonArray(raw: string): unknown[] | null {
+  try {
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) ? v : null;
+  } catch {
+    return null;
   }
 }
 
@@ -687,17 +709,43 @@ const str = (v: unknown): string | null =>
  * publishing a credential.
  */
 const CREDENTIAL_SHAPES: RegExp[] = [
-  // The URL userinfo form: credentials embedded before the host. Described
-  // rather than written literally -- an example of the shape trips the
-  // identifier scanner that guards this repo, which is the scanner working.
-  /[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:[^\/\s@]+@/i,
-  // a secret-looking query or fragment parameter
-  /[?&#](?:token|access_token|api[_-]?key|secret|password|passwd|pwd|sig|signature|credential)=/i,
   // bearer/authorization material inline
   /\b(?:bearer|authorization)\s+[A-Za-z0-9._~+\/-]{12,}/i,
   // a private key body, which has no business in a path field
   /-----BEGIN[A-Z ]*PRIVATE KEY-----/,
 ];
+
+/**
+ * Anything that looks like it could be a URL, so the URL rule gets a look at
+ * it. Deliberately loose: the cost of testing a non-URL is one failed parse,
+ * and the cost of missing one is publishing a credential.
+ */
+const URLISH_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/**
+ * Does this URL carry anything beyond the location of a thing?
+ *
+ * The previous version matched two regexes: userinfo in its user-and-password
+ * form, and a query parameter whose NAME was on a list. Both are the wrong
+ * shape of test. A username with no password is still an account name; a
+ * signing parameter nobody thought to list still signs; and a list of secret
+ * parameter names is a list that is wrong the moment a registry invents a new
+ * one. So the rule is inverted: a source or install URL legitimately needs a
+ * scheme, a host and a path, and nothing else. Any username, any password,
+ * any query, any fragment means this is not just a location, and a value that
+ * is not just a location does not get persisted.
+ */
+function urlCarriesMoreThanLocation(value: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(value);
+  } catch {
+    // Not parseable as a URL. The regex rules below still get their turn.
+    return false;
+  }
+  return u.username !== "" || u.password !== "" ||
+    u.search !== "" || u.hash !== "";
+}
 
 /**
  * A remote string that is safe to persist, or null.
@@ -710,8 +758,35 @@ const CREDENTIAL_SHAPES: RegExp[] = [
 export function safeRemoteString(v: unknown): string | null {
   const s = str(v);
   if (s === null) return null;
+  if (URLISH_RE.test(s) && urlCarriesMoreThanLocation(s)) return null;
   for (const re of CREDENTIAL_SHAPES) if (re.test(s)) return null;
   return s;
+}
+
+/**
+ * A bounded, screened excerpt of a host's own error text.
+ *
+ * This is the value behind the opt-in `errorDetail` argument, and it is the
+ * one place this model stores text it did not choose the shape of. Free text
+ * cannot be validated the way a field can, so it gets three passes: control
+ * and format characters escaped, credential-shaped tokens removed rather than
+ * redacted, and a hard length bound.
+ *
+ * Screening is per whitespace-separated token because the interesting case is
+ * a URL or a key sitting inside a sentence -- "failed to fetch <url>" should
+ * keep the sentence and lose the URL. A token that screens out is dropped
+ * entirely; the marker says a token was there without saying what it was.
+ */
+function safeDetail(text: string): string | undefined {
+  const printable = printableRemoteText(text).trim();
+  if (printable === "") return undefined;
+  const kept = printable
+    .split(/(\s+)/)
+    .map((tok) =>
+      (/\s/.test(tok) || safeRemoteString(tok) !== null) ? tok : "[withheld]"
+    )
+    .join("");
+  return kept.slice(0, MAX_DETAIL_CHARS);
 }
 
 /**
@@ -779,9 +854,18 @@ const LsEntrySchema = z.object({
   }).optional(),
 }).loose();
 
+/**
+ * One row of `mise config ls --json`.
+ *
+ * `tools` is required on purpose. It was optional, and a missing `tools`
+ * became `[]` -- a config that declares nothing, which is a measurement, when
+ * what actually happened is that the host did not say. That is the same
+ * mistake as reading a failed outdated probe as "everything is current", one
+ * level down. An entry without it is dropped and counted.
+ */
 const ConfigEntrySchema = z.object({
   path: z.string(),
-  tools: z.array(z.string()).optional(),
+  tools: z.array(z.string()),
 }).loose();
 
 const OutdatedEntrySchema = z.object({
@@ -795,7 +879,8 @@ const OutdatedEntrySchema = z.object({
  * this data crosses a process boundary and nothing validates it upstream.
  */
 export function parseLsCurrent(json: string, sink?: DropSink): ToolRow[] {
-  const obj = parseJson<Record<string, unknown>>(json, {});
+  const obj = parseJsonObject(json);
+  if (obj === null) return [];
   const rows: ToolRow[] = [];
   for (const [tool, entries] of Object.entries(obj)) {
     if (!Array.isArray(entries) || entries.length === 0) {
@@ -843,8 +928,8 @@ export function parseConfigLs(
   json: string,
   sink?: DropSink,
 ): { path: string; tools: string[] }[] {
-  const arr = parseJson<unknown[]>(json, []);
-  if (!Array.isArray(arr)) return [];
+  const arr = parseJsonArray(json);
+  if (arr === null) return [];
   const out: { path: string; tools: string[] }[] = [];
   for (const raw of arr) {
     // Validated, not cast. The cast let a number or null through and then
@@ -860,7 +945,7 @@ export function parseConfigLs(
     // dropped name is counted: the config still parsed, but the list of what
     // it declares is now short, and a short list reads as "declares less".
     const tools: string[] = [];
-    for (const t of parsed.data.tools ?? []) {
+    for (const t of parsed.data.tools) {
       const name = safeRemoteKey(t, sink);
       if (name !== null) tools.push(name);
     }
@@ -885,7 +970,8 @@ export function parseOutdated(
   json: string,
   sink?: DropSink,
 ): Record<string, string | null> {
-  const obj = parseJson<Record<string, unknown>>(json, {});
+  const obj = parseJsonObject(json);
+  if (obj === null) return Object.create(null);
   const out: Record<string, string | null> = Object.create(null);
   for (const [tool, v] of Object.entries(obj)) {
     const parsed = OutdatedEntrySchema.safeParse(v);

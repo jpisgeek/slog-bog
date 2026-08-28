@@ -36,8 +36,14 @@ caveats: >-
   clean. Set `misePath` when a host records `failureKind: notfound`, which is
   mise missing from the PATH rather than a host missing from the network. A
   host that exits zero and hands back something other than the JSON that
-  subcommand promises records `failureKind: unparseable` and stays unmeasured.
-  That one is usually a login shell printing a banner over the top of the
+  `ls --current` promises records `failureKind: unparseable` and stays
+  unmeasured, because that is the probe the whole reading rests on. The
+  follow-up subcommands are judged the same way but cost less: a wrong shape
+  from `config ls` or `outdated`, a banner from `--version`, or unreadable
+  text from `trust --show` names that subcommand in `failedSubcommands` and
+  leaves the host measured-but-degraded rather than unmeasured.
+  An unparseable answer is usually a login shell printing a banner over the
+  top of the
   answer, so the repair belongs on the host. A host can also answer in part.
   When a follow-up subcommand goes quiet, or answers in a shape this model
   cannot read, the record is marked
@@ -92,9 +98,11 @@ security: >-
   rather than repairing it: a half-fixed path that measures the wrong
   directory silently is worse than a config error. `ssh.host` and `ssh.user`
   are a different case, and a stronger one. Neither reaches a shell at all.
-  Each occupies a single argv element handed straight to `ssh`, so the only
+  The two are combined into the single positional destination argument
+  `user@host` and handed straight to `ssh` as one argv element, so the only
   thing their schema has to refuse is a leading dash, which would otherwise
-  let either be read as an ssh option such as `-oProxyCommand=`. They carry
+  let the destination be read as an ssh option such as `-oProxyCommand=`.
+  They carry
   no shell charset rule and do not need one. Node labels refuse terminal
   controls at parse time. Every string returned by a host is made printable
   before it reaches a resource field, tag, or log parameter. C0 and C1 bytes,
@@ -114,7 +122,18 @@ security: >-
   is real either way: with it off, a failure nobody wrote a pattern for reads
   as `unclassified` and the detail that would explain it is gone. Quoting
   even a truncated excerpt would publish whatever the host happened to print,
-  which routinely includes URLs carrying credentials. Written data: host labels, the measured directory, mise version, tool
-  names and versions, install paths, and config file paths. Install and config
-  paths embed the remote account's home directory and real project directory
-  names, so treat the datastore as infrastructure detail.
+  which routinely includes URLs carrying credentials. Written data: host
+  labels, the measured directory, mise version, tool names and versions,
+  install paths, tool source types and source paths, and config file paths.
+  Install and config paths embed the remote account's home directory and real
+  project directory names. A source path is whatever registry or repository a
+  tool came from, so it can name a private repository URL, an internal domain,
+  an account identifier, and the shape of a project. All of it also appears in
+  readable form in resource names and in tags, which are the surface a casual
+  query returns first -- there is no field here that is stored but not
+  displayed. Credential-bearing values are withheld before any of that: a
+  source or install URL carrying a username, a password, a query or a fragment
+  is dropped rather than redacted, and a tool name or config path that screens
+  the same way takes its whole entry with it. What remains is still
+  infrastructure detail. Treat the datastore, and the sweep logs alongside it,
+  as infrastructure-sensitive.

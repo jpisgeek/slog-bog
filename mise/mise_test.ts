@@ -1942,10 +1942,57 @@ Deno.test("a declared tool name shaped like a credential is dropped from tags", 
 
 Deno.test("a config entry that is not an object is dropped, not read through", () => {
   const sink = { dropped: 0 };
-  const cfgs = parseConfigLs('[7,null,{"path":"/etc/mise.toml"}]', sink);
+  const cfgs = parseConfigLs(
+    '[7,null,{"path":"/etc/mise.toml","tools":["node"]}]',
+    sink,
+  );
   assertEquals(cfgs.length, 1);
   assertEquals(cfgs[0].path, "/etc/mise.toml");
   assertEquals(sink.dropped, 2);
+});
+
+Deno.test("a config with no tools field is not a config declaring nothing", () => {
+  // Absence is not emptiness. `tools ?? []` made a host that did not say
+  // look like a host that declares no tools, which is a measurement.
+  const sink = { dropped: 0 };
+  const cfgs = parseConfigLs('[{"path":"/etc/mise.toml"}]', sink);
+  assertEquals(cfgs.length, 0);
+  assertEquals(sink.dropped, 1);
+});
+
+Deno.test("a username-only URL is still an account name", () => {
+  // The old rule needed user AND password. A bare username in a source URL
+  // is an operator identity, and it went straight into stored data.
+  assertEquals(safeRemoteString("https://deploybot@git.internal/x.git"), null);
+});
+
+Deno.test("any query or fragment on a source URL is withheld", () => {
+  // Not a list of secret-looking parameter names: a source URL needs a
+  // scheme, a host and a path, so anything past that is withheld whatever
+  // it is called.
+  assertEquals(
+    safeRemoteString("https://reg.internal/n.tgz?sv=2024&x=1"),
+    null,
+  );
+  assertEquals(safeRemoteString("https://reg.internal/n.tgz#tok"), null);
+  assertEquals(
+    safeRemoteString("https://reg.internal/n.tgz"),
+    "https://reg.internal/n.tgz",
+    "an ordinary source URL is not collateral damage",
+  );
+  assertEquals(
+    safeRemoteString("/opt/homebrew/bin/node"),
+    "/opt/homebrew/bin/node",
+    "a plain path is not a URL and is left alone",
+  );
+});
+
+Deno.test("ls output that is not an object yields no rows", () => {
+  // parseJson<Record<string, unknown>> used to hand an array straight back,
+  // and Object.entries over it produced rows keyed "0", "1", "2".
+  assertEquals(parseLsCurrent("[1,2,3]").length, 0);
+  assertEquals(parseLsCurrent("not json").length, 0);
+  assertEquals(parseConfigLs('{"path":"/x"}').length, 0);
 });
 
 Deno.test("malformed entries are counted, not silently skipped", () => {

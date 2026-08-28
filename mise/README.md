@@ -94,20 +94,25 @@ routinely missing from a non-login shell's PATH, and a zero tool count from a
 host that never ran mise is indistinguishable from a host that is genuinely
 clean. Set `misePath` when a host records `failureKind: notfound`, which is mise
 missing from the PATH rather than a host missing from the network. A host that
-exits zero and hands back something other than the JSON that subcommand promises
-records `failureKind: unparseable` and stays unmeasured. That one is usually a
-login shell printing a banner over the top of the answer, so the repair belongs
-on the host. A host can also answer in part. When a follow-up subcommand goes
-quiet, or answers in a shape this model cannot read, the record is marked
-`degraded` and names it in `failedSubcommands`, and `nodesDegraded` on the
-summary counts how many hosts that happened to. Answering in a shape this model
-cannot read counts as going quiet: `mise --version` that returns a banner
-instead of a version, and `mise trust --show` that returns text with no readable
-line in it, both mark the host degraded even though they exited zero. A host can
-also answer in the right shape and still return individual entries no parser
-will vouch for -- a malformed tool row, an unreadable trust line, a name that
-screens as credential-bearing. Those are counted in `droppedEntries` rather than
-dropped in silence, and any count above zero marks the host degraded too. While
+exits zero and hands back something other than the JSON that `ls --current`
+promises records `failureKind: unparseable` and stays unmeasured, because that
+is the probe the whole reading rests on. The follow-up subcommands are judged
+the same way but cost less: a wrong shape from `config ls` or `outdated`, a
+banner from `--version`, or unreadable text from `trust --show` names that
+subcommand in `failedSubcommands` and leaves the host measured-but-degraded
+rather than unmeasured. An unparseable answer is usually a login shell printing
+a banner over the top of the answer, so the repair belongs on the host. A host
+can also answer in part. When a follow-up subcommand goes quiet, or answers in a
+shape this model cannot read, the record is marked `degraded` and names it in
+`failedSubcommands`, and `nodesDegraded` on the summary counts how many hosts
+that happened to. Answering in a shape this model cannot read counts as going
+quiet: `mise --version` that returns a banner instead of a version, and
+`mise trust --show` that returns text with no readable line in it, both mark the
+host degraded even though they exited zero. A host can also answer in the right
+shape and still return individual entries no parser will vouch for -- a
+malformed tool row, an unreadable trust line, a name that screens as
+credential-bearing. Those are counted in `droppedEntries` rather than dropped in
+silence, and any count above zero marks the host degraded too. While
 `nodesDegraded` is above zero, read the drift totals as a floor rather than as
 everything there is to find. Tool rows carry the same flag as a `degraded` tag,
 so a query over rows alone cannot mistake a partial sweep for a clean one. mise
@@ -148,9 +153,10 @@ operator-supplied values reach the remote command: `dir`, single-quoted, and
 value containing a character a shell would act on, rather than repairing it: a
 half-fixed path that measures the wrong directory silently is worse than a
 config error. `ssh.host` and `ssh.user` are a different case, and a stronger
-one. Neither reaches a shell at all. Each occupies a single argv element handed
-straight to `ssh`, so the only thing their schema has to refuse is a leading
-dash, which would otherwise let either be read as an ssh option such as
+one. Neither reaches a shell at all. The two are combined into the single
+positional destination argument `user@host` and handed straight to `ssh` as one
+argv element, so the only thing their schema has to refuse is a leading dash,
+which would otherwise let the destination be read as an ssh option such as
 `-oProxyCommand=`. They carry no shell charset rule and do not need one. Node
 labels refuse terminal controls at parse time. Every string returned by a host
 is made printable before it reaches a resource field, tag, or log parameter. C0
@@ -171,9 +177,18 @@ nobody wrote a pattern for reads as `unclassified` and the detail that would
 explain it is gone. Quoting even a truncated excerpt would publish whatever the
 host happened to print, which routinely includes URLs carrying credentials.
 Written data: host labels, the measured directory, mise version, tool names and
-versions, install paths, and config file paths. Install and config paths embed
-the remote account's home directory and real project directory names, so treat
-the datastore as infrastructure detail.
+versions, install paths, tool source types and source paths, and config file
+paths. Install and config paths embed the remote account's home directory and
+real project directory names. A source path is whatever registry or repository a
+tool came from, so it can name a private repository URL, an internal domain, an
+account identifier, and the shape of a project. All of it also appears in
+readable form in resource names and in tags, which are the surface a casual
+query returns first -- there is no field here that is stored but not displayed.
+Credential-bearing values are withheld before any of that: a source or install
+URL carrying a username, a password, a query or a fragment is dropped rather
+than redacted, and a tool name or config path that screens the same way takes
+its whole entry with it. What remains is still infrastructure detail. Treat the
+datastore, and the sweep logs alongside it, as infrastructure-sensitive.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.
