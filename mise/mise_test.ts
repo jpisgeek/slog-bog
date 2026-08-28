@@ -130,7 +130,11 @@ Deno.test("expect matches on whole version segments, never string prefix", () =>
 });
 
 Deno.test("a configured tool the host never installed is notinstalled", () => {
-  const d = classifyTool({ installed: false, active: false }, {
+  const d = classifyTool({
+    installed: false,
+    active: false,
+    resolvedVersion: "1.0.0",
+  }, {
     outdated: false,
     expectFail: false,
   });
@@ -138,7 +142,11 @@ Deno.test("a configured tool the host never installed is notinstalled", () => {
 });
 
 Deno.test("installed but not active is its own class, not notinstalled", () => {
-  const d = classifyTool({ installed: true, active: false }, {
+  const d = classifyTool({
+    installed: true,
+    active: false,
+    resolvedVersion: "1.0.0",
+  }, {
     outdated: false,
     expectFail: false,
   });
@@ -146,7 +154,11 @@ Deno.test("installed but not active is its own class, not notinstalled", () => {
 });
 
 Deno.test("a healthy tool carries no drift", () => {
-  const d = classifyTool({ installed: true, active: true }, {
+  const d = classifyTool({
+    installed: true,
+    active: true,
+    resolvedVersion: "1.0.0",
+  }, {
     outdated: false,
     expectFail: false,
   });
@@ -154,7 +166,11 @@ Deno.test("a healthy tool carries no drift", () => {
 });
 
 Deno.test("outdated and expect failures stack onto the install state", () => {
-  const d = classifyTool({ installed: true, active: true }, {
+  const d = classifyTool({
+    installed: true,
+    active: true,
+    resolvedVersion: "1.0.0",
+  }, {
     outdated: true,
     expectFail: true,
   });
@@ -1620,7 +1636,7 @@ Deno.test("an unmeasured outdated probe is null and drifts as unmeasured", () =>
   // report outdated:false, which reads as "up to date" -- an unknown rounded
   // into a healthy value.
   const drift = classifyTool(
-    { installed: true, active: true },
+    { installed: true, active: true, resolvedVersion: "1.0.0" },
     { outdated: null, expectFail: false },
   );
   assertEquals(drift.includes("unmeasured"), true);
@@ -2413,6 +2429,60 @@ Deno.test("an unmeasured host does not hold another host's stale rows", async ()
       true,
       "web-server answered, so its departed row is gone even though " +
         "unmeasured `web` shares its name prefix",
+    );
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("an installed, active tool with no version is a hole, not a pass", () => {
+  // Every version-dependent judgement passes silently on a missing version:
+  // an `expect` rule cannot fail a version the row does not have, so the
+  // tool came back with no drift at all and read as healthy.
+  const d = classifyTool(
+    { installed: true, active: true, resolvedVersion: null },
+    { outdated: false, expectFail: false },
+  );
+  assertEquals(d, ["unmeasured"]);
+  // And a row that did report one is still clean.
+  assertEquals(
+    classifyTool(
+      { installed: true, active: true, resolvedVersion: "22.1.0" },
+      { outdated: false, expectFail: false },
+    ),
+    [],
+  );
+});
+
+Deno.test("a bracketed IPv6 host does not slip past the schemeless rules", () => {
+  // A literal address is a private address, and the first version of the
+  // host alternative only matched names and dotted quads.
+  assertEquals(safeRemoteString("deploy:hunter2@[fd00::1]:org/repo.git"), null);
+  assertEquals(safeRemoteString("//deploy@[2001:db8::1]/n.tgz"), null);
+});
+
+Deno.test("two node labels that slug alike do not overwrite each other's hold", async () => {
+  // "web server" and "web-server" both slug to web-server, so setting the
+  // map entry let whichever node came last decide for both -- which could
+  // delete a failed host's retained rows. Holding when ANY colliding node
+  // is held errs toward keeping data.
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const stale = "tool-web-server-ruby-" + "0".repeat(64);
+    const c = mockCtx(
+      {
+        nodes: [
+          { name: "web-server", misePath: m.path },
+          { name: "web server", misePath: "/nonexistent/mise" },
+        ],
+      },
+      { existing: [stale] },
+    );
+    await model.methods.discover.execute({}, c.ctx);
+    assertEquals(
+      c.deleted.includes(stale),
+      false,
+      "one of the two colliding nodes was unmeasured, so the row is held",
     );
   } finally {
     await m.cleanup();

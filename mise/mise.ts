@@ -420,7 +420,17 @@ const DriftEnum = z.enum(DRIFT_CLASSES);
  * quietly grow a dependency on fields (versions, paths) that have nothing to
  * do with whether a tool is installed or active.
  */
-export type ToolEntry = { installed: boolean; active: boolean };
+export type ToolEntry = {
+  installed: boolean;
+  active: boolean;
+  /**
+   * The version mise resolved, or null when it did not report one. Part of
+   * the classification input rather than a display field: an installed and
+   * active tool with no version is a hole, and every version-dependent
+   * judgement passes silently on it.
+   */
+  resolvedVersion: string | null;
+};
 
 /**
  * Does `resolved` satisfy the `expect` value? Compared segment by segment, so
@@ -448,6 +458,12 @@ export function classifyTool(
   const drift: Drift[] = [];
   if (!entry.installed) drift.push("notinstalled");
   else if (!entry.active) drift.push("notactive");
+  // An installed, active tool with no resolved version is a hole, not a
+  // clean row. Every version-dependent judgement below silently passes on
+  // it: an `expect` rule cannot fail a version it does not have, so the
+  // tool came back with no drift at all and read as healthy. Absence again,
+  // wearing the shape of a pass.
+  else if (entry.resolvedVersion === null) drift.push("unmeasured");
   // null is "we could not ask", which is a different fact from "not behind".
   // It earns `unmeasured` rather than silently contributing nothing, so a
   // failed outdated probe is visible in the drift set instead of looking
@@ -896,12 +912,15 @@ const URLISH_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi;
  * `new URL()` will accept.
  */
 const USERINFO_NO_SCHEME: RegExp[] = [
-  // scp-style: user@host:path, with an optional :password. Requires a dot or
-  // a colon-path after the host so an ordinary email address in an error
-  // sentence is not mistaken for a location.
-  /(?:^|[\s(<'"])[A-Za-z0-9._~%-]+(?::[^\s@]*)?@[A-Za-z0-9.-]+:[^\s]/,
-  // scheme-relative with userinfo
-  /(?:^|[\s(<'"])\/\/[A-Za-z0-9._~%-]+(?::[^\s@]*)?@[A-Za-z0-9.-]+/,
+  // scp-style: user@host:path, with an optional :password. Requires a
+  // colon-path after the host so an ordinary email address in an error
+  // sentence is not mistaken for a location. The host alternative includes
+  // the bracketed IPv6 form, which the first version of this did not: a
+  // literal address is a private address, and `user:pw@[fd00::1]:repo`
+  // slipped through with username, password and address intact.
+  /(?:^|[\s(<'"])[A-Za-z0-9._~%-]+(?::[^\s@]*)?@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[^\s]/,
+  // scheme-relative with userinfo, same two host forms
+  /(?:^|[\s(<'"])\/\/[A-Za-z0-9._~%-]+(?::[^\s@]*)?@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)/,
 ];
 
 /**
@@ -1942,9 +1961,23 @@ export const model = {
         for (const n of nodeStates) {
           const name = await resourceName("node", n.name);
           live.add(name);
+          // OR, not overwrite. Distinct node labels can slug to the same
+          // prefix -- "web server" and "web-server" both become web-server,
+          // and so does anything past the slug's length cap -- so setting
+          // the entry let whichever node came last decide for all of them.
+          // That could delete a failed host's retained rows or keep a
+          // measured host's departed ones. Holding when ANY colliding node
+          // is held errs toward keeping data, which is the recoverable
+          // direction.
           const held = !n.measured || n.degraded;
-          prefixHeld.set(nodePrefix("tool", n.name), held);
-          prefixHeld.set(nodePrefix("config", n.name), held);
+          for (
+            const p of [
+              nodePrefix("tool", n.name),
+              nodePrefix("config", n.name),
+            ]
+          ) {
+            prefixHeld.set(p, (prefixHeld.get(p) ?? false) || held);
+          }
           handles.push(
             await ctx.writeResource(
               "node",
