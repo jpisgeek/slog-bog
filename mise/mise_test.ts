@@ -1598,6 +1598,85 @@ Deno.test("an unmeasured outdated probe is null and drifts as unmeasured", () =>
   assertEquals(drift.includes("outdated"), false);
 });
 
+// ---- errorDetail: opt-in diagnostics without a default leak ---------------
+
+Deno.test("errorDetail is off by default and no host text is stored", async () => {
+  const m = await fakeMise({
+    stderr: "error: could not reach https://u:p@registry.internal/x",
+    exit: 1,
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "host", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.errorDetail, null, "detail must be absent by default");
+    for (const leak of ["registry.internal", "u:p", "https://"]) {
+      assertEquals(
+        JSON.stringify(node).includes(leak),
+        false,
+        `${leak} must not appear anywhere in the node resource`,
+      );
+    }
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("errorDetail on preserves the diagnosis the code alone loses", async () => {
+  // The point of the option: "unclassified" is safe but tells an operator
+  // nothing. On a private fleet whose datastore you own, the excerpt is what
+  // explains a novel failure.
+  const m = await fakeMise({
+    stderr: "mise: something nobody wrote a pattern for",
+    exit: 1,
+  });
+  try {
+    const c = mockCtx({
+      nodes: [{ name: "host", misePath: m.path }],
+      errorDetail: true,
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(
+      node.error,
+      "unclassified",
+      "the code stays a closed-set code",
+    );
+    assertStringIncludes(
+      String(node.errorDetail),
+      "nobody wrote a pattern for",
+    );
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("errorDetail never widens the error field itself", async () => {
+  // Whatever errorDetail is set to, `error` remains a code. The two fields
+  // exist separately so the always-safe one cannot become the unsafe one.
+  const m = await fakeMise({
+    stderr: "Permission denied (publickey)",
+    exit: 1,
+  });
+  try {
+    for (const on of [false, true]) {
+      const c = mockCtx({
+        nodes: [{ name: "host", misePath: m.path }],
+        errorDetail: on,
+      });
+      await model.methods.discover.execute({}, c.ctx);
+      const node = c.written.find((w) => w.spec === "node")!.data;
+      assertEquals(
+        ERROR_CODES.includes(String(node.error)),
+        true,
+        `error must stay a closed-set code with errorDetail=${on}`,
+      );
+    }
+  } finally {
+    await m.cleanup();
+  }
+});
+
 // ---- pruning --------------------------------------------------------------
 
 Deno.test("a full sweep prunes rows the fleet no longer reports", async () => {

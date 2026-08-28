@@ -96,8 +96,15 @@ security: >-
   closed. BatchMode alone would not do that: it removes the prompt but leaves
   the decision to ambient ssh_config, which can be set to accept a key it has
   never seen, and passing the policy as an argument beats any config file.
-  Errors never quote host output at all. stderr is read to classify a failure
-  and then discarded; what is stored is one of a closed set of codes. Quoting
+  Errors never quote host output by default. stderr is read to classify a
+  failure and then discarded; what is stored is one of a closed set of codes.
+  The `errorDetail` option turns that off and stores a bounded excerpt of the
+  host's own text beside the code, for a private fleet whose datastore you own
+  and need to debug. It is off by default and should stay off wherever the
+  datastore is shared, because host error text routinely carries
+  credential-bearing URLs, tokens, private hostnames and home paths. The trade
+  is real either way: with it off, a failure nobody wrote a pattern for reads
+  as `unclassified` and the detail that would explain it is gone. Quoting
   even a truncated excerpt would publish whatever the host happened to print,
   which routinely includes URLs carrying credentials. Written data: host labels, the measured directory, mise version, tool
   names and versions, install paths, and config file paths. Install and config

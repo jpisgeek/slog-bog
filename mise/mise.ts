@@ -196,6 +196,22 @@ export const GlobalArgsSchema = z.object({
         "absence is not visible in the drift counts. Omit it and each host " +
         "is judged only against its own config.",
     ),
+  errorDetail: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Store a bounded excerpt of a failing host's own error text alongside " +
+        "the classification code, for diagnosis. OFF by default, and it " +
+        "should stay off wherever the datastore is not fully trusted: host " +
+        "error text routinely carries credential-bearing URLs, tokens, " +
+        "private hostnames and home paths, and resource data is durable and " +
+        "readable. The trade is real -- with this off a novel failure " +
+        "classifies as 'unclassified' and you lose the detail that would " +
+        "explain it. Turn it on for a private fleet whose datastore you own " +
+        "and need to debug; leave it off for anything shared. The " +
+        "classification code is written either way; this only adds a second " +
+        "field beside it.",
+    ),
 });
 
 /**
@@ -383,7 +399,19 @@ export function classifyFailure(
  */
 export type RunResult =
   | { ok: true; stdout: string }
-  | { ok: false; kind: "notfound" | "failed"; error: string };
+  | {
+    ok: false;
+    kind: "notfound" | "failed";
+    /** Closed-set classification code. Always safe to store. */
+    error: string;
+    /**
+     * A bounded printable excerpt of the host's own text. Carried so the
+     * caller CAN store it when errorDetail is enabled, and simply dropped
+     * when it is not. Kept off `error` so the safe field can never
+     * accidentally become the unsafe one.
+     */
+    detail?: string;
+  };
 
 /**
  * NodeSchema after zod has run: defaults (misePath, ssh.port) are filled in
@@ -467,6 +495,7 @@ export async function runMise(
         ok: false,
         kind: classifyFailure(out.code, stderr),
         error: stderr ? remoteErrorCode(stderr) : "nonzero-exit",
+        detail: stderr ? printableRemoteText(stderr).slice(0, 160) : undefined,
       };
     }
     return { ok: true, stdout: new TextDecoder().decode(out.stdout) };
@@ -489,6 +518,7 @@ export async function runMise(
       error: e instanceof Deno.errors.NotFound
         ? "binary-missing"
         : remoteErrorCode(msg),
+      detail: printableRemoteText(msg).slice(0, 160),
     };
   } finally {
     // A long-lived process running many probes would otherwise accumulate one
@@ -787,7 +817,15 @@ const NodeStateSchema = z.object({
    */
   failureKind: z.string().nullable(),
   transport: z.string(),
+  /** Always a closed-set classification code, never host text. */
   error: z.string().nullable(),
+  /**
+   * A bounded excerpt of the host's own error text, present only when the
+   * errorDetail global argument is enabled. Null otherwise, and null on
+   * success. Split from `error` on purpose: one field is always safe to read
+   * and to publish, the other is opt-in and is not.
+   */
+  errorDetail: z.string().nullable(),
   miseVersion: z.string().nullable(),
   /**
    * The directory the reading came from. null has two causes: an ssh node
@@ -1080,6 +1118,7 @@ export const model = {
                 const err = ls.ok
                   ? "mise exited zero without the JSON object it promises"
                   : ls.error;
+                const detail = ls.ok ? undefined : ls.detail;
                 // The honesty case. Counts stay null so that "we could not
                 // ask" never reads downstream as "there was nothing to find".
                 ctx.logger.warning(
@@ -1096,6 +1135,9 @@ export const model = {
                   failureKind: kind,
                   transport,
                   error: err,
+                  // Opt-in only. With errorDetail off, a novel failure is
+                  // just its code, which is the safe default.
+                  errorDetail: g.errorDetail ? (detail ?? null) : null,
                   miseVersion: null,
                   dir,
                   configCount: null,
@@ -1220,6 +1262,9 @@ export const model = {
                 error: failed.length > 0
                   ? `part measured, no answer from: ${failed.join(", ")}`
                   : null,
+                // Names our own subcommands, not host text: nothing extra
+                // to withhold.
+                errorDetail: null,
                 miseVersion: ver.ok
                   ? (printableRemoteText(ver.stdout.trim().split(" ")[0]) ||
                     null)
@@ -1256,6 +1301,10 @@ export const model = {
                 failureKind: "failed",
                 transport,
                 error: msg,
+                errorDetail: g.errorDetail
+                  ? printableRemoteText((e as Error)?.message ?? String(e))
+                    .slice(0, 160)
+                  : null,
                 miseVersion: null,
                 dir,
                 configCount: null,
