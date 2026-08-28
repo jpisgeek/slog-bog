@@ -147,13 +147,19 @@ dash, which would otherwise let either be read as an ssh option such as
 labels refuse terminal controls at parse time. Every string returned by a host
 is made printable before it reaches a resource field, tag, or log parameter. C0
 and C1 bytes, including ESC, are written as visible `\uNNNN` text instead of
-being handed to a terminal. SSH uses `BatchMode=yes`, so an unknown host key
-fails closed instead of prompting. Errors quote stderr only, never stdout,
-because stdout carries config contents and error strings reach swamp run logs.
-Written data: host labels, the measured directory, mise version, tool names and
-versions, install paths, and config file paths. Install and config paths embed
-the remote account's home directory and real project directory names, so treat
-the datastore as infrastructure detail.
+being handed to a terminal. SSH passes both `BatchMode=yes` and
+`StrictHostKeyChecking=yes` on the command line, so an unknown host key fails
+closed. BatchMode alone would not do that: it removes the prompt but leaves the
+decision to ambient ssh_config, which can be set to accept a key it has never
+seen, and passing the policy as an argument beats any config file. Errors never
+quote host output at all. stderr is read to classify a failure and then
+discarded; what is stored is one of a closed set of codes. Quoting even a
+truncated excerpt would publish whatever the host happened to print, which
+routinely includes URLs carrying credentials. Written data: host labels, the
+measured directory, mise version, tool names and versions, install paths, and
+config file paths. Install and config paths embed the remote account's home
+directory and real project directory names, so treat the datastore as
+infrastructure detail.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

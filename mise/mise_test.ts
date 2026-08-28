@@ -33,6 +33,7 @@ import {
   remoteCommand,
   remoteErrorCode,
   runMise,
+  safeRemoteString,
   satisfiesExpect,
   sshArgs,
   SUB_LS,
@@ -1498,6 +1499,103 @@ Deno.test("an unknown host key is classified, not quoted back", () => {
   assertEquals(code, "host-key-unknown");
   assertEquals(code.includes("builder"), false);
   assertEquals(code.includes("internal"), false);
+});
+
+// ---- remote data is validated and screened before it is persisted ---------
+
+Deno.test("credential-shaped values are omitted, never persisted", () => {
+  const hostile = [
+    "https://deploy:hunter2@artifacts.internal/tools/node",
+    "https://artifacts.example/tool?access_token=abcdefghijklmnop",
+    "https://artifacts.example/tool#api_key=abcdefghijklmnop",
+    "Authorization Bearer abcdefghijklmnopqrstuvwx",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+  ];
+  for (const h of hostile) {
+    assertEquals(
+      safeRemoteString(h),
+      null,
+      `${JSON.stringify(h)} must be omitted, not persisted`,
+    );
+  }
+});
+
+Deno.test("ordinary paths and versions survive screening untouched", () => {
+  // The screen must not be so eager that it eats normal data -- a collector
+  // that drops real values is a different kind of broken.
+  for (
+    const ok of [
+      "/opt/tools/node/22.1.0",
+      "https://artifacts.example/tools/node-22.tar.gz",
+      "22.1.0",
+      "mise.toml",
+      "/srv/project/.config/mise/config.toml",
+    ]
+  ) {
+    assertEquals(safeRemoteString(ok), ok, `${ok} must survive`);
+  }
+});
+
+Deno.test("a malformed ls entry is skipped, not coerced into a measured row", () => {
+  // `entries[0] as Record<string, unknown>` accepted any of these and then
+  // read properties off them, producing a row of nulls that looked measured.
+  const malformed = [
+    '{"node":[42]}',
+    '{"node":["a string"]}',
+    '{"node":[null]}',
+    '{"node":[{"installed":"true","active":"yes"}]}',
+  ];
+  for (const j of malformed) {
+    const rows = parseLsCurrent(j);
+    assertEquals(rows.length, 0, `${j} must produce no rows`);
+  }
+});
+
+Deno.test("a well-formed entry still parses, and unknown fields do not break it", () => {
+  // Tolerating unknown fields is deliberate: mise adds them between releases,
+  // and failing the probe on an upstream addition would make every mise
+  // upgrade an outage of this collector.
+  const rows = parseLsCurrent(
+    '{"node":[{"version":"22.1.0","installed":true,"active":true,' +
+      '"source":{"type":"mise.toml","path":"/srv/p/mise.toml"},' +
+      '"a_field_added_next_release":123}]}',
+  );
+  assertEquals(rows.length, 1);
+  assertEquals(rows[0].resolvedVersion, "22.1.0");
+  assertEquals(rows[0].installed, true);
+  assertEquals(rows[0].sourcePath, "/srv/p/mise.toml");
+  // Not yet asked: the outdated probe has not run at parse time.
+  assertEquals(rows[0].outdated, null);
+});
+
+Deno.test("a source path carrying a credential is dropped from the row", () => {
+  const rows = parseLsCurrent(
+    '{"node":[{"version":"22.1.0","installed":true,"active":true,' +
+      '"source":{"type":"http","path":"https://u:p@registry.internal/n.tgz"}}]}',
+  );
+  assertEquals(rows.length, 1, "the row itself is still worth having");
+  assertEquals(
+    rows[0].sourcePath,
+    null,
+    "the credential-bearing path must be absent, not redacted",
+  );
+  assertEquals(
+    rows[0].resolvedVersion,
+    "22.1.0",
+    "the rest of the row survives",
+  );
+});
+
+Deno.test("an unmeasured outdated probe is null and drifts as unmeasured", () => {
+  // The bug this guards: a failed outdated probe used to make every tool
+  // report outdated:false, which reads as "up to date" -- an unknown rounded
+  // into a healthy value.
+  const drift = classifyTool(
+    { installed: true, active: true },
+    { outdated: null, expectFail: false },
+  );
+  assertEquals(drift.includes("unmeasured"), true);
+  assertEquals(drift.includes("outdated"), false);
 });
 
 // ---- pruning --------------------------------------------------------------

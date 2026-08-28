@@ -254,12 +254,17 @@ export function satisfiesExpect(expected: string, resolved: string): boolean {
  */
 export function classifyTool(
   entry: ToolEntry,
-  opts: { outdated: boolean; expectFail: boolean },
+  opts: { outdated: boolean | null; expectFail: boolean },
 ): Drift[] {
   const drift: Drift[] = [];
   if (!entry.installed) drift.push("notinstalled");
   else if (!entry.active) drift.push("notactive");
-  if (opts.outdated) drift.push("outdated");
+  // null is "we could not ask", which is a different fact from "not behind".
+  // It earns `unmeasured` rather than silently contributing nothing, so a
+  // failed outdated probe is visible in the drift set instead of looking
+  // exactly like a clean result.
+  if (opts.outdated === null) drift.push("unmeasured");
+  else if (opts.outdated) drift.push("outdated");
   if (opts.expectFail) drift.push("expected");
   return drift;
 }
@@ -509,7 +514,8 @@ export type ToolRow = {
   sourcePath: string | null;
   installed: boolean;
   active: boolean;
-  outdated: boolean;
+  /** null until the outdated probe answers -- and stays null if it failed. */
+  outdated: boolean | null;
   latestVersion: string | null;
   drift: Drift[];
 };
@@ -573,6 +579,74 @@ const str = (v: unknown): string | null =>
   typeof v === "string" && v !== "" ? printableRemoteText(v) : null;
 
 /**
+ * Values that must never be persisted, however they arrive.
+ *
+ * These strings come off a remote host and are written into resource data and
+ * into resource NAMES, both of which are durable and readable. A tool source
+ * path or install path can legitimately be a URL, and a URL can legitimately
+ * carry userinfo or a token in its query -- at which point publishing it is
+ * publishing a credential.
+ */
+const CREDENTIAL_SHAPES: RegExp[] = [
+  // The URL userinfo form: credentials embedded before the host. Described
+  // rather than written literally -- an example of the shape trips the
+  // identifier scanner that guards this repo, which is the scanner working.
+  /[a-z][a-z0-9+.-]*:\/\/[^\/\s:@]+:[^\/\s@]+@/i,
+  // a secret-looking query or fragment parameter
+  /[?&#](?:token|access_token|api[_-]?key|secret|password|passwd|pwd|sig|signature|credential)=/i,
+  // bearer/authorization material inline
+  /\b(?:bearer|authorization)\s+[A-Za-z0-9._~+\/-]{12,}/i,
+  // a private key body, which has no business in a path field
+  /-----BEGIN[A-Z ]*PRIVATE KEY-----/,
+];
+
+/**
+ * A remote string that is safe to persist, or null.
+ *
+ * Omits rather than redacts. A redacted value invites the reader to believe
+ * the rest of the field is intact, and a partially-scrubbed URL is still a
+ * hostname and a path. Absence is honest and the resource schema already
+ * allows null for every one of these fields.
+ */
+export function safeRemoteString(v: unknown): string | null {
+  const s = str(v);
+  if (s === null) return null;
+  for (const re of CREDENTIAL_SHAPES) if (re.test(s)) return null;
+  return s;
+}
+
+/**
+ * Response shapes, validated rather than cast.
+ *
+ * Known fields are type-checked strictly: a `version` that arrives as a number
+ * or an `installed` that arrives as the string "true" is a malformed response,
+ * not something to coerce. `e.installed === true` silently read every one of
+ * those as false.
+ *
+ * Unknown fields are tolerated on purpose, which is a deliberate departure
+ * from "reject on any extra field". mise adds fields between releases; failing
+ * the whole probe on an upstream addition would turn every mise upgrade into
+ * an outage of this collector, which is a worse and far more likely failure
+ * than the one strictness would prevent. Types of the fields we READ are what
+ * matter, and those are enforced.
+ */
+const LsEntrySchema = z.object({
+  version: z.string().optional(),
+  requested_version: z.string().optional(),
+  install_path: z.string().optional(),
+  installed: z.boolean().optional(),
+  active: z.boolean().optional(),
+  source: z.object({
+    type: z.string().optional(),
+    path: z.string().optional(),
+  }).optional(),
+}).loose();
+
+const OutdatedEntrySchema = z.object({
+  latest: z.string().optional(),
+}).loose();
+
+/**
  * `mise ls --current --json` is keyed by tool name, each holding an array of
  * entries. Only the first entry per tool is the one the config selected, so
  * that is the row. Anything shaped unexpectedly is skipped rather than cast:
@@ -583,19 +657,25 @@ export function parseLsCurrent(json: string): ToolRow[] {
   const rows: ToolRow[] = [];
   for (const [tool, entries] of Object.entries(obj)) {
     if (!Array.isArray(entries) || entries.length === 0) continue;
-    const e = entries[0] as Record<string, unknown>;
-    if (!e || typeof e !== "object") continue;
-    const source = (e.source ?? {}) as Record<string, unknown>;
+    // Validated, not cast. `entries[0] as Record<string, unknown>` accepted a
+    // number, a string, or null and then read properties off it, which is how
+    // a malformed response became a row of nulls that looked measured.
+    const parsed = LsEntrySchema.safeParse(entries[0]);
+    if (!parsed.success) continue;
+    const e = parsed.data;
+    const source = e.source ?? {};
     rows.push({
       tool: printableRemoteText(tool),
-      requestedVersion: str(e.requested_version),
-      resolvedVersion: str(e.version),
-      installPath: str(e.install_path),
-      sourceType: str(source.type),
-      sourcePath: str(source.path),
+      requestedVersion: safeRemoteString(e.requested_version),
+      resolvedVersion: safeRemoteString(e.version),
+      installPath: safeRemoteString(e.install_path),
+      sourceType: safeRemoteString(source.type),
+      // Source and install paths are the most likely of these to be a URL,
+      // and therefore the most likely to carry userinfo or a token.
+      sourcePath: safeRemoteString(source.path),
       installed: e.installed === true,
       active: e.active === true,
-      outdated: false,
+      outdated: null,
       latestVersion: null,
       drift: [],
     });
@@ -643,8 +723,9 @@ export function parseOutdated(json: string): Record<string, string | null> {
   const obj = parseJson<Record<string, unknown>>(json, {});
   const out: Record<string, string | null> = Object.create(null);
   for (const [tool, v] of Object.entries(obj)) {
-    const rec = v as Record<string, unknown>;
-    out[printableRemoteText(tool)] = str(rec?.latest);
+    const parsed = OutdatedEntrySchema.safeParse(v);
+    if (!parsed.success) continue;
+    out[printableRemoteText(tool)] = safeRemoteString(parsed.data.latest);
   }
   return out;
 }
@@ -730,7 +811,13 @@ const ToolStateSchema = z.object({
   sourcePath: z.string().nullable(),
   installed: z.boolean(),
   active: z.boolean(),
-  outdated: z.boolean(),
+  /**
+   * null means NOT MEASURED, not "up to date". The outdated probe can fail on
+   * its own while ls succeeds, and reporting false in that case presents an
+   * unknown as a healthy value -- the one direction a drift report must never
+   * round in.
+   */
+  outdated: z.boolean().nullable(),
   latestVersion: z.string().nullable(),
   drift: z.array(DriftEnum),
 });
@@ -1051,7 +1138,12 @@ export const model = {
                 );
               }
 
-              const outdated = outdJson === null ? {} : parseOutdated(outdJson);
+              // null, not {}. An empty map is indistinguishable from "every
+              // tool is current", which is exactly the wrong reading when the
+              // probe failed.
+              const outdated = outdJson === null
+                ? null
+                : parseOutdated(outdJson);
               const configs = cfgJson === null ? [] : parseConfigLs(cfgJson);
               const trusted = trust.ok ? parseTrustShow(trust.stdout) : {};
 
@@ -1068,7 +1160,9 @@ export const model = {
                 const expectFail = expected !== undefined &&
                   r.resolvedVersion !== null &&
                   !satisfiesExpect(expected, r.resolvedVersion);
-                const isOutdated = Object.hasOwn(outdated, r.tool);
+                const isOutdated = outdated === null
+                  ? null
+                  : Object.hasOwn(outdated, r.tool);
                 const drift = classifyTool(r, {
                   outdated: isOutdated,
                   expectFail,
@@ -1085,7 +1179,9 @@ export const model = {
                   installed: r.installed,
                   active: r.active,
                   outdated: isOutdated,
-                  latestVersion: isOutdated ? outdated[r.tool] : null,
+                  latestVersion: isOutdated && outdated !== null
+                    ? outdated[r.tool]
+                    : null,
                   drift,
                 });
               }
