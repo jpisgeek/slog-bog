@@ -31,6 +31,7 @@ import {
   parseOutdated,
   parseTrustShow,
   remoteCommand,
+  remoteErrorCode,
   runMise,
   satisfiesExpect,
   sshArgs,
@@ -193,29 +194,50 @@ Deno.test("misePath reaches the remote command unquoted, so its charset is load-
   }
 });
 
+/** Read an `-o Key=value` option out of an argv, independent of position. */
+function sshOpt(args: string[], key: string): string | undefined {
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === "-o" && args[i + 1].startsWith(`${key}=`)) {
+      return args[i + 1].slice(key.length + 1);
+    }
+  }
+  return undefined;
+}
+
 Deno.test("ssh flags fail closed and never spawn a local shell", () => {
   const args = sshArgs(
     { host: "host.example.com", user: "reader", port: 2222 },
     15,
     "mise ls --current --json",
   );
-  assertEquals(args, [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=10",
-    "-p",
-    "2222",
-    "reader@host.example.com",
-    "mise ls --current --json",
-  ]);
+  // Asserted by property rather than by exact argv, so adding an option does
+  // not break the test that exists to protect the security posture.
+  assertEquals(sshOpt(args, "BatchMode"), "yes");
+  // BatchMode alone does not make an unknown host key fail closed -- it only
+  // removes the prompt. Without an explicit policy, ambient ssh_config can set
+  // StrictHostKeyChecking=no and ssh will trust a key it has never seen.
+  assertEquals(sshOpt(args, "StrictHostKeyChecking"), "yes");
+  assertEquals(args[args.length - 2], "reader@host.example.com");
+  assertEquals(args[args.length - 1], "mise ls --current --json");
+  assertEquals(args.includes("2222"), true);
+  // Nothing that could reach a local shell.
+  assertEquals(args.some((a) => a.includes("ProxyCommand")), false);
+});
+
+Deno.test("an unknown host key is never accepted on the ssh command line", () => {
+  const args = sshArgs({ host: "h.example.com", user: "u", port: 22 }, 15, "x");
+  const policy = sshOpt(args, "StrictHostKeyChecking");
+  // "accept-new" would silently trust first contact, which is the failure this
+  // guards: it looks strict and is not.
+  assertEquals(policy, "yes");
+  assertEquals(policy === "no" || policy === "accept-new", false);
 });
 
 Deno.test("connect timeout is capped at ten seconds", () => {
   const args = sshArgs({ host: "h.example.com", user: "u", port: 22 }, 90, "x");
-  assertEquals(args[3], "ConnectTimeout=10");
+  assertEquals(sshOpt(args, "ConnectTimeout"), "10");
   const quick = sshArgs({ host: "h.example.com", user: "u", port: 22 }, 5, "x");
-  assertEquals(quick[3], "ConnectTimeout=5");
+  assertEquals(sshOpt(quick, "ConnectTimeout"), "5");
 });
 
 /** Write an executable fake mise emitting the given stdout/stderr/exit. */
@@ -315,12 +337,17 @@ Deno.test("a missing binary reports notfound rather than an empty tool list", as
   assertEquals(!r.ok && r.kind, "notfound");
 });
 
-Deno.test("stdout is withheld from the error on a failed run", async () => {
-  // stdout can carry config contents. Errors reach swamp run logs and
-  // reports, so only stderr is quoted back.
+Deno.test("no remote text reaches the error, from stdout or stderr", async () => {
+  // This used to assert only that stdout was withheld while stderr was quoted
+  // back. Quoting stderr was the bug: it routinely carries credential-bearing
+  // URLs, tokens, private hostnames and home paths, and the error string is
+  // written into resources AND logs, so one failure published infrastructure
+  // detail permanently. Now NEITHER stream reaches it -- stderr is read to
+  // classify and then discarded.
   const m = await fakeMise({
     stdout: "SENSITIVE-CONFIG-BODY",
-    stderr: "error: could not read config",
+    stderr:
+      "error: could not read https://user:hunter2@vault.internal/secret/path",
     exit: 1,
   });
   try {
@@ -331,12 +358,37 @@ Deno.test("stdout is withheld from the error on a failed run", async () => {
       new AbortController().signal,
     );
     assertEquals(r.ok, false);
+    if (r.ok) return;
+    for (
+      const leak of [
+        "SENSITIVE-CONFIG-BODY",
+        "hunter2",
+        "vault.internal",
+        "secret/path",
+        "user:",
+      ]
+    ) {
+      assertEquals(
+        r.error.includes(leak),
+        false,
+        `remote text ${JSON.stringify(leak)} must never reach the error`,
+      );
+    }
+    // What survives is a closed-set code, not an excerpt.
     assertEquals(
-      !r.ok && r.error.includes("SENSITIVE-CONFIG-BODY"),
-      false,
-      "stdout must never reach the error string",
+      [
+        "binary-missing",
+        "permission-denied",
+        "host-key-unknown",
+        "connection-failed",
+        "config-error",
+        "timed-out",
+        "nonzero-exit",
+        "unclassified",
+      ].includes(r.error),
+      true,
+      `error must be a fixed code, got ${JSON.stringify(r.error)}`,
     );
-    assertEquals(!r.ok && r.error.includes("could not read config"), true);
   } finally {
     await m.cleanup();
   }
@@ -1252,7 +1304,19 @@ Deno.test("one node's exception never discards the fleet", async () => {
       /[\u0000-\u001f\u007f-\u009f]/.test(String(gone.error)),
       false,
     );
-    assertStringIncludes(String(gone.error), "logger");
+    // The exception's own text must NOT survive into the resource. It used
+    // to, escaped and truncated, which is not sanitisation -- an exception
+    // message carries a path, a host, or a credential just as easily as the
+    // word "logger". A closed-set code is what gets written now.
+    assertEquals(
+      String(gone.error).includes("logger"),
+      false,
+      "exception text must never reach a written resource",
+    );
+    // "unclassified" is the right answer here and worth asserting: the
+    // failure was a thrown logger, not a remote condition, so the classifier
+    // declines to name it rather than guessing at the nearest code.
+    assertEquals(String(gone.error), "unclassified");
     for (const log of c.logs) {
       assertNoControlCharacters(log.values);
     }
@@ -1321,13 +1385,119 @@ Deno.test("an ssh node is reached with ssh, not the local binary", async () => {
     // back notfound. Success here means ssh was the process that ran.
     assertEquals(r.ok, true);
     const argv = r.ok ? r.stdout.trim().split("\n") : [];
-    assertEquals(argv[0], "-o");
-    assertEquals(argv[1], "BatchMode=yes");
-    assertEquals(argv[6], "reader@builder.example.com");
-    assertEquals(argv[7], "/nonexistent/mise ls --current --json");
+    // Asserted by position from the END and by option lookup, not by fixed
+    // index: adding an ssh option must not break a test about which binary
+    // ran. An earlier version indexed argv[6]/argv[7] and broke the moment
+    // StrictHostKeyChecking was added.
+    assertEquals(sshOpt(argv, "BatchMode"), "yes");
+    assertEquals(sshOpt(argv, "StrictHostKeyChecking"), "yes");
+    assertEquals(argv[argv.length - 2], "reader@builder.example.com");
+    assertEquals(
+      argv[argv.length - 1],
+      "/nonexistent/mise ls --current --json",
+    );
   } finally {
     await ssh.restore();
   }
+});
+
+// ---- error classification, added when raw remote text stopped being stored --
+
+/** The complete vocabulary remoteErrorCode may ever return. */
+const ERROR_CODES = [
+  "binary-missing",
+  "permission-denied",
+  "host-key-unknown",
+  "connection-failed",
+  "config-error",
+  "timed-out",
+  "nonzero-exit",
+  "unclassified",
+];
+
+Deno.test("remoteErrorCode returns only closed-set codes, so it cannot leak", () => {
+  // The guarantee is structural rather than filter-based: if the output is
+  // always drawn from a fixed vocabulary, no input can survive into it. That
+  // is stronger than checking for known-bad substrings, which only catches
+  // the secrets someone thought to list.
+  const hostile = [
+    "ssh://deploy:s3cr3t@vault.internal:8200/v1/kv/prod",
+    "Permission denied (publickey) for /Users/someone/.ssh/id_ed25519",
+    "could not read /srv/private-project/mise.toml",
+    "Host key verification failed for build-01.corp.example",
+    "mise failed: token=eyJhbGciOiJIUzI1NiJ9.secret.sig",
+    "",
+  ];
+  for (const h of hostile) {
+    const code = remoteErrorCode(h);
+    assertEquals(
+      ERROR_CODES.includes(code),
+      true,
+      `${JSON.stringify(code)} is not in the closed set`,
+    );
+  }
+});
+
+Deno.test("identifying detail from the input never appears in the code", () => {
+  // Spot-check the classes that actually matter, on top of the structural
+  // guarantee above: credentials, hosts, and paths.
+  const cases: [string, string[]][] = [
+    ["ssh://deploy:s3cr3t@vault.internal/v1/kv", [
+      "s3cr3t",
+      "vault.internal",
+      "deploy",
+    ]],
+    ["Permission denied for /Users/someone/.ssh/id_ed25519", [
+      "someone",
+      "id_ed25519",
+      "Users",
+    ]],
+    ["Host key verification failed for build-01.corp.example", [
+      "build-01",
+      "corp.example",
+    ]],
+  ];
+  for (const [input, secrets] of cases) {
+    const code = remoteErrorCode(input);
+    for (const sec of secrets) {
+      assertEquals(
+        code.includes(sec),
+        false,
+        `code ${JSON.stringify(code)} leaked ${JSON.stringify(sec)}`,
+      );
+    }
+  }
+});
+
+Deno.test("remoteErrorCode classifies the cases that matter, in priority order", () => {
+  assertEquals(
+    remoteErrorCode("Host key verification failed."),
+    "host-key-unknown",
+  );
+  assertEquals(
+    remoteErrorCode("bash: mise: command not found"),
+    "binary-missing",
+  );
+  assertEquals(
+    remoteErrorCode("Permission denied (publickey)."),
+    "permission-denied",
+  );
+  // "connection timed out" is a network fact, not our deadline expiring --
+  // the connection pattern must win over the generic timeout one.
+  assertEquals(
+    remoteErrorCode("ssh: connect to host x: Connection timed out"),
+    "connection-failed",
+  );
+  assertEquals(remoteErrorCode("something nobody predicted"), "unclassified");
+});
+
+Deno.test("an unknown host key is classified, not quoted back", () => {
+  const code = remoteErrorCode(
+    "Host key verification failed for builder.internal.example",
+  );
+  assertEquals(code, "host-key-unknown");
+  assertEquals(code.includes("builder"), false);
+  assertEquals(code.includes("internal"), false);
 });
 
 // ---- pruning --------------------------------------------------------------
@@ -1437,7 +1607,7 @@ Deno.test("a host that could not be measured keeps its history", async () => {
 
 // ---- schema discipline ----------------------------------------------------
 
-Deno.test("resource names carry sixty-four bits of hash", async () => {
+Deno.test("resource names carry a full-width identity hash", async () => {
   // Tool names come off a remote host, and slugPart collapses punctuation
   // runs, so the readable half hides a lot of variation. The hash is what
   // keeps two of those apart.
@@ -1452,7 +1622,7 @@ Deno.test("resource names carry sixty-four bits of hash", async () => {
       .filter((w) => w.spec !== "summary")
       .map((w) => w.name);
     assertEquals(names.length, 3, "one node, one tool, one config");
-    for (const n of names) assertMatch(n, /-[0-9a-f]{16}$/);
+    for (const n of names) assertMatch(n, /-[0-9a-f]{64}$/);
   } finally {
     await m.cleanup();
   }
@@ -1489,7 +1659,7 @@ Deno.test("two identities that collide under a weak hash stay apart", async () =
     // under the old one it did not: one name, one surviving row, one tool
     // quietly gone from the reading.
     assertEquals(
-      new Set(tools.map((t) => t.name.replace(/-[0-9a-f]{16}$/, ""))).size,
+      new Set(tools.map((t) => t.name.replace(/-[0-9a-f]{64}$/, ""))).size,
       1,
       "the fixture is only meaningful if the readable halves match",
     );

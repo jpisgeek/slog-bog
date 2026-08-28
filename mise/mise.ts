@@ -45,9 +45,56 @@ function printableRemoteText(value: string): string {
   return printable;
 }
 
-/** A bounded printable excerpt for resource errors and logger parameters. */
-function remoteError(value: string): string {
-  return printableRemoteText(value).slice(0, 160);
+/**
+ * Reduce arbitrary remote text to a fixed, safe code.
+ *
+ * This used to return a printable 160-character excerpt of stderr. Escaping
+ * control bytes and truncating does not sanitise: remote stderr routinely
+ * carries credential-bearing URLs, tokens in query strings, private hostnames,
+ * account names and home-directory paths, and any of those fit in 160
+ * characters. That text was written into resources AND logs, so one unlucky
+ * failure published infrastructure detail into the datastore permanently.
+ *
+ * Classification needs to READ stderr; nothing needs to STORE it. The matching
+ * still runs against the full text and only the verdict escapes.
+ */
+export type RemoteErrorCode =
+  | "binary-missing"
+  | "permission-denied"
+  | "host-key-unknown"
+  | "connection-failed"
+  | "config-error"
+  | "timed-out"
+  | "nonzero-exit"
+  | "unclassified";
+
+const ERROR_PATTERNS: [RegExp, RemoteErrorCode][] = [
+  [
+    /host key verification failed|remote host identification/i,
+    "host-key-unknown",
+  ],
+  [/command not found|no such file or directory/i, "binary-missing"],
+  [
+    /permission denied|access denied|operation not permitted/i,
+    "permission-denied",
+  ],
+  [
+    /connection (refused|closed|timed out)|could not resolve|network is unreachable|no route to host/i,
+    "connection-failed",
+  ],
+  [/timed out|timeout/i, "timed-out"],
+  [/toml|parse error|invalid config/i, "config-error"],
+];
+
+/**
+ * Classify remote failure text into one of a closed set of codes. Never
+ * returns any part of the input. Order matters: the most specific patterns
+ * are tried first, because "connection timed out" is a connection failure
+ * rather than our deadline expiring.
+ */
+export function remoteErrorCode(value: string): RemoteErrorCode {
+  for (const [re, code] of ERROR_PATTERNS) if (re.test(value)) return code;
+  return "unclassified";
 }
 
 const SshSchema = z.object({
@@ -269,6 +316,14 @@ export function sshArgs(
   return [
     "-o",
     "BatchMode=yes",
+    // BatchMode alone does NOT guarantee an unknown host key fails closed:
+    // it disables the interactive prompt, but ambient ssh_config can still
+    // set StrictHostKeyChecking=no or accept-new, in which case ssh trusts a
+    // key it has never seen and connects anyway. Passing the policy on the
+    // command line beats any config file, so the guarantee is ours rather
+    // than the operator's environment's.
+    "-o",
+    "StrictHostKeyChecking=yes",
     "-o",
     `ConnectTimeout=${Math.min(timeoutSec, 10)}`,
     "-p",
@@ -351,6 +406,16 @@ export async function runMise(
   signal: AbortSignal,
 ): Promise<RunResult> {
   const bin = node.misePath ?? "mise";
+  // Our own deadline gets its own controller rather than being folded into the
+  // caller's signal with AbortSignal.any. Composed that way the two are
+  // indistinguishable afterwards, so a host that merely took too long was
+  // reported as a generic remote failure -- a classification that says
+  // something about the host when the truth was about us.
+  const deadline = new AbortController();
+  const timer = setTimeout(
+    () => deadline.abort(new Error("deadline")),
+    (timeoutSec + 10) * 1000,
+  );
   const cmd = node.ssh
     ? new Deno.Command("ssh", {
       args: sshArgs(
@@ -361,20 +426,14 @@ export async function runMise(
       stdin: "null",
       stdout: "piped",
       stderr: "piped",
-      signal: AbortSignal.any([
-        signal,
-        AbortSignal.timeout((timeoutSec + 10) * 1000),
-      ]),
+      signal: AbortSignal.any([signal, deadline.signal]),
     })
     : new Deno.Command(bin, {
       args: localArgs(node.dir, sub),
       stdin: "null",
       stdout: "piped",
       stderr: "piped",
-      signal: AbortSignal.any([
-        signal,
-        AbortSignal.timeout((timeoutSec + 10) * 1000),
-      ]),
+      signal: AbortSignal.any([signal, deadline.signal]),
     });
 
   try {
@@ -390,12 +449,19 @@ export async function runMise(
     if (signal.aborted) {
       throw signal.reason ?? new Error("run cancelled by the caller");
     }
+    // Our own deadline, not the caller's cancellation. Keeping the two signals
+    // apart is the whole point: a host that merely ran out of time is a fact
+    // about the host, and folding it into the caller's signal made it
+    // indistinguishable from a generic remote failure.
+    if (deadline.signal.aborted) {
+      return { ok: false, kind: "failed", error: "timed-out" };
+    }
     const stderr = new TextDecoder().decode(out.stderr).trim();
     if (!out.success) {
       return {
         ok: false,
         kind: classifyFailure(out.code, stderr),
-        error: remoteError(stderr) || `exit ${out.code}`,
+        error: stderr ? remoteErrorCode(stderr) : "nonzero-exit",
       };
     }
     return { ok: true, stdout: new TextDecoder().decode(out.stdout) };
@@ -404,6 +470,9 @@ export async function runMise(
     // thrown by a spawn that never got off the ground. The caller pulling
     // the run away says nothing about this host, so it is never classified.
     if (signal.aborted) throw e;
+    if (deadline.signal.aborted) {
+      return { ok: false, kind: "failed", error: "timed-out" };
+    }
     // Deno throws NotFound when the local binary itself is absent, which is
     // the same fact as a shell's 127 and must classify the same way.
     const msg = (e as Error).message;
@@ -412,8 +481,14 @@ export async function runMise(
       kind: e instanceof Deno.errors.NotFound
         ? "notfound"
         : classifyFailure(-1, msg),
-      error: remoteError(msg),
+      error: e instanceof Deno.errors.NotFound
+        ? "binary-missing"
+        : remoteErrorCode(msg),
     };
+  } finally {
+    // A long-lived process running many probes would otherwise accumulate one
+    // live timer per call until each fired.
+    clearTimeout(timer);
   }
 }
 
@@ -704,12 +779,26 @@ const SummarySchema = z.object({
  * list that is deliberately empty. It is async, which is the only reason
  * resourceName is.
  */
+/**
+ * Identity digest for a resource name.
+ *
+ * This was the first 8 bytes of SHA-256. 64 bits is not a collision-resistant
+ * identity when part of the input is remote-controlled: a birthday search over
+ * tool names or paths is ~2^32 work offline, which is minutes, and a collision
+ * means two different tools resolve to the same resource name and one silently
+ * overwrites the other. The length-prefixed encoding below makes distinct
+ * identities distinct as INPUTS; truncating the digest threw that guarantee
+ * away at the last step.
+ *
+ * 32 bytes is 2^128 collision resistance and costs 48 more characters in a
+ * name nothing reads by eye.
+ */
 async function shortHash(s: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode(s),
   );
-  return Array.from(new Uint8Array(digest).subarray(0, 8))
+  return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
@@ -1056,7 +1145,7 @@ export const model = {
               // from. The workers run under Promise.all, so an escaping
               // error would take the whole sweep with it and nothing at all
               // would be written, including for every host that answered.
-              const msg = remoteError(
+              const msg = remoteErrorCode(
                 (e as Error)?.message ?? String(e),
               );
               // Record first, log second. The logger is the one thing in here
