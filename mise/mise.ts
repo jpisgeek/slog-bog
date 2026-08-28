@@ -34,13 +34,69 @@ const SAFE_BIN_PATH = /^[A-Za-z0-9._/-]+$/;
  * actually returned. The resulting text is plain ASCII at every control-byte
  * position, including ESC, so a terminal never gets a sequence to act on.
  */
+/**
+ * Characters that must never reach a resource field, tag, log parameter, or
+ * resource name as themselves.
+ *
+ * This was C0 and C1 only, which is the terminal-safety half of the problem
+ * and not the display-integrity half. Unicode format characters -- the
+ * bidirectional overrides U+202A..U+202E and isolates U+2066..U+2069, the
+ * marks U+200E/U+200F/U+061C, and the zero-width joiners -- are not control
+ * bytes and pass that filter untouched. They can visually reverse or hide
+ * parts of a string, so a tool named with an embedded override renders as a
+ * different tool than the one stored, in a resource name a human then reads
+ * to decide something. Nothing in a mise tool name, version, or path has a
+ * legitimate use for them.
+ *
+ * Matched by Unicode general category rather than a list of code points:
+ * Cc (control), Cf (format, which is where the bidi and zero-width characters
+ * live), and Zl/Zp (line and paragraph separators). A list would need
+ * revisiting every time Unicode adds a member; the categories do not.
+ */
+/**
+ * Ceilings on remote input.
+ *
+ * Everything below crosses a process boundary from a host this model does not
+ * control, and none of it had a bound. A compromised or simply broken host
+ * could return output until the collector ran out of memory, or a tool name
+ * long enough to make a resource name unusable. The limits are far above any
+ * legitimate value -- mise's own output for a large fleet host is kilobytes,
+ * not megabytes -- so they never truncate real data; they exist so the worst
+ * case is bounded rather than unbounded.
+ */
+const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+const MAX_SLUG_CHARS = 64;
+
+/**
+ * Decode a process stream, refusing to hold more than the ceiling.
+ *
+ * Truncation is marked rather than silent: a JSON payload cut in half fails
+ * to parse and is already handled as an unreadable response, and a cut stderr
+ * still classifies. Silently returning the first 4 MB as though it were the
+ * whole answer is the one behaviour that would turn a hostile host into a
+ * wrong measurement instead of a failed one.
+ */
+function boundedDecode(buf: Uint8Array): string {
+  if (buf.byteLength <= MAX_OUTPUT_BYTES) {
+    return new TextDecoder().decode(buf);
+  }
+  return new TextDecoder().decode(buf.subarray(0, MAX_OUTPUT_BYTES)) +
+    "\n[truncated: output exceeded the size limit]";
+}
+
+const UNSAFE_TEXT_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
 function printableRemoteText(value: string): string {
   let printable = "";
+  // Iterate by code point, not code unit: charCodeAt(0) on an astral
+  // character returns its high surrogate, which is not the character.
   for (const char of value) {
-    const code = char.charCodeAt(0);
-    printable += code <= 0x1f || (code >= 0x7f && code <= 0x9f)
-      ? `\\u${code.toString(16).padStart(4, "0")}`
-      : char;
+    if (UNSAFE_TEXT_RE.test(char)) {
+      const cp = char.codePointAt(0) ?? 0;
+      printable += `\\u${cp.toString(16).padStart(4, "0")}`;
+    } else {
+      printable += char;
+    }
   }
   return printable;
 }
@@ -291,6 +347,19 @@ export const SUB_LS = ["ls", "--current", "--json"];
 export const SUB_CONFIG = ["config", "ls", "--json"];
 /** Installed tools mise considers behind latest, the source for the "outdated" drift flag. */
 export const SUB_OUTDATED = ["outdated", "--json"];
+/**
+ * The version mise reported, or null if it did not report one.
+ *
+ * `mise --version` prints "2025.1.0 macos-arm64 (...)", so the first token is
+ * the version. Anything that is not version-shaped is a host printing over
+ * the answer, and null is how that gets said -- which in turn marks the node
+ * degraded rather than letting a banner stand in for a version.
+ */
+export function parseVersion(stdout: string): string | null {
+  const first = printableRemoteText(stdout.trim()).split(/\s+/)[0] ?? "";
+  return /^v?\d+(\.\d+)*/.test(first) ? first : null;
+}
+
 /** Confirms mise answered at all and records which build ran, for the node record's miseVersion field. */
 export const SUB_VERSION = ["--version"];
 /** Per-config trust state, recorded for context only. See parseTrustShow for why it never drives drift on its own. */
@@ -489,7 +558,7 @@ export async function runMise(
     if (deadline.signal.aborted) {
       return { ok: false, kind: "failed", error: "timed-out" };
     }
-    const stderr = new TextDecoder().decode(out.stderr).trim();
+    const stderr = boundedDecode(out.stderr).trim();
     if (!out.success) {
       return {
         ok: false,
@@ -498,7 +567,7 @@ export async function runMise(
         detail: stderr ? printableRemoteText(stderr).slice(0, 160) : undefined,
       };
     }
-    return { ok: true, stdout: new TextDecoder().decode(out.stdout) };
+    return { ok: true, stdout: boundedDecode(out.stdout) };
   } catch (e) {
     // Cancellation leaves by this door, whether it was raised just above or
     // thrown by a spawn that never got off the ground. The caller pulling
@@ -646,6 +715,44 @@ export function safeRemoteString(v: unknown): string | null {
 }
 
 /**
+ * A count of entries a parser refused.
+ *
+ * Every parser below skips entries it cannot vouch for, which is correct --
+ * a malformed row is not a measurement. What was wrong was skipping them
+ * silently: a host that answered with fifty tools and forty malformed rows
+ * produced ten clean rows and a node record that claimed to be fully
+ * measured. The reader could not tell a thin host from a broken answer.
+ *
+ * A sink is optional so the parsers stay callable on their own, and it is a
+ * mutable object rather than a changed return type so the counting is
+ * additive across the several parsers that feed one node's reading.
+ */
+export interface DropSink {
+  dropped: number;
+}
+
+function noteDrop(sink: DropSink | undefined): void {
+  if (sink) sink.dropped += 1;
+}
+
+/**
+ * A remote string safe to use as a KEY, or null.
+ *
+ * Same screening as safeRemoteString, applied to the values that become tool
+ * names, config paths and tags. Screening only the value fields was half a
+ * job: a key is written into resource names and into tags, which are the most
+ * visible and most queried surface of the whole record, and nothing stopped a
+ * tool name from being a URL carrying userinfo. A key cannot be nulled the way
+ * a field can -- there is nothing left to hang the row on -- so an unsafe key
+ * drops the entry and counts it.
+ */
+export function safeRemoteKey(v: unknown, sink?: DropSink): string | null {
+  const s = safeRemoteString(v);
+  if (s === null) noteDrop(sink);
+  return s;
+}
+
+/**
  * Response shapes, validated rather than cast.
  *
  * Known fields are type-checked strictly: a `version` that arrives as a number
@@ -672,6 +779,11 @@ const LsEntrySchema = z.object({
   }).optional(),
 }).loose();
 
+const ConfigEntrySchema = z.object({
+  path: z.string(),
+  tools: z.array(z.string()).optional(),
+}).loose();
+
 const OutdatedEntrySchema = z.object({
   latest: z.string().optional(),
 }).loose();
@@ -682,20 +794,28 @@ const OutdatedEntrySchema = z.object({
  * that is the row. Anything shaped unexpectedly is skipped rather than cast:
  * this data crosses a process boundary and nothing validates it upstream.
  */
-export function parseLsCurrent(json: string): ToolRow[] {
+export function parseLsCurrent(json: string, sink?: DropSink): ToolRow[] {
   const obj = parseJson<Record<string, unknown>>(json, {});
   const rows: ToolRow[] = [];
   for (const [tool, entries] of Object.entries(obj)) {
-    if (!Array.isArray(entries) || entries.length === 0) continue;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      noteDrop(sink);
+      continue;
+    }
     // Validated, not cast. `entries[0] as Record<string, unknown>` accepted a
     // number, a string, or null and then read properties off it, which is how
     // a malformed response became a row of nulls that looked measured.
     const parsed = LsEntrySchema.safeParse(entries[0]);
-    if (!parsed.success) continue;
+    if (!parsed.success) {
+      noteDrop(sink);
+      continue;
+    }
+    const name = safeRemoteKey(tool, sink);
+    if (name === null) continue;
     const e = parsed.data;
     const source = e.source ?? {};
     rows.push({
-      tool: printableRemoteText(tool),
+      tool: name,
       requestedVersion: safeRemoteString(e.requested_version),
       resolvedVersion: safeRemoteString(e.version),
       installPath: safeRemoteString(e.install_path),
@@ -721,17 +841,29 @@ export function parseLsCurrent(json: string): ToolRow[] {
  */
 export function parseConfigLs(
   json: string,
+  sink?: DropSink,
 ): { path: string; tools: string[] }[] {
   const arr = parseJson<unknown[]>(json, []);
   if (!Array.isArray(arr)) return [];
   const out: { path: string; tools: string[] }[] = [];
   for (const raw of arr) {
-    const c = raw as Record<string, unknown>;
-    const path = str(c?.path);
-    if (!path) continue;
-    const tools = Array.isArray(c.tools)
-      ? c.tools.map((t) => printableRemoteText(String(t)))
-      : [];
+    // Validated, not cast. The cast let a number or null through and then
+    // read `.path` off it, which is undefined rather than an error.
+    const parsed = ConfigEntrySchema.safeParse(raw);
+    if (!parsed.success) {
+      noteDrop(sink);
+      continue;
+    }
+    const path = safeRemoteKey(parsed.data.path, sink);
+    if (path === null) continue;
+    // A declared tool name becomes a tag, so it is screened the same way. A
+    // dropped name is counted: the config still parsed, but the list of what
+    // it declares is now short, and a short list reads as "declares less".
+    const tools: string[] = [];
+    for (const t of parsed.data.tools ?? []) {
+      const name = safeRemoteKey(t, sink);
+      if (name !== null) tools.push(name);
+    }
     out.push({ path, tools });
   }
   return out;
@@ -749,13 +881,21 @@ export function parseConfigLs(
  * there. Callers still use Object.hasOwn, and now they are not the only
  * thing standing in the way.
  */
-export function parseOutdated(json: string): Record<string, string | null> {
+export function parseOutdated(
+  json: string,
+  sink?: DropSink,
+): Record<string, string | null> {
   const obj = parseJson<Record<string, unknown>>(json, {});
   const out: Record<string, string | null> = Object.create(null);
   for (const [tool, v] of Object.entries(obj)) {
     const parsed = OutdatedEntrySchema.safeParse(v);
-    if (!parsed.success) continue;
-    out[printableRemoteText(tool)] = safeRemoteString(parsed.data.latest);
+    if (!parsed.success) {
+      noteDrop(sink);
+      continue;
+    }
+    const name = safeRemoteKey(tool, sink);
+    if (name === null) continue;
+    out[name] = safeRemoteString(parsed.data.latest);
   }
   return out;
 }
@@ -765,19 +905,29 @@ export function parseOutdated(json: string): Record<string, string | null> {
  * lines. Recorded for context only. An untrusted plain [tools] config still
  * applies, so trust is never a drift trigger on its own.
  */
-export function parseTrustShow(text: string): Record<string, boolean> {
+export function parseTrustShow(
+  text: string,
+  sink?: DropSink,
+): Record<string, boolean> {
   // No prototype here either. These keys are config paths from the same
   // remote host, so a lookup that misses must come back empty rather than
   // walking up to Object.prototype and finding a function.
   const out: Record<string, boolean> = Object.create(null);
   for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
     const idx = line.lastIndexOf(": ");
-    if (idx === -1) continue;
-    const path = printableRemoteText(line.slice(0, idx).trim());
+    if (idx === -1) {
+      noteDrop(sink);
+      continue;
+    }
+    const path = safeRemoteKey(line.slice(0, idx).trim(), sink);
     const status = line.slice(idx + 2).trim();
-    if (!path) continue;
+    if (path === null) continue;
     if (status === "trusted") out[path] = true;
     else if (status === "untrusted") out[path] = false;
+    // Any other status is a line this parser does not understand, which is
+    // the same kind of hole as a malformed row.
+    else noteDrop(sink);
   }
   return out;
 }
@@ -797,7 +947,8 @@ const NodeStateSchema = z.object({
    */
   measured: z.boolean(),
   /**
-   * mise answered, but at least one of the follow-up subcommands did not.
+   * mise answered, but at least one of the follow-up subcommands did not, or
+   * some of what it did answer was unreadable.
    * The drift counts on a degraded node are a floor rather than a total: the
    * outdated probe has to reach an upstream registry, and a host busy enough
    * to time it out still reports every tool it has. Read this before reading
@@ -806,6 +957,14 @@ const NodeStateSchema = z.object({
   degraded: z.boolean(),
   /** Which subcommands went unanswered: "config", "outdated", "trust", "version". */
   failedSubcommands: z.array(z.string()),
+  /**
+   * How many entries this host's answers contained that no parser would
+   * vouch for: malformed rows, unreadable trust lines, and names that
+   * screened as credential-shaped. Non-zero means the counts below are a
+   * floor, and it is why such a host is degraded rather than clean. Null on
+   * a host that was never measured, because nothing was parsed to drop.
+   */
+  droppedEntries: z.number().nullable(),
   /**
    * How an unmeasured host failed. "notfound" when mise itself was absent,
    * "failed" when mise ran and hit a real problem, and "unparseable" when the
@@ -973,7 +1132,13 @@ function slugPart(p: string): string {
     .replace(/[^a-zA-Z0-9]+/g, "-")
     .toLowerCase()
     .replace(/^-+|-+$/g, "");
-  return s === "" ? "x" : s;
+  // Bounded because the input is remote. A host returning a megabyte-long
+  // tool name would otherwise put a megabyte-long readable half into a
+  // resource NAME, which is an identifier that gets stored, indexed and
+  // displayed. Identity is unaffected: the full value is still hashed, so
+  // truncating the readable half cannot merge two distinct identities.
+  const capped = s.length > MAX_SLUG_CHARS ? s.slice(0, MAX_SLUG_CHARS) : s;
+  return capped === "" ? "x" : capped;
 }
 
 /**
@@ -1131,6 +1296,7 @@ export const model = {
                   // Not part measured, not measured at all. The unmeasured
                   // drift record below carries that whole fact on its own.
                   degraded: false,
+                  droppedEntries: null,
                   failedSubcommands: [],
                   failureKind: kind,
                   transport,
@@ -1147,7 +1313,11 @@ export const model = {
                 continue;
               }
 
-              const rows = parseLsCurrent(lsJson);
+              // One sink for the whole node: every parser adds to it, so a
+              // host that answers badly in several places is degraded once
+              // with a total, rather than per-parser.
+              const drops: DropSink = { dropped: 0 };
+              const rows = parseLsCurrent(lsJson, drops);
               const ver = await run(SUB_VERSION);
               const cfg = await run(SUB_CONFIG);
               const outd = await run(SUB_OUTDATED);
@@ -1164,30 +1334,54 @@ export const model = {
               // The two JSON probes are held to their promised shape as
               // well as to the exit code, and the shapes differ: config ls
               // lists files, outdated is keyed by tool. `trust --show` and
-              // `--version` are plain text with no shape to fail, so an exit
-              // code is all there is to judge them on.
+              // `--version` are plain text with no JSON shape to fail, so
+              // they are judged on whether the text itself parsed.
               const cfgJson = jsonStdout(cfg, "array");
               const outdJson = jsonStdout(outd, "object");
-              const failed: string[] = [];
-              if (cfgJson === null) failed.push("config");
-              if (outdJson === null) failed.push("outdated");
-              if (!trust.ok) failed.push("trust");
-              if (!ver.ok) failed.push("version");
-              if (failed.length > 0) {
-                ctx.logger.warning(
-                  "{name} answered in part, no reading from: {subs}",
-                  { name: node.name, subs: failed.join(", ") },
-                );
-              }
 
               // null, not {}. An empty map is indistinguishable from "every
               // tool is current", which is exactly the wrong reading when the
               // probe failed.
               const outdated = outdJson === null
                 ? null
-                : parseOutdated(outdJson);
-              const configs = cfgJson === null ? [] : parseConfigLs(cfgJson);
-              const trusted = trust.ok ? parseTrustShow(trust.stdout) : {};
+                : parseOutdated(outdJson, drops);
+              const configs = cfgJson === null
+                ? []
+                : parseConfigLs(cfgJson, drops);
+              const trusted = trust.ok
+                ? parseTrustShow(trust.stdout, drops)
+                : {};
+
+              // A zero exit is not an answer. These two checks used to stop
+              // at the exit code, so a login shell that printed a banner over
+              // the top of the answer and exited zero passed -- and produced
+              // a node record with a null version and an empty trust map that
+              // read as measured. Judge the text too: a version line has to
+              // be version-shaped, and trust output is either genuinely empty
+              // or lines this parser understood.
+              const miseVersion = ver.ok ? parseVersion(ver.stdout) : null;
+              const trustReadable = !trust.ok ||
+                trust.stdout.trim() === "" ||
+                Object.keys(trusted).length > 0;
+
+              const failed: string[] = [];
+              if (cfgJson === null) failed.push("config");
+              if (outdJson === null) failed.push("outdated");
+              if (!trust.ok || !trustReadable) failed.push("trust");
+              if (!ver.ok || miseVersion === null) failed.push("version");
+              if (failed.length > 0) {
+                ctx.logger.warning(
+                  "{name} answered in part, no reading from: {subs}",
+                  { name: node.name, subs: failed.join(", ") },
+                );
+              }
+              if (drops.dropped > 0) {
+                ctx.logger.warning(
+                  "{name} returned {n} entries no parser would accept; " +
+                    "its counts are a floor",
+                  { name: node.name, n: String(drops.dropped) },
+                );
+              }
 
               const nodeDrift = new Set<Drift>();
               for (const r of rows) {
@@ -1253,7 +1447,8 @@ export const model = {
               nodeStates.push({
                 name: node.name,
                 measured: true,
-                degraded: failed.length > 0,
+                degraded: failed.length > 0 || drops.dropped > 0,
+                droppedEntries: drops.dropped,
                 failedSubcommands: failed,
                 failureKind: null,
                 transport,
@@ -1265,10 +1460,7 @@ export const model = {
                 // Names our own subcommands, not host text: nothing extra
                 // to withhold.
                 errorDetail: null,
-                miseVersion: ver.ok
-                  ? (printableRemoteText(ver.stdout.trim().split(" ")[0]) ||
-                    null)
-                  : null,
+                miseVersion,
                 dir,
                 // Zero configs is a measurement. No answer from config ls is
                 // the absence of one, and null is how that is written down.
@@ -1296,6 +1488,7 @@ export const model = {
                 name: node.name,
                 measured: false,
                 degraded: false,
+                droppedEntries: null,
                 failedSubcommands: [],
                 // Nothing here says mise was absent. The sweep broke.
                 failureKind: "failed",

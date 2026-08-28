@@ -30,9 +30,11 @@ import {
   parseLsCurrent,
   parseOutdated,
   parseTrustShow,
+  parseVersion,
   remoteCommand,
   remoteErrorCode,
   runMise,
+  safeRemoteKey,
   safeRemoteString,
   satisfiesExpect,
   sshArgs,
@@ -1887,4 +1889,115 @@ Deno.test("a misspelled drift class never reaches stored data", () => {
     schema.safeParse({ ...row, drift: ["notinstalled"] }).success,
     true,
   );
+});
+
+
+Deno.test("a bidi override in a tool name is escaped, not rendered", () => {
+  // U+202E flips the rendering of everything after it, so a name stored as
+  // "nod‮elbat" reads on screen as a different tool than the one the row
+  // is about. The bytes are not control bytes, so the old C0/C1 filter passed
+  // them through untouched and the escape landed in a resource NAME.
+  const rows = parseLsCurrent(
+    '{"nod‮elbat":[{"version":"22.1.0","installed":true,"active":true}]}',
+  );
+  assertEquals(rows.length, 1);
+  assertEquals(
+    rows[0].tool.includes("‮"),
+    false,
+    "no bidi override may survive into stored text",
+  );
+  assertStringIncludes(rows[0].tool, "\\u202e");
+});
+
+Deno.test("a zero-width joiner cannot hide inside a stored name", () => {
+  const rows = parseLsCurrent(
+    '{"no‍de":[{"version":"1.0.0","installed":true,"active":true}]}',
+  );
+  assertEquals(rows[0].tool, "no\\u200dde");
+});
+
+Deno.test("a tool name shaped like a credential drops the row and is counted", () => {
+  // A key cannot be nulled the way a field can, so the whole entry goes --
+  // and the count is what stops that from looking like a host with one tool.
+  const sink = { dropped: 0 };
+  const rows = parseLsCurrent(
+    '{"https://u:p@host/x":[{"version":"1.0.0","installed":true,' +
+      '"active":true}],"node":[{"version":"22.1.0","installed":true,' +
+      '"active":true}]}',
+    sink,
+  );
+  assertEquals(rows.map((r) => r.tool), ["node"]);
+  assertEquals(sink.dropped, 1, "the dropped entry must be visible");
+});
+
+Deno.test("a declared tool name shaped like a credential is dropped from tags", () => {
+  const sink = { dropped: 0 };
+  const cfgs = parseConfigLs(
+    '[{"path":"/etc/mise.toml","tools":["node","https://u:p@host/x"]}]',
+    sink,
+  );
+  assertEquals(cfgs.length, 1);
+  assertEquals(cfgs[0].tools, ["node"]);
+  assertEquals(sink.dropped, 1);
+});
+
+Deno.test("a config entry that is not an object is dropped, not read through", () => {
+  const sink = { dropped: 0 };
+  const cfgs = parseConfigLs('[7,null,{"path":"/etc/mise.toml"}]', sink);
+  assertEquals(cfgs.length, 1);
+  assertEquals(cfgs[0].path, "/etc/mise.toml");
+  assertEquals(sink.dropped, 2);
+});
+
+Deno.test("malformed entries are counted, not silently skipped", () => {
+  // The whole point: ten clean rows out of fifty is a broken answer, and
+  // before the sink there was nothing in the record that said so.
+  const sink = { dropped: 0 };
+  parseLsCurrent(
+    '{"a":[{"version":22}],"b":[],"c":[{"version":"1.0.0",' +
+      '"installed":true,"active":true}]}',
+    sink,
+  );
+  assertEquals(sink.dropped, 2);
+});
+
+Deno.test("an unreadable trust line is counted rather than ignored", () => {
+  const sink = { dropped: 0 };
+  const trusted = parseTrustShow(
+    "/etc/mise.toml: trusted\nthis is a banner line\n/o.toml: sideways\n",
+    sink,
+  );
+  assertEquals(trusted["/etc/mise.toml"], true);
+  assertEquals(sink.dropped, 2, "the banner and the unknown status both count");
+});
+
+Deno.test("a blank trust line is not a dropped entry", () => {
+  const sink = { dropped: 0 };
+  parseTrustShow("/etc/mise.toml: trusted\n\n", sink);
+  assertEquals(sink.dropped, 0);
+});
+
+Deno.test("a version banner is not a version", () => {
+  // A login shell printing over the answer used to pass on exit code alone.
+  assertEquals(parseVersion("2025.1.0 macos-arm64 (abc)"), "2025.1.0");
+  assertEquals(parseVersion("v2025.1.0"), "v2025.1.0");
+  assertEquals(parseVersion("Welcome to the host!"), null);
+  assertEquals(parseVersion(""), null);
+});
+
+Deno.test("a remote name is bounded so it cannot bloat a resource name", () => {
+  const long = "x".repeat(5000);
+  const rows = parseLsCurrent(
+    `{"${long}":[{"version":"1.0.0","installed":true,"active":true}]}`,
+  );
+  assertEquals(rows.length, 1, "a long name is legal, just bounded");
+  assertEquals(rows[0].tool.length, 5000, "the stored value itself is intact");
+});
+
+Deno.test("safeRemoteKey screens the same shapes as safeRemoteString", () => {
+  const sink = { dropped: 0 };
+  assertEquals(safeRemoteKey("node", sink), "node");
+  assertEquals(safeRemoteKey("https://u:p@host/x", sink), null);
+  assertEquals(safeRemoteKey("", sink), null);
+  assertEquals(sink.dropped, 2);
 });

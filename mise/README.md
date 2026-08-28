@@ -58,7 +58,7 @@ the fleet summary from one host's worth of data.
 
 | resource  | lifetime | fields                                                                                                                                                             | description                                                                                                                                                                                                                                                                                                                    |
 | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `node`    | infinite | `name`, `measured`, `degraded`, `failedSubcommands`, `failureKind`, `transport`, `error`, `errorDetail`, `miseVersion`, `dir`, `configCount`, `toolCount`, `drift` | One record per host: whether mise answered at all, whether it answered in full, which directory the reading came from, and how much drift was found there. A null dir is either an ssh node with no dir set, where the reading comes from wherever the login lands, or a local node whose working directory could not be read. |
+| `node`    | infinite | `name`, `measured`, `degraded`, `failedSubcommands`, `failureKind`, `transport`, `error`, `errorDetail`, `miseVersion`, `dir`, `configCount`, `toolCount`, `droppedEntries`, `drift` | One record per host: whether mise answered at all, whether it answered in full, which directory the reading came from, and how much drift was found there. A null dir is either an ssh node with no dir set, where the reading comes from wherever the login lands, or a local node whose working directory could not be read. |
 | `tool`    | infinite | `node`, `tool`, `requestedVersion`, `resolvedVersion`, `installPath`, `sourceType`, `sourcePath`, `installed`, `active`, `outdated`, `latestVersion`, `drift`      | One record per tool per host: what the config asked for, what the host resolved it to, and whether it is installed, active, or behind.                                                                                                                                                                                         |
 | `config`  | infinite | `node`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                                    | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                                                                                                                                                                                                                     |
 | `summary` | infinite | `nodes`, `nodesMeasured`, `nodesUnmeasured`, `nodesDegraded`, `tools`, `notinstalled`, `notactive`, `configsNotInEffect`, `outdated`, `expected`, `sweptAt`        | Fleet totals for the most recent sweep.                                                                                                                                                                                                                                                                                        |
@@ -100,8 +100,16 @@ login shell printing a banner over the top of the answer, so the repair belongs
 on the host. A host can also answer in part. When a follow-up subcommand goes
 quiet, or answers in a shape this model cannot read, the record is marked
 `degraded` and names it in `failedSubcommands`, and `nodesDegraded` on the
-summary counts how many hosts that happened to. While that count is above zero,
-read the drift totals as a floor rather than as everything there is to find.
+summary counts how many hosts that happened to. Answering in a shape this model
+cannot read counts as going quiet: `mise --version` that returns a banner
+instead of a version, and `mise trust --show` that returns text with no
+readable line in it, both mark the host degraded even though they exited zero.
+A host can also answer in the right shape and still return individual entries
+no parser will vouch for -- a malformed tool row, an unreadable trust line, a
+name that screens as credential-bearing. Those are counted in `droppedEntries`
+rather than dropped in silence, and any count above zero marks the host
+degraded too. While `nodesDegraded` is above zero, read the drift totals as a
+floor rather than as everything there is to find.
 Tool rows carry the same flag as a `degraded` tag, so a query over rows alone
 cannot mistake a partial sweep for a clean one. mise config is directory-scoped,
 so `dir` decides which config is being judged. Leave it off and you measure the
