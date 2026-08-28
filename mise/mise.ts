@@ -944,8 +944,16 @@ function urlCarriesMoreThanLocation(value: string): boolean {
   try {
     u = new URL(value);
   } catch {
-    // Not parseable as a URL. The regex rules below still get their turn.
-    return false;
+    // Fail closed. This returned false -- "carries nothing extra" -- which
+    // meant anything URL-shaped that would not parse skipped the check
+    // entirely. `https://user:pass@` has no host, so it does not parse, and
+    // it went into stored data with its credentials intact while the README
+    // said credential-bearing URLs are withheld. A value that announces
+    // itself as a URL and then cannot be read as one is not a value this
+    // model can vouch for, so it is treated as carrying more than a
+    // location. Only strings matched by URLISH_RE reach here, so an
+    // ordinary path or version is unaffected.
+    return true;
   }
   return u.username !== "" || u.password !== "" ||
     u.search !== "" || u.hash !== "";

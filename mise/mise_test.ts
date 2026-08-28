@@ -2488,3 +2488,19 @@ Deno.test("two node labels that slug alike do not overwrite each other's hold", 
     await m.cleanup();
   }
 });
+
+Deno.test("a URL-shaped value that will not parse fails closed", () => {
+  // This returned "carries nothing extra" on a parse failure, so anything
+  // URL-shaped that would not parse skipped the check entirely and went
+  // into stored data with its credentials intact.
+  assertEquals(safeRemoteString("https://user:pass@"), null);
+  assertEquals(safeRemoteString("http://@"), null);
+  // Only URL-shaped strings reach that rule, so ordinary values are not
+  // collateral damage.
+  assertEquals(safeRemoteString("core:node"), "core:node");
+  assertEquals(safeRemoteString("22.1.0"), "22.1.0");
+  assertEquals(
+    safeRemoteString("registry.internal:5000/image"),
+    "registry.internal:5000/image",
+  );
+});
