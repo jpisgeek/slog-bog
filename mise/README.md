@@ -9,7 +9,7 @@ declared in a config that never took, or simply behind. Installs nothing and
 upgrades nothing. mise already does that job. This one wades through the fleet,
 writes down what it finds, and leaves the acting to whatever workflow wants it.
 
-**Version** `2026.08.24.1` · **License** MIT · **Source**
+**Version** `2026.08.28.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/mise
 
 ## Install

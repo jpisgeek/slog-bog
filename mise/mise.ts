@@ -1748,7 +1748,7 @@ function currentDir(): string | null {
  */
 export const model = {
   type: "@jpisgeek/mise",
-  version: "2026.08.24.1",
+  version: "2026.08.28.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     node: {
