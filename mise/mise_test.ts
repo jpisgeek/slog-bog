@@ -2058,13 +2058,29 @@ Deno.test("a version banner is not a version", () => {
   assertEquals(parseVersion(""), null);
 });
 
-Deno.test("a remote name is bounded so it cannot bloat a resource name", () => {
+Deno.test("an oversized remote value is refused, not truncated", () => {
+  // The output cap stops a host filling memory; it did not stop one putting
+  // a multi-megabyte tool name into a resource field and its tags, because
+  // only the readable half of the resource NAME was capped. Refused rather
+  // than truncated: truncating stores a different string under the same
+  // identity and calls it the measurement.
+  const sink = { dropped: 0 };
   const long = "x".repeat(5000);
   const rows = parseLsCurrent(
-    `{"${long}":[{"version":"1.0.0","installed":true,"active":true}]}`,
+    `{"${long}":[{"version":"1.0.0","installed":true,"active":true}],` +
+      `"node":[{"version":"22.1.0","installed":true,"active":true}]}`,
+    sink,
   );
-  assertEquals(rows.length, 1, "a long name is legal, just bounded");
-  assertEquals(rows[0].tool.length, 5000, "the stored value itself is intact");
+  assertEquals(rows.map((r) => r.tool), ["node"]);
+  assertEquals(sink.dropped, 1, "and counted, so the sweep reads as partial");
+});
+
+Deno.test("a long but plausible path still survives", () => {
+  // The ceiling has to clear anything real. Linux paths top out around 4096
+  // bytes and tool names are far shorter.
+  const p = "/home/deploy/" + "sub/".repeat(200) + "bin/node";
+  assertEquals(p.length < 4096, true);
+  assertEquals(safeRemoteString(p), p);
 });
 
 Deno.test("safeRemoteKey screens the same shapes as safeRemoteString", () => {
@@ -2255,5 +2271,95 @@ Deno.test("a spaced assignment is withheld across its tokens", async () => {
     assertEquals(String(node.errorDetail).includes("swordfish"), false);
   } finally {
     await m.cleanup();
+  }
+});
+
+Deno.test("a multi-word secret is withheld whole, not by its first word", () => {
+  // Stopping at the first space withheld the opening word and published the
+  // rest, which is worse than withholding nothing: it reads as though the
+  // screening worked.
+  return (async () => {
+    const m = await fakeMise({
+      stderr: "config error: password = correct horse battery staple",
+      exit: 1,
+    });
+    try {
+      const c = mockCtx({
+        nodes: [{ name: "host", misePath: m.path }],
+        errorDetail: true,
+      });
+      await model.methods.discover.execute({}, c.ctx);
+      const d = String(
+        c.written.find((w) => w.spec === "node")!.data.errorDetail,
+      );
+      for (const word of ["correct", "horse", "battery", "staple"]) {
+        assertEquals(d.includes(word), false, `"${word}" survived: ${d}`);
+      }
+    } finally {
+      await m.cleanup();
+    }
+  })();
+});
+
+Deno.test("a PEM header spanning five words is caught in error text", () => {
+  // Tokenized, not one of those five words is a private key, so the marker
+  // this model has screened for from the start never matched inside error
+  // text at all.
+  return (async () => {
+    const m = await fakeMise({
+      stderr: "read failed: -----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNz",
+      exit: 1,
+    });
+    try {
+      const c = mockCtx({
+        nodes: [{ name: "host", misePath: m.path }],
+        errorDetail: true,
+      });
+      await model.methods.discover.execute({}, c.ctx);
+      const d = String(
+        c.written.find((w) => w.spec === "node")!.data.errorDetail,
+      );
+      assertEquals(
+        d.includes("b3BlbnNz"),
+        false,
+        `key material survived: ${d}`,
+      );
+      assertStringIncludes(d, "withheld");
+    } finally {
+      await m.cleanup();
+    }
+  })();
+});
+
+Deno.test("misePath must be named mise exactly", () => {
+  const ok = (p: string) =>
+    GlobalArgsSchema.safeParse({ nodes: [{ name: "a", misePath: p }] }).success;
+  assertEquals(ok("/opt/homebrew/bin/mise"), true);
+  assertEquals(ok("/usr/local/bin/mise.exe"), true);
+  // Any-extension was allowed by the first form of the rule, which made the
+  // README's "the basename must be mise" untrue.
+  assertEquals(ok("/tmp/mise.sh"), false);
+  assertEquals(ok("/tmp/mise.evil"), false);
+});
+
+Deno.test("a bad --node names neither the value nor the fleet", async () => {
+  // Echoing the argument put caller-controlled text into a logged error, and
+  // listing every configured label turned one wrong guess into a directory
+  // of the fleet.
+  const c = mockCtx({
+    nodes: [{ name: "workstation" }, { name: "controller" }],
+  });
+  await assertRejects(
+    () => model.methods.discover.execute({ node: "nope" }, c.ctx),
+    Error,
+    "No node by that name is configured",
+  );
+  try {
+    await model.methods.discover.execute({ node: "nope" }, c.ctx);
+  } catch (e) {
+    const msg = (e as Error).message;
+    assertEquals(msg.includes("nope"), false, "must not echo the argument");
+    assertEquals(msg.includes("workstation"), false, "must not list the fleet");
+    assertEquals(msg.includes("controller"), false, "must not list the fleet");
   }
 });

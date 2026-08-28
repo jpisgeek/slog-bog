@@ -98,7 +98,8 @@ security: >-
   does not: the argument list is fixed, so this model will not ask a host to
   change. It cannot promise the same about the binary that receives those
   arguments. `misePath` names an executable, and while its schema constrains
-  the charset, refuses a leading dash and requires the basename to be mise, a
+  the charset, refuses a leading dash and requires the basename to be exactly
+  mise or mise.exe, a
   file called mise can be anything -- `/tmp/mise` passes. That is operator
   config, trusted the way the node list itself is trusted, and it is worth
   knowing it is trusted rather than verified. Point it at a mise you put

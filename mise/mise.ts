@@ -37,9 +37,11 @@ const SAFE_BIN_PATH = /^[A-Za-z0-9._/-]+$/;
  * under a different binary, so this is not a live exploit; it is a guarantee
  * the schema was not actually keeping. It keeps it now. The point of the
  * argument is to say WHERE mise is when it is not on the PATH, and every
- * legitimate answer to that ends in mise.
+ * legitimate answer to that is named mise. Exactly mise, or mise.exe: the
+ * first form of this allowed any extension, so mise.sh and mise.evil both
+ * passed a rule documented as "the basename must be mise".
  */
-const MISE_BASENAME = /(?:^|\/)mise(?:\.[A-Za-z0-9]+)?$/;
+const MISE_BASENAME = /(?:^|\/)mise(?:\.exe)?$/;
 /**
  * Make process-controlled text printable before it reaches data, tags, or
  * logs. Escaping instead of dropping the byte keeps two hostile names from
@@ -80,6 +82,18 @@ const MISE_BASENAME = /(?:^|\/)mise(?:\.[A-Za-z0-9]+)?$/;
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_SLUG_CHARS = 64;
 const MAX_DETAIL_CHARS = 160;
+/**
+ * The longest a single remote value may be.
+ *
+ * The output cap stops a host filling memory; it did not stop one putting a
+ * four-megabyte tool name into a resource field and its tags, because only
+ * the readable half of the resource NAME was capped. A value longer than this
+ * is not a tool name, a version or a path -- filesystem paths top out around
+ * 4096 bytes on Linux and the rest are far shorter -- so it is refused rather
+ * than truncated. Truncating would store a different string under the same
+ * identity and call it the measurement.
+ */
+const MAX_VALUE_CHARS = 4096;
 
 /**
  * Read one process stream, stopping at the ceiling instead of after it.
@@ -254,13 +268,25 @@ const SshSchema = z.object({
  * carries its own refinement, because this schema is the boundary where
  * operator-supplied fleet config turns into command text.
  */
+/**
+ * A host label: non-empty, and printable all the way through.
+ *
+ * Hoisted so the `node` method argument is held to the same rule as the
+ * config value it is compared against. It was a bare string, which made it
+ * the one place in this model where unprintable text reached a message --
+ * by arriving from the caller rather than from a host, and so missing every
+ * filter aimed at hosts.
+ */
+const NodeLabelSchema = z
+  .string()
+  .min(1)
+  .max(MAX_SLUG_CHARS)
+  .refine((v) => printableRemoteText(v) === v, {
+    message: "name must not contain terminal control characters",
+  });
+
 export const NodeSchema = z.object({
-  name: z
-    .string()
-    .min(1)
-    .refine((v) => printableRemoteText(v) === v, {
-      message: "name must not contain terminal control characters",
-    })
+  name: NodeLabelSchema
     .describe("Label for this host in the written data"),
   ssh: SshSchema.optional().describe(
     "Reach this host over SSH. Omit for the machine swamp is running on.",
@@ -809,7 +835,9 @@ function parseJsonArray(raw: string): unknown[] | null {
 }
 
 const str = (v: unknown): string | null =>
-  typeof v === "string" && v !== "" ? printableRemoteText(v) : null;
+  typeof v === "string" && v !== "" && v.length <= MAX_VALUE_CHARS
+    ? printableRemoteText(v)
+    : null;
 
 /**
  * Values that must never be persisted, however they arrive.
@@ -924,7 +952,11 @@ function safeDetail(text: string): string | undefined {
   // assignment and whatever follows it are replaced together.
   const deassigned = printable
     .replace(
-      /\b(token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\b\s*[=:]\s*\S+/gi,
+      // To end of line, not to the first space. A passphrase may contain
+      // spaces, and stopping at the first one withheld its opening word and
+      // published the rest -- worse than withholding nothing, because it
+      // reads as though the screening worked.
+      /\b(token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\b\s*[=:].*/gi,
       "$1=[withheld]",
     )
     // Same reason, different shape. `Bearer abc123` is two whitespace-
@@ -937,6 +969,13 @@ function safeDetail(text: string): string | undefined {
       /\b(bearer|basic|digest|negotiate|authorization)\s+\S+/gi,
       "$1 [withheld]",
     );
+  // Whole-string shapes before tokenizing, because some of them span
+  // whitespace and no single token carries them. A PEM header is five words:
+  // tokenized, not one of them is a private key, so the marker this model
+  // has screened for from the start never matched inside error text at all.
+  for (const re of CREDENTIAL_SHAPES) {
+    if (re.test(deassigned)) return "[withheld: unscreenable error text]";
+  }
   const kept = deassigned
     .split(/(\s+)/)
     .map((tok) =>
@@ -1524,10 +1563,13 @@ export const model = {
           ? g.nodes.filter((n) => n.name === args.node)
           : g.nodes;
         if (targets.length === 0) {
+          // Names neither the value asked for nor the fleet. Echoing the
+          // argument put caller-controlled text into an error that gets
+          // logged, and listing every configured label turned one wrong
+          // guess into a directory of the fleet. The operator has the node
+          // list already; nobody else should get it from a typo.
           throw new Error(
-            `No node named '${args.node}'. Known: ${
-              g.nodes.map((n) => n.name).join(", ")
-            }`,
+            `No node by that name is configured (${g.nodes.length} known).`,
           );
         }
 
