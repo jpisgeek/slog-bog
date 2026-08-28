@@ -2363,3 +2363,58 @@ Deno.test("a bad --node names neither the value nor the fleet", async () => {
     assertEquals(msg.includes("controller"), false, "must not list the fleet");
   }
 });
+
+Deno.test("scp-style and scheme-relative locations are screened too", () => {
+  // The URL rule only ever saw scheme://, and the form most git remotes are
+  // actually written in has no scheme at all -- so the likeliest way for a
+  // credential to arrive was the one way nothing looked at.
+  for (
+    const v of [
+      "git@git.internal:org/repo.git",
+      "deploy:hunter2@git.internal:org/repo.git",
+      "//deploybot@reg.internal/n.tgz",
+      "cloned from git@private.host:team/x.git",
+    ]
+  ) {
+    assertEquals(safeRemoteString(v), null, `must be withheld: ${v}`);
+  }
+  // And the things that merely look similar are not collateral damage.
+  for (
+    const v of [
+      "contact ops@example.com for help",
+      "registry.internal:5000/image",
+      "/opt/homebrew/bin/node",
+    ]
+  ) {
+    assertEquals(safeRemoteString(v), v, `must survive: ${v}`);
+  }
+});
+
+Deno.test("an unmeasured host does not hold another host's stale rows", async () => {
+  // Both slugs may contain the separator, so `tool-web-` is a prefix of a
+  // record belonging to `web` and of one belonging to `web-server`. The
+  // unmeasured host used to hold the other's rows indefinitely, leaving
+  // stored data that contradicts the sweep.
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const stale = "tool-web-server-ruby-" + "0".repeat(64);
+    const c = mockCtx(
+      {
+        nodes: [
+          { name: "web", misePath: "/nonexistent/mise" },
+          { name: "web-server", misePath: m.path },
+        ],
+      },
+      { existing: [stale] },
+    );
+    await model.methods.discover.execute({}, c.ctx);
+    assertEquals(
+      c.deleted.includes(stale),
+      true,
+      "web-server answered, so its departed row is gone even though " +
+        "unmeasured `web` shares its name prefix",
+    );
+  } finally {
+    await m.cleanup();
+  }
+});

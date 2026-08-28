@@ -882,6 +882,29 @@ const CREDENTIAL_SHAPES: RegExp[] = [
 const URLISH_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi;
 
 /**
+ * Locations that carry userinfo without a scheme in front of them.
+ *
+ * The URL rule only ever saw `scheme://`, and two extremely ordinary forms
+ * are not written that way. scp-style git remotes -- `user@host:path`, which
+ * is how most git sources are actually written and so how a mise tool source
+ * is likely to arrive -- and scheme-relative URLs, `//user@host/path`. Both
+ * put an account name, and sometimes a password, in front of a private
+ * hostname, and both went into stored data untouched while the README said
+ * credential-bearing URLs are withheld.
+ *
+ * Matched by shape rather than parsed, because neither form is something
+ * `new URL()` will accept.
+ */
+const USERINFO_NO_SCHEME: RegExp[] = [
+  // scp-style: user@host:path, with an optional :password. Requires a dot or
+  // a colon-path after the host so an ordinary email address in an error
+  // sentence is not mistaken for a location.
+  /(?:^|[\s(<'"])[A-Za-z0-9._~%-]+(?::[^\s@]*)?@[A-Za-z0-9.-]+:[^\s]/,
+  // scheme-relative with userinfo
+  /(?:^|[\s(<'"])\/\/[A-Za-z0-9._~%-]+(?::[^\s@]*)?@[A-Za-z0-9.-]+/,
+];
+
+/**
  * Does this URL carry anything beyond the location of a thing?
  *
  * The previous version matched two regexes: userinfo in its user-and-password
@@ -925,6 +948,9 @@ export function safeRemoteString(v: unknown): string | null {
     const candidate = m[0].replace(/[)\]}>.,;'"]+$/, "");
     if (urlCarriesMoreThanLocation(candidate)) return null;
   }
+  // The schemeless forms, which new URL() will not parse and the rule above
+  // therefore never saw.
+  for (const re of USERINFO_NO_SCHEME) if (re.test(s)) return null;
   for (const re of CREDENTIAL_SHAPES) if (re.test(s)) return null;
   return s;
 }
@@ -1481,6 +1507,34 @@ function nodePrefix(prefix: string, node: string): string {
 }
 
 /**
+ * Does an unmeasured host's hold cover this stored record?
+ *
+ * A record is named `tool-<node-slug>-<tool-slug>-<hash>`, and both slugs may
+ * contain the separator, so `tool-web-` is a prefix of a record belonging to
+ * a node called web AND of one belonging to web-server. Testing the held
+ * prefixes alone therefore let an unmeasured `web` hold `web-server`'s stale
+ * rows indefinitely, leaving stored data that contradicts the current sweep.
+ *
+ * The ambiguity is resolved by comparing against every configured node rather
+ * than only the held ones: the longest prefix that matches names the node the
+ * record actually belongs to, because a longer node slug is a more specific
+ * claim on the same string. Only that node's state decides. A record matching
+ * no configured node belongs to a host that has left the config, which is
+ * exactly what the prune is for.
+ */
+function holdsRecord(prefixHeld: Map<string, boolean>, name: string): boolean {
+  let best = "";
+  let held = false;
+  for (const [prefix, isHeld] of prefixHeld) {
+    if (name.startsWith(prefix) && prefix.length > best.length) {
+      best = prefix;
+      held = isHeld;
+    }
+  }
+  return best !== "" && held;
+}
+
+/**
  * Where a local sweep actually looks. Null when the runtime will not say,
  * which records the same "we do not know" the ssh case does rather than
  * writing down a directory nobody read.
@@ -1879,17 +1933,18 @@ export const model = {
         // only in part, says nothing about which of its tools and configs
         // still exist, so its stored rows are held rather than read as gone.
         const live = new Set<string>();
-        const protectedPrefixes: string[] = [];
+        // Prefix -> may this prefix's rows be pruned. Every configured node
+        // gets an entry, not only the protected ones, because deciding which
+        // node a stored name belongs to needs the whole field to compare
+        // against. See holdsRecord below.
+        const prefixHeld = new Map<string, boolean>();
 
         for (const n of nodeStates) {
           const name = await resourceName("node", n.name);
           live.add(name);
-          if (!n.measured || n.degraded) {
-            protectedPrefixes.push(
-              nodePrefix("tool", n.name),
-              nodePrefix("config", n.name),
-            );
-          }
+          const held = !n.measured || n.degraded;
+          prefixHeld.set(nodePrefix("tool", n.name), held);
+          prefixHeld.set(nodePrefix("config", n.name), held);
           handles.push(
             await ctx.writeResource(
               "node",
@@ -2041,9 +2096,7 @@ export const model = {
               continue;
             }
             if (live.has(rec.data.name)) continue;
-            if (
-              protectedPrefixes.some((p) => rec.data.name.startsWith(p))
-            ) continue;
+            if (holdsRecord(prefixHeld, rec.data.name)) continue;
             await ctx.deleteResource(rec.data.name);
             ctx.logger.info("pruned {name}", { name: rec.data.name });
           }
