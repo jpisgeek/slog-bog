@@ -2557,3 +2557,41 @@ Deno.test("ssh host and user are held to hostname and username shapes", () => {
   assertEquals(ok({ host: "a@b.example.com", user: "u" }), false);
   assertEquals(ok({ host: "-oProxyCommand=x", user: "u" }), false);
 });
+
+Deno.test("a short Basic credential is withheld from a stored field", () => {
+  // The field filter required twelve characters and knew only about bearer,
+  // while the free-text filter had already been widened -- so the stricter
+  // rule guarded error prose and the looser one guarded what is published.
+  assertEquals(safeRemoteString("Basic YWxpY2U6cHc="), null);
+  assertEquals(safeRemoteString("Bearer abc"), null);
+});
+
+Deno.test("a record every candidate node measured is still pruned", () => {
+  // Holding unconditionally on ambiguity meant a record whose every
+  // candidate node answered stayed forever, contradicting the documented
+  // promise that a full sweep deletes what it did not write.
+  return (async () => {
+    const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+    try {
+      const stale = "tool-web-server-ruby-" + "0".repeat(64);
+      const c = mockCtx(
+        {
+          nodes: [
+            { name: "web", misePath: m.path },
+            { name: "web-server", misePath: m.path },
+          ],
+        },
+        { existing: [stale] },
+      );
+      await model.methods.discover.execute({}, c.ctx);
+      assertEquals(
+        c.deleted.includes(stale),
+        true,
+        "both candidates were measured, so the attribution never had to " +
+          "be resolved to know the row is gone",
+      );
+    } finally {
+      await m.cleanup();
+    }
+  })();
+});

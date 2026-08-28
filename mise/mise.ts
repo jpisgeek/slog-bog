@@ -891,8 +891,17 @@ const str = (v: unknown): string | null =>
  * publishing a credential.
  */
 const CREDENTIAL_SHAPES: RegExp[] = [
-  // bearer/authorization material inline
-  /\b(?:bearer|authorization)\s+[A-Za-z0-9._~+\/-]{12,}/i,
+  // Auth material inline. This required twelve characters and knew only
+  // about bearer, while the free-text filter had already been widened to
+  // every scheme and no minimum -- so the stricter rule guarded error prose
+  // and the looser one guarded the fields that are actually published. What
+  // follows an auth scheme is a credential however short it is, and Basic
+  // is the one most likely to appear in a source URL.
+  // The negative lookahead is for the free-text path, which replaces the
+  // credential with this placeholder before the whole-string check runs.
+  // Without it the check matches its own output and throws away the
+  // surrounding sentence, which is the part worth keeping.
+  /\b(?:bearer|basic|digest|negotiate|authorization)\s+(?!\[withheld\])\S+/i,
   // A private key body. Matched on BEGIN and PRIVATE KEY separately rather
   // than as one run of text, because the previous single pattern missed a
   // header whose internal spacing had been changed or wrapped.
@@ -900,7 +909,7 @@ const CREDENTIAL_SHAPES: RegExp[] = [
   // A secret-looking assignment anywhere, not only after a URL separator.
   // The previous form required ? & or # in front, so a bare `token=...` in
   // a path or an error sentence passed untouched.
-  /\b(?:token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\s*[=:]\s*\S/i,
+  /\b(?:token|access[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|credential|client[_-]?secret|sig|signature)\s*[=:]\s*(?!\[withheld\])\S/i,
   // A long unbroken high-entropy-looking run: the shape of a bare key sitting
   // on its own with nothing around it to name it. Deliberately conservative
   // about length so ordinary hashes in paths -- a nix store path, a git sha
@@ -1175,7 +1184,14 @@ const ConfigEntrySchema = z.object({
  * The one field the prune reads off a stored record. Validated because the
  * loop that reads it deletes.
  */
-const StoredRecordSchema = z.object({ name: z.string().min(1) }).loose();
+const StoredRecordSchema = z.object({
+  // Printable, not merely non-empty. This name is read back out of the
+  // datastore and written straight into a log line, so it is remote-shaped
+  // text arriving by a route none of the host-facing filters cover -- a
+  // record written by an older version, or by anything else sharing the
+  // store, could put control and format characters into log output.
+  name: z.string().min(1).refine((v) => printableRemoteText(v) === v),
+}).loose();
 
 const OutdatedEntrySchema = z.object({
   latest: z.string().optional(),
@@ -1595,17 +1611,19 @@ function holdsRecord(prefixHeld: Map<string, boolean>, name: string): boolean {
     if (name.startsWith(prefix)) matches.push(isHeld);
   }
   if (matches.length === 0) return false;
-  // One match is an unambiguous attribution: that node's state decides.
-  if (matches.length === 1) return matches[0];
-  // More than one and the record cannot be attributed at all. Longest-match
-  // was the first answer here and it is wrong in the other direction: a row
-  // belonging to node `web` whose tool slug begins with `server-` matches
-  // `tool-web-server-` too, and more specifically, so it would be handed to
-  // the wrong node. There is nothing in the name to break the tie -- the
-  // hash covers the pair, not the node alone. So an ambiguous record is
-  // held. Keeping a stale row is recoverable by the next sweep that can
-  // attribute it; deleting a live one is not.
-  return true;
+  // Ambiguity only matters when it changes the answer. A record matching
+  // several node prefixes cannot be attributed to one of them -- the hash
+  // covers the node-and-tool pair, not the node, so nothing in the name
+  // breaks the tie -- but if every candidate agrees, the attribution does
+  // not need to be resolved to know what to do. Holding unconditionally
+  // meant a record whose every candidate node was measured stayed forever,
+  // contradicting the documented promise that a full sweep deletes what it
+  // did not write.
+  //
+  // Only a genuine disagreement is held, and it is held rather than guessed
+  // because keeping a stale row is recoverable by the next sweep that can
+  // attribute it, and deleting a live one is not.
+  return matches.some((held) => held);
 }
 
 /**

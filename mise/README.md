@@ -136,14 +136,19 @@ not the same as passing. A tool no config on that host declares produces no
 record for that host at all, so its absence is invisible in the drift counts
 rather than surfacing under some other class. To hold a host to a tool, the tool
 has to be in that host's config. A full sweep deletes every stored record it did
-not write that time, so dropping a host from `nodes` removes its node record
-along with its tool and config rows. A run limited to one node with `--node` is
-a diagnostic and touches only that host. It deletes nothing, and it does not
-write the `summary` either, because one host's totals under a fleet-wide name
-would read as the fleet. The standing summary keeps its own `sweptAt`, which is
-the honest way to see how old it is. Node, tool, and config resource names all
-carry a hash suffix, so find them with `swamp data list <model>` rather than
-building the name by hand.
+not write that time, with one exception worth knowing: a record is attributed to
+a host by the readable half of its name, and two host labels that normalize
+alike leave that attribution ambiguous. Such a record is deleted when every
+candidate host answered and held when they disagree, because keeping a stale row
+is recoverable by the next sweep that can attribute it and deleting a live one
+is not. Dropping a host from `nodes` removes its node record along with its tool
+and config rows. A run limited to one node with `--node` is a diagnostic and
+touches only that host. It deletes nothing, and it does not write the `summary`
+either, because one host's totals under a fleet-wide name would read as the
+fleet. The standing summary keeps its own `sweptAt`, which is the honest way to
+see how old it is. Node, tool, and config resource names all carry a hash
+suffix, so find them with `swamp data list <model>` rather than building the
+name by hand.
 
 ## Security
 
