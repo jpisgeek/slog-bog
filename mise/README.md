@@ -60,7 +60,7 @@ the fleet summary from one host's worth of data.
 | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `node`    | infinite | `name`, `measured`, `degraded`, `failedSubcommands`, `droppedEntries`, `failureKind`, `transport`, `error`, `errorDetail`, `miseVersion`, `dir`, `configCount`, `toolCount`, `drift` | One record per host: whether mise answered at all, whether it answered in full, which directory the reading came from, and how much drift was found there. A null dir is either an ssh node with no dir set, where the reading comes from wherever the login lands, or a local node whose working directory could not be read. |
 | `tool`    | infinite | `node`, `tool`, `requestedVersion`, `resolvedVersion`, `installPath`, `sourceType`, `sourcePath`, `installed`, `active`, `outdated`, `latestVersion`, `drift`                        | One record per tool per host: what the config asked for, what the host resolved it to, and whether it is installed, active, or behind.                                                                                                                                                                                         |
-| `config`  | infinite | `node`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                                                      | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                                                                                                                                                                                                                     |
+| `config`  | infinite | `node`, `degraded`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                                          | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                                                                                                                                                                                                                     |
 | `summary` | infinite | `nodes`, `nodesMeasured`, `nodesUnmeasured`, `nodesDegraded`, `tools`, `notinstalled`, `notactive`, `configsNotInEffect`, `outdated`, `expected`, `sweptAt`                          | Fleet totals for the most recent sweep.                                                                                                                                                                                                                                                                                        |
 
 ## Example
@@ -173,9 +173,11 @@ The charset rule alone let it name any executable on the box, which is a
 guarantee this model advertises and was not actually keeping. `ssh.host` and
 `ssh.user` are a different case, and a stronger one. Neither reaches a shell at
 all. The two are combined into the single positional destination argument
-`user@host` and handed straight to `ssh` as one argv element, so the only thing
-their schema has to refuse is a leading dash, which would otherwise let the
-destination be read as an ssh option such as `-oProxyCommand=`. They carry no
+`user@host` and handed straight to `ssh` as one argv element, so the only first
+thing their schema refuses is a leading dash, which would otherwise let the
+destination be read as an ssh option such as `-oProxyCommand=`. It refuses more
+than that: both are held to hostname and username charsets, so an `@` or a `:`
+inside either cannot silently change which host is contacted. They carry no
 shell charset rule and do not need one. Node labels refuse terminal controls at
 parse time. Every string returned by a host is made printable before it reaches
 a resource field, tag, or log parameter. C0 and C1 bytes, including ESC, are

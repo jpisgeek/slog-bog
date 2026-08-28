@@ -1133,12 +1133,16 @@ export function safeRemoteKey(v: unknown, sink?: DropSink): string | null {
  * not something to coerce. `e.installed === true` silently read every one of
  * those as false.
  *
- * Unknown fields are tolerated on purpose, which is a deliberate departure
- * from "reject on any extra field". mise adds fields between releases; failing
+ * Unknown fields are tolerated but not kept, which is zod's default and is
+ * what was wanted all along. mise adds fields between releases, and failing
  * the whole probe on an upstream addition would turn every mise upgrade into
- * an outage of this collector, which is a worse and far more likely failure
- * than the one strictness would prevent. Types of the fields we READ are what
- * matter, and those are enforced.
+ * an outage of this collector -- a worse and far more likely failure than the
+ * one strictness prevents. These schemas carried `.loose()` on the belief
+ * that it was needed for that tolerance. It was not: the default already
+ * accepts an unrecognized field without complaint. All `.loose()` added was
+ * PASSTHROUGH, so unvalidated remote data rode along inside a parsed object
+ * that read as validated -- the one thing nobody wanted. Dropping it keeps
+ * the compatibility and loses the passthrough.
  */
 /**
  * One entry of `mise ls --current --json`.
@@ -1164,7 +1168,7 @@ const LsEntrySchema = z.object({
     type: z.string().optional(),
     path: z.string().optional(),
   }).optional(),
-}).loose();
+});
 
 /**
  * One row of `mise config ls --json`.
@@ -1178,7 +1182,7 @@ const LsEntrySchema = z.object({
 const ConfigEntrySchema = z.object({
   path: z.string(),
   tools: z.array(z.string()),
-}).loose();
+});
 
 /**
  * The one field the prune reads off a stored record. Validated because the
@@ -1191,11 +1195,11 @@ const StoredRecordSchema = z.object({
   // record written by an older version, or by anything else sharing the
   // store, could put control and format characters into log output.
   name: z.string().min(1).refine((v) => printableRemoteText(v) === v),
-}).loose();
+});
 
 const OutdatedEntrySchema = z.object({
   latest: z.string().optional(),
-}).loose();
+});
 
 /**
  * `mise ls --current --json` is keyed by tool name, each holding an array of
@@ -1447,6 +1451,16 @@ const ToolStateSchema = z.object({
 
 const ConfigStateSchema = z.object({
   node: z.string(),
+  /**
+   * Whether the host this config came from answered in full.
+   *
+   * A config row could look complete after unsafe or malformed declared-tool
+   * names were dropped: the node was marked degraded, but nothing on the row
+   * itself said so, and an empty `toolsNotInEffect` on a partial reading is
+   * indistinguishable from a config fully in effect. Tool rows already
+   * carried this; config rows now do too, in the data and as a tag.
+   */
+  degraded: z.boolean(),
   path: z.string(),
   trusted: z.boolean().nullable(),
   toolsDeclared: z.array(z.string()),
@@ -1554,7 +1568,7 @@ async function resourceName(
   prefix: string,
   ...parts: string[]
 ): Promise<string> {
-  const flat = parts.map(slugPart).join("-");
+  const flat = parts.map(slugPart).join(PART_SEP);
   return `${prefix}-${flat || "id"}-${await shortHash(identityKey(parts))}`;
 }
 
@@ -1565,6 +1579,25 @@ async function resourceName(
  * after the prefix. That is what lets nodePrefix name a host's whole run of
  * resources without knowing which tools it had.
  */
+/**
+ * What separates the node component of a resource name from the tool or
+ * config component.
+ *
+ * A single dash was ambiguous, and no amount of care at the reading end could
+ * fix it: slugs contain dashes, so `tool-web-server-ruby-<hash>` is node
+ * `web` with tool `server-ruby` and node `web-server` with tool `ruby`, and
+ * the hash covers the pair rather than either half. That ambiguity was worked
+ * around twice -- longest-match, then hold-on-disagreement -- and both were
+ * heuristics standing in for a fact the name did not carry.
+ *
+ * A double dash carries it. slugPart collapses every run of non-alphanumeric
+ * characters to ONE dash, so no slug can contain `--`, so the first `--`
+ * after the prefix is always the real boundary. Existing records keep their
+ * old single-dash names and are pruned on the next full sweep, which is the
+ * documented behaviour for a record this sweep did not write.
+ */
+const PART_SEP = "--";
+
 function slugPart(p: string): string {
   const s = p
     .replace(/[^a-zA-Z0-9]+/g, "-")
@@ -1586,7 +1619,7 @@ function slugPart(p: string): string {
  * covers both, which errs towards keeping records rather than deleting them.
  */
 function nodePrefix(prefix: string, node: string): string {
-  return `${prefix}-${slugPart(node)}-`;
+  return `${prefix}-${slugPart(node)}${PART_SEP}`;
 }
 
 /**
@@ -1606,6 +1639,10 @@ function nodePrefix(prefix: string, node: string): string {
  * exactly what the prune is for.
  */
 function holdsRecord(prefixHeld: Map<string, boolean>, name: string): boolean {
+  // Unambiguous now: PART_SEP cannot occur inside a slug, so at most one
+  // configured node prefix can match a given name. The multi-match branch
+  // below is kept for records written before the separator changed, which
+  // still carry the old ambiguous single-dash form.
   const matches: boolean[] = [];
   for (const [prefix, isHeld] of prefixHeld) {
     if (name.startsWith(prefix)) matches.push(isHeld);
@@ -1854,6 +1891,11 @@ export const model = {
                   { name: node.name, subs: failed.join(", ") },
                 );
               }
+              // Computed once here, where both the failed-probe list and
+              // the drop count are final, so the node record and every
+              // config row it produces cannot disagree about it.
+              const nodeDegraded = failed.length > 0 || drops.dropped > 0;
+
               if (drops.dropped > 0) {
                 ctx.logger.warning(
                   "{name} returned {n} entries no parser would accept; " +
@@ -1916,6 +1958,7 @@ export const model = {
                 if (missing.length > 0) nodeDrift.add("notineffect");
                 configStates.push({
                   node: node.name,
+                  degraded: nodeDegraded,
                   path: c.path,
                   // trust --show reports the directory, config ls the file,
                   // so a miss here is unknown rather than false.
@@ -1930,7 +1973,7 @@ export const model = {
               nodeStates.push({
                 name: node.name,
                 measured: true,
-                degraded: failed.length > 0 || drops.dropped > 0,
+                degraded: nodeDegraded,
                 droppedEntries: drops.dropped,
                 failedSubcommands: failed,
                 failureKind: null,
@@ -2100,7 +2143,18 @@ export const model = {
               "config",
               name,
               c,
-              { tags: { node: c.node } },
+              // The same degraded flag tool rows carry. A config row could
+              // look complete after unsafe or malformed declared-tool names
+              // were dropped: the host is marked degraded, but nothing on
+              // the config row said so, and an empty toolsNotInEffect on a
+              // partial reading is indistinguishable from a config fully in
+              // effect.
+              {
+                tags: {
+                  node: c.node,
+                  degraded: String(degradedNodes.has(c.node)),
+                },
+              },
             ),
           );
         }

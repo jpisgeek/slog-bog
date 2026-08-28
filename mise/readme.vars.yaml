@@ -121,8 +121,11 @@ security: >-
   are a different case, and a stronger one. Neither reaches a shell at all.
   The two are combined into the single positional destination argument
   `user@host` and handed straight to `ssh` as one argv element, so the only
-  thing their schema has to refuse is a leading dash, which would otherwise
-  let the destination be read as an ssh option such as `-oProxyCommand=`.
+  first thing their schema refuses is a leading dash, which would otherwise
+  let the destination be read as an ssh option such as `-oProxyCommand=`. It
+  refuses more than that: both are held to hostname and username charsets, so
+  an `@` or a `:` inside either cannot silently change which host is
+  contacted.
   They carry
   no shell charset rule and do not need one. Node labels refuse terminal
   controls at parse time. Every string returned by a host is made printable

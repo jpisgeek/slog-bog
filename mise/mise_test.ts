@@ -1755,7 +1755,7 @@ Deno.test("a single-node run never deletes anything", async () => {
           { name: "builder", misePath: m.path },
         ],
       },
-      { existing: ["tool-builder-go-1234abcd"] },
+      { existing: ["tool-builder--go-1234abcd"] },
     );
     await model.methods.discover.execute({ node: "workstation" }, c.ctx);
     assertEquals(c.deleted, [], "a filtered run legitimately sees a subset");
@@ -1816,9 +1816,9 @@ Deno.test("a host that could not be measured keeps its history", async () => {
       },
       {
         existing: [
-          "tool-gone-go-1234abcd",
-          "config-workstation-mise-toml-5678abcd",
-          "tool-retired-go-9999abcd",
+          "tool-gone--go-1234abcd",
+          "config-workstation--mise-toml-5678abcd",
+          "tool-retired--go-9999abcd",
         ],
       },
     );
@@ -1826,7 +1826,7 @@ Deno.test("a host that could not be measured keeps its history", async () => {
     // gone was never measured and workstation's config ls never answered, so
     // neither host's stored rows are evidence of anything departing. The
     // retired host really is gone from the fleet config.
-    assertEquals(c.deleted, ["tool-retired-go-9999abcd"]);
+    assertEquals(c.deleted, ["tool-retired--go-9999abcd"]);
   } finally {
     await m.cleanup();
   }
@@ -2411,19 +2411,18 @@ Deno.test("scp-style and scheme-relative locations are screened too", () => {
   }
 });
 
-Deno.test("a record that cannot be attributed to one node is held, not deleted", async () => {
-  // Both slugs may contain the separator, so `tool-web-` is a prefix of a
-  // record belonging to `web` and of one belonging to `web-server`, and the
-  // hash covers the pair rather than the node, so there is nothing in the
-  // name to break the tie. Longest-match was the first answer and it is
-  // wrong in the other direction: a row belonging to `web` whose tool slug
-  // begins with `server-` matches `tool-web-server-` more specifically and
-  // would be handed to the wrong node -- and then deleted. Keeping a stale
-  // row is recoverable by the next sweep that can attribute it. Deleting a
-  // live one is not.
+Deno.test("a node component is separated from a tool component unambiguously", async () => {
+  // A single dash could not carry the boundary: slugs contain dashes, so
+  // `tool-web-server-ruby-<hash>` was node `web` with tool `server-ruby` AND
+  // node `web-server` with tool `ruby`, and the hash covers the pair rather
+  // than either half. That was worked around twice with heuristics standing
+  // in for a fact the name did not carry. slugPart collapses every run of
+  // non-alphanumerics to one dash, so no slug contains `--`, so the first
+  // `--` is always the real boundary.
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
-    const stale = "tool-web-server-ruby-" + "0".repeat(64);
+    // Belongs to web-server, unambiguously, and web-server answered.
+    const stale = "tool-web-server--ruby-" + "0".repeat(64);
     const c = mockCtx(
       {
         nodes: [
@@ -2436,9 +2435,32 @@ Deno.test("a record that cannot be attributed to one node is held, not deleted",
     await model.methods.discover.execute({}, c.ctx);
     assertEquals(
       c.deleted.includes(stale),
+      true,
+      "unmeasured `web` no longer has any claim on a web-server record",
+    );
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("an unmeasured host still holds its own rows", async () => {
+  const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
+  try {
+    const mine = "tool-web--ruby-" + "0".repeat(64);
+    const c = mockCtx(
+      {
+        nodes: [
+          { name: "web", misePath: "/nonexistent/mise" },
+          { name: "web-server", misePath: m.path },
+        ],
+      },
+      { existing: [mine] },
+    );
+    await model.methods.discover.execute({}, c.ctx);
+    assertEquals(
+      c.deleted.includes(mine),
       false,
-      "the row matches both configured nodes, so it is held rather than " +
-        "attributed to a guess",
+      "web said nothing about its tools, so its rows are not read as gone",
     );
   } finally {
     await m.cleanup();
@@ -2478,7 +2500,7 @@ Deno.test("two node labels that slug alike do not overwrite each other's hold", 
   // is held errs toward keeping data.
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
-    const stale = "tool-web-server-ruby-" + "0".repeat(64);
+    const stale = "tool-web-server--ruby-" + "0".repeat(64);
     const c = mockCtx(
       {
         nodes: [
@@ -2573,7 +2595,7 @@ Deno.test("a record every candidate node measured is still pruned", () => {
   return (async () => {
     const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
     try {
-      const stale = "tool-web-server-ruby-" + "0".repeat(64);
+      const stale = "tool-web-server--ruby-" + "0".repeat(64);
       const c = mockCtx(
         {
           nodes: [
