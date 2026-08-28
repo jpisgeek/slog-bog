@@ -1,6 +1,6 @@
 {
   "extension": "@jpisgeek/mise",
-  "version": "2026.08.28.1",
+  "version": "2026.08.28.2",
   "reviewedAt": "2026-08-28T06:00:00Z",
   "dimensions": [
     {
@@ -21,7 +21,7 @@
     {
       "id": "testing-completeness",
       "verdict": "pass",
-      "note": "137 tests over the exported surface. Notably includes the case a fixed-string fake binary cannot reach: a producer that never stops, which is the only thing that exercises the output cap. Writing it found a real bug -- the cap fired but Promise.all still waited on the other stream, so the sweep hung to the deadline. Gap worth naming: no test drives a real remote host, so the ssh argument vector is asserted by property rather than by behaviour."
+      "note": "139 tests over the exported surface. Notably includes the case a fixed-string fake binary cannot reach: a producer that never stops, which is the only thing that exercises the output cap. Writing it found a real bug -- the cap fired but Promise.all still waited on the other stream, so the sweep hung to the deadline. Gap worth naming: no test drives a real remote host, so the ssh argument vector is asserted by property rather than by behaviour."
     },
     {
       "id": "idempotency-resilience",
@@ -76,7 +76,7 @@
     {
       "id": "version-upgrades",
       "verdict": "pass",
-      "note": "NOTE BEFORE FIRST UPGRADE: the resource-name separator changed during this review, so records written by an earlier version carry the old single-dash form, and the first full sweep after upgrading will delete and rewrite every tool and config record. That is the designed path rather than a fault: legacy prefixes are held in their own map and matched only against legacy-shaped names, so an unmeasured host's old rows survive the migration while a measured host's are pruned and the migration completes. Tested in both directions. It has not been run against production data."
+      "note": "An upgrades entry now exists and targets 2026.08.28.2, which sits above both published versions -- upgrades are filtered on toVersion > typeVersion, so an entry naming an already-installed version would never run. It is a no-op on the data: the one field added since 2026.08.24.1 (errorDetail) carries a default, and the remaining changes narrow validation on existing arguments rather than reshaping them. NOTE BEFORE FIRST UPGRADE, unchanged and still the thing to know: the resource-name separator changed, so the first full sweep after upgrading deletes and rewrites every tool and config record. That path is designed and tested in both directions -- legacy prefixes are held in their own map and matched only against legacy-shaped names -- but it has not run against production data. Second caveat: a config that used to parse may now be refused, because misePath, ssh.host, ssh.user and node labels are all validated more strictly. That is deliberate and an upgrade function cannot repair it."
     }
   ]
 }
