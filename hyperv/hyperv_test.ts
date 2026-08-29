@@ -21,6 +21,8 @@ import {
   CheckpointArgsSchema,
   classifyRemote,
   DeleteArgsSchema,
+  DiscoverEnvelope,
+  DiskDeleteEnvelope,
   dotNetDate,
   encodeCommand,
   GlobalArgsSchema,
@@ -28,6 +30,7 @@ import {
   parseRow,
   PART_SEP,
   psQuote,
+  PsStateRow,
   PsVmHostRow,
   PsVmRow,
   RemoveCheckpointArgsSchema,
@@ -429,5 +432,108 @@ Deno.test("deleting a running VM needs the power-off acknowledged", () => {
       confirmName: "a",
     }).confirmForcePowerOff,
     false,
+  );
+});
+
+// --- security review round 3 -----------------------------------------------
+
+Deno.test("wildcard names are refused everywhere a target is named", () => {
+  // `Remove-VM -Name *` selects every machine on the host. Quoting does not
+  // help: the string is well-formed, it just means "all of them".
+  for (const bad of ["*", "?", "vm-[0-9]", "web*", "]"]) {
+    assertEquals(VmNameArgs.safeParse({ vmName: bad }).success, false);
+    assertEquals(
+      CheckpointArgsSchema.safeParse({ vmName: "ok", name: bad }).success,
+      false,
+    );
+    assertEquals(
+      RemoveCheckpointArgsSchema.safeParse({ vmName: "ok", name: bad }).success,
+      false,
+    );
+  }
+});
+
+Deno.test("a wildcard cannot be confirmed twice to satisfy a guard", () => {
+  // This is why the wildcard check belongs in the schema and not in the
+  // guard: confirmName === vmName is trivially true for "*", so the guard
+  // would have confirmed the caller's intent to destroy the whole host.
+  assertEquals(
+    DeleteArgsSchema.safeParse({ vmName: "*", confirmName: "*" }).success,
+    false,
+  );
+  assertEquals(
+    RestoreArgsSchema.safeParse({
+      vmName: "vm",
+      name: "*",
+      confirmDiscardSince: "*",
+    }).success,
+    false,
+  );
+});
+
+Deno.test("control characters are refused in names", () => {
+  // NUL matters specifically: resource IDs digest their parts joined by NUL,
+  // so a name allowed to contain one could move the boundary and make two
+  // different names produce a single ID.
+  for (const bad of ["a\u0000b", "a\nb", "a\tb", "a\u007fb"]) {
+    assertEquals(VmNameArgs.safeParse({ vmName: bad }).success, false);
+  }
+});
+
+Deno.test("ordinary names still pass", () => {
+  for (const ok of ["web01", "Web Server 01", "db_primary", "vm.test"]) {
+    assertEquals(VmNameArgs.safeParse({ vmName: ok }).success, true);
+  }
+});
+
+Deno.test("a missing collection is an error, not zero found", () => {
+  // `top.vms ?? []` turned a truncated response into "this host runs no VMs".
+  assertThrows(
+    () =>
+      parseRow(DiscoverEnvelope, {
+        host: {
+          Name: "hv1",
+          LogicalProcessorCount: 8,
+          MemoryCapacity: 1,
+          VirtualMachinePath: "C:\\VMs",
+        },
+        switches: [],
+      }, "discover envelope"),
+    Error,
+    "did not match the expected shape",
+  );
+});
+
+Deno.test("an empty collection is still fine", () => {
+  const ok = parseRow(DiscoverEnvelope, {
+    host: {
+      Name: "hv1",
+      LogicalProcessorCount: 8,
+      MemoryCapacity: 1,
+      VirtualMachinePath: "C:\\VMs",
+    },
+    vms: [],
+    switches: [],
+  }, "discover envelope");
+  assertEquals(ok.vms.length, 0);
+});
+
+Deno.test("a malformed state probe is not read as 'no such VM'", () => {
+  // delete verifies itself by asking this question, so a broken probe that
+  // answered "absent" would confirm a deletion that never happened.
+  assertThrows(
+    () => parseRow(PsStateRow, {}, "VM state probe"),
+    Error,
+    "did not match the expected shape",
+  );
+  // An explicit null still means absent.
+  assertEquals(parseRow(PsStateRow, { state: null }, "probe").state, null);
+});
+
+Deno.test("disk deletion proof must account for every disk", () => {
+  assertThrows(
+    () => parseRow(DiskDeleteEnvelope, { diskCount: 2 }, "disk envelope"),
+    Error,
+    "did not match the expected shape",
   );
 });

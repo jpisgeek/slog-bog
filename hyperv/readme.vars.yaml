@@ -18,11 +18,13 @@ example: |
     port: 22
     timeoutSec: 30
 caveats: |
-  **Authentication is the ambient ssh-agent.** Load an identity the target
-  authorizes before running anything here. This model never handles key
-  material, never reads a key file, and takes no password argument. With no
-  agent reachable the SSH call fails, which is the intended outcome rather
-  than a quiet fallback to something weaker.
+  **Authentication is public-key only, and left to ssh.** Load an identity the
+  target authorizes before running anything here — from an agent, or from your
+  own ssh configuration. This model handles no key material and takes no
+  password argument, and it restricts ssh to public-key authentication so a
+  host offering passwords or keyboard-interactive cannot be used as a
+  fallback. It does not claim to control which identity files ssh loads; that
+  remains yours to configure.
 
   **The Windows sshd's default shell is `cmd.exe`.** Anything with a quote,
   pipe, or brace gets mangled twice before PowerShell ever sees it, so
@@ -49,6 +51,16 @@ security: |
   **What is written.** Summaries only: names, states, capacity, switch types,
   checkpoint names and timestamps. No device contents, no console credentials,
   no guest filesystem data.
+
+  **What the identifiers themselves reveal.** Resource IDs are not opaque. Each
+  is built as `<kind>--<host>--<name>[--<name>]-<sha256>`, where the readable
+  parts are lowercase-slugged versions of the host name, and of the VM, switch
+  or checkpoint name. The digest exists to prevent collisions, not to conceal:
+  anyone who can list resource IDs can read your host and VM names out of them.
+  Checkpoint resources additionally carry a `vm` tag holding the VM name, and
+  VM resources carry a `state` tag. This is deliberate — IDs that cannot be
+  read are IDs nobody can operate on — but it means the ID namespace is part
+  of the inventory exposure described below, not a way around it.
 
   **What mutates, and what stops it.** `start` and `stop` change run state;
   `stop --force` cuts power and risks the guest filesystem exactly as pulling
@@ -77,5 +89,17 @@ security: |
   The point of both guards is a `vmName` arriving from a workflow input: it
   should fail rather than succeed against the wrong machine.
 
+  **Names must identify one object.** PowerShell's `-Name` parameters accept
+  wildcards, so `*` is a well-formed argument that means *every* machine.
+  Every name this model accepts is refused if it contains `*`, `?`, `[` or
+  `]`, along with control characters and surrounding whitespace. Without that,
+  the confirmation guards above would be satisfiable by passing a wildcard
+  twice — which confirms nothing, on every VM at once.
+
   **Verification, not exit codes.** `start`, `stop`, and `checkpoint` read the
-  resulting state back rather than trusting the cmdlet's exit status.
+  resulting state back rather than trusting the cmdlet's exit status, and the
+  responses are parsed against declared schemas rather than cast. A required
+  field that is absent, or a collection that is missing rather than empty, is
+  an error — not "zero found". `delete` reconciles the disk-removal results
+  against the number of disks the host reported, because a proof that went
+  missing is not a proof of success.

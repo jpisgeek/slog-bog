@@ -74,6 +74,39 @@ const HOSTLIKE =
  */
 const USERLIKE = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
 
+/**
+ * A name that identifies exactly ONE object on the host.
+ *
+ * PowerShell's `-Name` parameters accept WILDCARDS. `Remove-VM -Name *`
+ * selects every machine, and quoting does not help: the string is a perfectly
+ * well-formed argument, it just means "all of them". This is what made the
+ * confirmation guards insufficient rather than merely thin -- `confirmName`
+ * equalling `vmName` is satisfied by passing `*` twice, and the model would
+ * have confirmed the caller's intent to destroy the entire host.
+ *
+ * Control characters are refused in the same place, for a different reason.
+ * Resource IDs are digested over parts joined by NUL, so a name allowed to
+ * contain NUL could shift the boundary and make two different names produce
+ * one ID -- the exact collision the digest exists to prevent.
+ */
+export const SafeName = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((v) => !/[*?\[\]]/.test(v), {
+    message:
+      "name must not contain PowerShell wildcards (* ? [ ]): they select " +
+      "more than one object, and a confirmation that repeats a wildcard " +
+      "confirms nothing",
+  })
+  // deno-lint-ignore no-control-regex
+  .refine((v) => !/[\u0000-\u001f\u007f]/.test(v), {
+    message: "name must not contain control characters",
+  })
+  .refine((v) => v.trim() === v && v.trim() !== "", {
+    message: "name must not be blank or padded with whitespace",
+  });
+
 export const GlobalArgsSchema = z.object({
   host: z
     .string()
@@ -115,7 +148,7 @@ const DiscoverArgsSchema = z.object({});
  * `-Name` would select nothing or, worse, everything.
  */
 export const VmNameArgs = z.object({
-  vmName: z.string().min(1).describe("Name of the target virtual machine."),
+  vmName: SafeName.describe("Name of the target virtual machine."),
 });
 
 /**
@@ -125,7 +158,7 @@ export const VmNameArgs = z.object({
  * off and warns when set.
  */
 export const StopArgsSchema = z.object({
-  vmName: z.string().min(1),
+  vmName: SafeName,
   force: z.boolean().default(false).describe(
     "Cut power instead of asking the guest to shut down. A graceful stop " +
       "needs the Shutdown integration service responding; force does not, " +
@@ -139,8 +172,8 @@ export const StopArgsSchema = z.object({
  * would not know which restore point they ended up with.
  */
 export const CheckpointArgsSchema = z.object({
-  vmName: z.string().min(1),
-  name: z.string().min(1).describe(
+  vmName: SafeName,
+  name: SafeName.describe(
     "Checkpoint name to create. Must not already exist on this VM: the " +
       "method refuses a duplicate rather than letting Hyper-V decide what to " +
       "do about the collision, because the caller would not then know which " +
@@ -156,8 +189,8 @@ export const CheckpointArgsSchema = z.object({
  * verbs, two schemas.
  */
 export const RemoveCheckpointArgsSchema = z.object({
-  vmName: z.string().min(1),
-  name: z.string().min(1).describe(
+  vmName: SafeName,
+  name: SafeName.describe(
     "Checkpoint to remove. Must already exist on this VM; it is the " +
       "checkpoint that will be deleted.",
   ),
@@ -171,9 +204,9 @@ export const RemoveCheckpointArgsSchema = z.object({
  * quietly throws away an hour of work is worse than one that refuses.
  */
 export const RestoreArgsSchema = z.object({
-  vmName: z.string().min(1),
-  name: z.string().min(1).describe("Checkpoint to roll back to."),
-  confirmDiscardSince: z.string().min(1).describe(
+  vmName: SafeName,
+  name: SafeName.describe("Checkpoint to roll back to."),
+  confirmDiscardSince: SafeName.describe(
     "Must equal the checkpoint name. Restoring discards every change made " +
       "since it was taken, and that loss is silent -- Hyper-V does not warn " +
       "and there is no undo. Naming it again is the acknowledgement.",
@@ -189,8 +222,8 @@ export const RestoreArgsSchema = z.object({
  * would be a harsher default than the platform's.
  */
 export const DeleteArgsSchema = z.object({
-  vmName: z.string().min(1),
-  confirmName: z.string().min(1).describe(
+  vmName: SafeName,
+  confirmName: SafeName.describe(
     "Must exactly equal vmName. Deleting removes the machine and its " +
       "checkpoints; a vmName arriving from a workflow input is not something " +
       "to take on trust.",
@@ -288,6 +321,16 @@ async function runPowerShell(
       // host, where a socket signs for every key it holds.
       "-o",
       "BatchMode=yes",
+      // BatchMode only suppresses PROMPTS. On its own ssh will still try
+      // password and keyboard-interactive against a host that offers them,
+      // and will still read default identity files. Public key only, so the
+      // set of things that can authenticate is the set the caller configured.
+      "-o",
+      "PreferredAuthentications=publickey",
+      "-o",
+      "PasswordAuthentication=no",
+      "-o",
+      "KbdInteractiveAuthentication=no",
       "-o",
       "StrictHostKeyChecking=yes",
       "-o",
@@ -471,9 +514,14 @@ export async function sha256Hex(input: string): Promise<string> {
  * they are the shape of a silent collection failure, and the schemas make
  * that failure loud.
  *
- * Unknown keys are tolerated -- Windows adds properties between builds and
- * that is not this model's business -- but every field it actually reads must
- * be present and of the right type.
+ * Unknown KEYS are tolerated on purpose. Windows adds properties between
+ * builds, and a schema that rejects an unrecognised field turns a routine
+ * platform update into a total collection outage on a host that is otherwise
+ * answering correctly. What is NOT tolerated is a field this model reads
+ * being absent or the wrong type -- that is the failure worth being loud
+ * about, because it is the one that silently produces a plausible-looking
+ * record. Values are typed; the object is open. (zod strips unknown keys by
+ * default, so nothing unvalidated reaches a resource either way.)
  */
 export const PsVmHostRow = z.object({
   Name: z.string().min(1),
@@ -490,8 +538,9 @@ export const PsVmRow = z.object({
   ProcessorCount: z.number().int().nonnegative(),
   MemoryAssigned: z.number().nonnegative(),
   // A .NET TimeSpan, serialised as an OBJECT carrying TotalSeconds -- not a
-  // number and not a string. Typed loosely here and narrowed at the read.
-  Uptime: z.unknown().optional(),
+  // number and not a string. Typed, rather than left unknown and narrowed by
+  // hand at the read, which is where a wrong assumption used to survive.
+  Uptime: z.object({ TotalSeconds: z.number() }).nullable().optional(),
 });
 
 export const PsSwitchRow = z.object({
@@ -501,12 +550,62 @@ export const PsSwitchRow = z.object({
   SwitchType: z.number().int(),
 });
 
+/**
+ * The discover response as a whole.
+ *
+ * `vms` and `switches` are REQUIRED. They were previously read as
+ * `top.vms ?? []`, which turned a response that omitted the field entirely --
+ * a truncated pipeline, a cmdlet that errored past $ErrorActionPreference --
+ * into the confident claim that the host runs no virtual machines. An empty
+ * array still means empty; a missing one now means broken.
+ */
+export const DiscoverEnvelope = z.object({
+  host: PsVmHostRow,
+  vms: z.array(PsVmRow),
+  switches: z.array(PsSwitchRow),
+});
+
+/** The state probe. `state` must be present; only its VALUE may be null. */
+/**
+ * The disk-deletion envelope, and it is REQUIRED rather than defaulted.
+ *
+ * The proof used to be read as `top?.results ?? []`, which meant a truncated
+ * or malformed response produced an empty result list, counted zero failures,
+ * and logged that every disk had been removed. A deletion whose evidence went
+ * missing is not a deletion that succeeded. `diskCount` is carried alongside
+ * so the count can be reconciled: a host that reported four disks and
+ * returned three results has not accounted for the fourth.
+ */
+export const DiskDeleteEnvelope = z.object({
+  diskCount: z.number().int().nonnegative(),
+  results: z.array(z.object({
+    index: z.number().int().nonnegative(),
+    removed: z.boolean(),
+  })),
+});
+
+export const PsStateRow = z.object({
+  state: z.string().nullable(),
+});
+
 export const PsCheckpointRow = z.object({
   VMName: z.string().min(1),
   Name: z.string().min(1),
   CheckpointType: z.string(),
-  CreationTime: z.unknown(),
+  // Either the /Date(ms)/ form PowerShell emits or an ISO string, depending
+  // on how it was serialised. Both are strings; anything else is a bug.
+  CreationTime: z.string(),
   ParentSnapshotName: z.string().nullable().optional(),
+});
+
+/**
+ * The checkpoint response. `checkpoints` is required for the same reason
+ * `vms` is: removal and restore return this list as their proof, so a
+ * response missing the field must not read as "none, therefore verified".
+ */
+export const CheckpointEnvelope = z.object({
+  host: z.string().min(1),
+  checkpoints: z.array(PsCheckpointRow),
 });
 
 /**
@@ -571,16 +670,19 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
 `.trim();
 
   const raw = await runPowerShell(g, ps, ctx.signal);
-  const top = asArray(raw)[0];
-  if (!top) throw new Error("PowerShell returned no host record");
+  const top = parseRow(
+    DiscoverEnvelope,
+    asArray(raw)[0],
+    "discover envelope",
+  );
 
   // Parsed, not cast. A field the host failed to return is an error here
-  // rather than an empty string or a zero written down as fact.
-  const hostRec = parseRow(PsVmHostRow, top.host ?? {}, "host record");
-  const vms = asArray(JSON.stringify(top.vms ?? []))
-    .map((r) => parseRow(PsVmRow, r, "VM record"));
-  const switches = asArray(JSON.stringify(top.switches ?? []))
-    .map((r) => parseRow(PsSwitchRow, r, "switch record"));
+  // rather than an empty string or a zero written down as fact -- and the
+  // envelope above requires `vms` and `switches` to be PRESENT, so a response
+  // that omits them fails instead of reading as "zero found".
+  const hostRec = top.host;
+  const vms = top.vms;
+  const switches = top.switches;
 
   handles.push(
     await ctx.writeResource(
@@ -663,8 +765,12 @@ if ($null -eq $v) { '{"state":null}' } else {
   [pscustomobject]@{ state = $v.State.ToString() } | ConvertTo-Json -Compress
 }`.trim();
   const raw = await runPowerShell(g, ps, signal);
-  const o = asArray(raw)[0] ?? {};
-  return typeof o.state === "string" ? o.state : null;
+  // Strict: `state` must be present, and only an explicit JSON null means
+  // "no such VM". The old form returned null for a malformed response too,
+  // which made a broken probe indistinguishable from an absent machine --
+  // and `delete` verifies its own success by asking exactly this question.
+  const o = parseRow(PsStateRow, asArray(raw)[0], "VM state probe");
+  return o.state;
 }
 
 /**
@@ -749,12 +855,12 @@ $c = @(Get-VMSnapshot -VMName ${psQuote(vmName)} |
     @{n='CheckpointType';e={$_.SnapshotType.ToString()}})
 [pscustomobject]@{ host=$h; checkpoints=$c } | ConvertTo-Json -Depth 4 -Compress`
     .trim();
-  const top = asArray(await runPowerShell(g, ps, signal))[0];
-  if (!top) throw new Error("PowerShell returned no checkpoint envelope");
-  const hostName = z.string().min(1).parse(top.host);
-  const rows = asArray(JSON.stringify(top.checkpoints ?? []))
-    .map((r) => parseRow(PsCheckpointRow, r, "checkpoint record"));
-  return { hostName, rows };
+  const top = parseRow(
+    CheckpointEnvelope,
+    asArray(await runPowerShell(g, ps, signal))[0],
+    "checkpoint envelope",
+  );
+  return { hostName: top.host, rows: top.checkpoints };
 }
 
 async function collectCheckpoints(
@@ -976,7 +1082,11 @@ ${
   }
 [pscustomobject]@{ diskCount = $disks.Count; results = @($results) } | ConvertTo-Json -Depth 4 -Compress`
     .trim();
-  const top = asArray(await runPowerShell(g, ps, ctx.signal))[0];
+  const envelope = parseRow(
+    DiskDeleteEnvelope,
+    asArray(await runPowerShell(g, ps, ctx.signal))[0],
+    "disk deletion envelope",
+  );
 
   // Read back rather than trust the cmdlet.
   const after = await vmState(g, args.vmName, ctx.signal);
@@ -987,8 +1097,17 @@ ${
   }
 
   if (args.deleteDisks) {
-    const results = asArray(JSON.stringify(top?.results ?? []));
-    const failed = results.filter((r) => r.removed !== true).length;
+    const results = envelope.results;
+    // Reconcile before judging. Fewer results than disks means the loop did
+    // not finish, and an all-`removed` list of the wrong length is not proof.
+    if (results.length !== envelope.diskCount) {
+      throw new Error(
+        `${args.vmName} was deleted, but disk removal is unaccounted for: ` +
+          `the host reported ${envelope.diskCount} disk(s) and returned ` +
+          `${results.length} result(s)`,
+      );
+    }
+    const failed = results.filter((r) => !r.removed).length;
     if (failed > 0) {
       // Positions, never paths: a disk path names a volume layout and often
       // the VM, and this message reaches logs and resources.
@@ -996,8 +1115,7 @@ ${
         `${args.vmName} was deleted, but ${failed} of ${results.length} ` +
           `disk(s) could not be removed and are still on disk ` +
           `(positions: ${
-            results.map((r, i) => r.removed !== true ? i : -1)
-              .filter((i) => i >= 0).join(", ")
+            results.filter((r) => !r.removed).map((r) => r.index).join(", ")
           })`,
       );
     }
