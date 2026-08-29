@@ -824,10 +824,14 @@ export const PsCheckpointRow = z.object({
   // letting dotNetDate return null for the rest meant a malformed timestamp
   // was written as "no creation time" -- a broken response wearing the shape
   // of missing data.
-  CreationTime: z.string().refine(
-    (v) => /^\/Date\((-?\d+)\)\/$/.test(v) || ISO_DATE.test(v),
-    { message: "CreationTime must be a .NET /Date(ms)/ or ISO-8601 value" },
-  ),
+  // Shape AND value. `2026-13-45T99:99:99Z` matches the pattern and is not a
+  // date; letting it through meant dotNetDate returned null and the record
+  // said "no creation time" for a response that was actually malformed.
+  CreationTime: z.string().refine((v) => dotNetDate(v) !== null, {
+    message:
+      "CreationTime must be a .NET /Date(ms)/ or ISO-8601 value that names a " +
+      "real instant",
+  }),
   // Required, nullable. A root checkpoint genuinely has no parent; a
   // response that omits the field has not told us either way.
   ParentSnapshotName: SafeName.nullable(),
@@ -1387,7 +1391,12 @@ function Get-OtherDiskSet {
       Get-VMHardDiskDrive | Select-Object -ExpandProperty Path)) {
     try { [void]$set.Add([System.IO.Path]::GetFullPath($p)) } catch { [void]$set.Add($p) }
   }
-  return $set
+  # The unary comma is load-bearing. A bare return lets PowerShell ENUMERATE
+  # the HashSet on the way out, so the caller receives null, a bare string, or
+  # an array depending on how many items it held -- and Contains() on an
+  # array is case-SENSITIVE, which silently undoes the normalisation this
+  # function exists for. Wrapping in a single-element array suppresses that.
+  return ,$set
 }
 function Normalise-Path([string]$p) {
   try { return [System.IO.Path]::GetFullPath($p) } catch { return $p }
@@ -1425,10 +1434,13 @@ ${
 # window -- so the window is made as small as this transport allows rather
 # than pretended away. A disk that became shared since the snapshot is
 # refused here and reported, not removed.
-$current = Get-OtherDiskSet
 for ($i = 0; $i -lt $disks.Count; $i++) {
   $d = $disks[$i]
   $ok = $false
+  # Per iteration, not once before the loop. A single snapshot ahead of the
+  # loop is the same non-atomic check this was supposed to replace, just
+  # slightly later -- and the window grows with every disk deleted.
+  $current = Get-OtherDiskSet
   if ($current.Contains((Normalise-Path $d))) {
     $ok = $false
   } else {

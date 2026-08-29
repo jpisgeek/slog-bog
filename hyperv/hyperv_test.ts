@@ -789,3 +789,42 @@ Deno.test("the transport refuses everything it should, by property", () => {
   assertEquals(args[args.length - 3], "--");
   assertEquals(args[args.length - 2], "admin@hv1");
 });
+
+// --- security review round 10 --------------------------------------------
+
+Deno.test("a pattern-shaped non-date is rejected, not stored as null", () => {
+  const base = {
+    VMName: "vm1",
+    Name: "cp",
+    CheckpointType: "Standard",
+    ParentSnapshotName: null,
+  };
+  // Matches ISO_DATE and names no real instant. Shape is not enough.
+  for (const t of ["2026-13-45T99:99:99Z", "0000-00-00T00:00:00Z"]) {
+    assertEquals(
+      PsCheckpointRow.safeParse({ ...base, CreationTime: t }).success,
+      false,
+    );
+  }
+  // Real ones still pass.
+  for (const t of ["/Date(1234567890000)/", "2026-01-01T00:00:00Z"]) {
+    assertEquals(
+      PsCheckpointRow.safeParse({ ...base, CreationTime: t }).success,
+      true,
+    );
+  }
+});
+
+Deno.test("the embedded PowerShell carries no backtick", async () => {
+  // A backtick inside the PowerShell terminates the JS template literal it
+  // lives in. That has broken this file twice, both times in a comment,
+  // and both times the failure looked like a TypeScript syntax error
+  // hundreds of lines away from the cause.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  for (const line of src.split("\n")) {
+    const t = line.trim();
+    if (t.startsWith("#")) assertEquals(t.includes("`"), false);
+  }
+});
