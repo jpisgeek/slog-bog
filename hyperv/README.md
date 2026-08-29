@@ -200,7 +200,7 @@ The point of both guards is a `vmName` arriving from a workflow input: it should
 fail rather than succeed against the wrong machine.
 
 **Caller-supplied names appear in errors and logs; remote output does not.** A
-message like `no VM named web01` names infrastructure deliberately. The
+message like `no VM named <your-vm-name>` names infrastructure deliberately. The
 distinction is provenance: remote output is screened hard — stderr is reduced to
 a fixed verdict, malformed stdout is reported as a byte count, and parse
 failures name the field rather than the value — because none of it was chosen by

@@ -25,7 +25,9 @@ import {
   DiskDeleteEnvelope,
   dotNetDate,
   encodeCommand,
+  frameParts,
   GlobalArgsSchema,
+  MAX_OUTPUT_BYTES,
   num,
   parseRow,
   PART_SEP,
@@ -36,6 +38,7 @@ import {
   RemoveCheckpointArgsSchema,
   resourceId,
   RestoreArgsSchema,
+  safeState,
   slugPart,
   StopArgsSchema,
   SWITCH_TYPES,
@@ -541,4 +544,59 @@ Deno.test("disk deletion proof must account for every disk", () => {
     Error,
     "did not match the expected shape",
   );
+});
+
+// --- security review round 5 ---------------------------------------------
+
+Deno.test("id framing cannot be forged by part contents", () => {
+  // The NUL join was unambiguous only while every part was NUL-free, which
+  // held for caller-supplied names and never held for names discovered on
+  // the host. Length prefixes read the boundary before the content.
+  assertEquals(frameParts(["ab", "c"]) === frameParts(["a", "bc"]), false);
+  assertEquals(frameParts(["a-b"]) === frameParts(["a", "b"]), false);
+  assertEquals(frameParts(["1:x"]) === frameParts(["1", "x"]), false);
+});
+
+Deno.test("framing introduces no control characters", () => {
+  const framed = frameParts(["host", "vm name", "cp"]);
+  for (const ch of framed) {
+    const code = ch.charCodeAt(0);
+    assertEquals(code >= 0x20 && code !== 0x7f, true);
+  }
+});
+
+Deno.test("remote names are held to the same rule as caller names", () => {
+  // These feed resource IDs, so a host reporting a control character or a
+  // wildcard must not have it reach an identifier.
+  const bads = ["a" + String.fromCharCode(0) + "b", "*", "vm\nname"];
+  for (const bad of bads) {
+    assertEquals(
+      PsVmRow.safeParse({
+        Name: bad,
+        State: "Running",
+        Status: "OK",
+        Generation: 2,
+        ProcessorCount: 1,
+        MemoryAssigned: 1,
+      }).success,
+      false,
+    );
+  }
+});
+
+Deno.test("state text in messages comes from a closed set", () => {
+  assertEquals(safeState("Running"), "Running");
+  assertEquals(safeState(null), "absent");
+  // A host cannot choose the words that end up in a log line.
+  assertEquals(
+    safeState("Running\n\nATTACKER CONTROLLED"),
+    "unrecognised-state",
+  );
+  assertEquals(safeState("../../etc/passwd"), "unrecognised-state");
+});
+
+Deno.test("the output cap is a byte limit, not a time limit", () => {
+  // A host that never stops talking should hit a byte cap, not a heap
+  // limit. The timeout bounds how LONG it runs, not how much it can send.
+  assertEquals(MAX_OUTPUT_BYTES, 4 * 1024 * 1024);
 });

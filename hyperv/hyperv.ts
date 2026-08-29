@@ -306,7 +306,7 @@ async function runPowerShell(
   ps: string,
   signal: AbortSignal,
 ): Promise<string> {
-  const out = await new Deno.Command("ssh", {
+  const cmd = new Deno.Command("ssh", {
     args: [
       // Everything ssh will otherwise take from ambient config is pinned
       // here, because this model's guarantees have to be its own rather than
@@ -368,16 +368,90 @@ async function runPowerShell(
       signal,
       AbortSignal.timeout((g.timeoutSec + 10) * 1000),
     ]),
-  }).output();
+  });
 
-  const stdout = new TextDecoder().decode(out.stdout).trim();
-  if (out.code !== 0) {
-    const err = new TextDecoder().decode(out.stderr);
+  // Read both streams with a hard byte cap instead of buffering to
+  // completion. `.output()` accumulates whatever the far end sends, so a host
+  // that is broken or hostile can exhaust this process's memory long before
+  // the timeout has anything to say about it -- the timeout bounds how long
+  // it runs, not how much it can hand over in that time.
+  //
+  // The child is killed at the point of overflow rather than after both
+  // streams settle. Waiting for stderr to end cannot work when the process is
+  // still producing: stderr does not reach EOF until the child exits, and the
+  // child is exactly what is not exiting.
+  const child = cmd.spawn();
+  let killed = false;
+  const kill = () => {
+    if (killed) return;
+    killed = true;
+    try {
+      child.kill("SIGKILL");
+    } catch { /* already gone */ }
+  };
+  const [stdoutRaw, stderrRaw, status] = await Promise.all([
+    readCapped(child.stdout, kill),
+    readCapped(child.stderr, kill),
+    child.status,
+  ]);
+
+  if (killed) {
     throw new Error(
-      `powershell over ssh failed (exit ${out.code}): ${classifyRemote(err)}`,
+      `powershell over ssh produced more than ${MAX_OUTPUT_BYTES} bytes and ` +
+        `was terminated`,
+    );
+  }
+  const stdout = new TextDecoder().decode(stdoutRaw).trim();
+  if (status.code !== 0) {
+    throw new Error(
+      `powershell over ssh failed (exit ${status.code}): ${
+        classifyRemote(new TextDecoder().decode(stderrRaw))
+      }`,
     );
   }
   return stdout;
+}
+
+/** Nothing this model asks for is remotely this large. */
+export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Drain a stream up to the cap, calling `onOverflow` the moment it is passed.
+ * Returns what was read so far so a caller can still classify a failure.
+ */
+async function readCapped(
+  stream: ReadableStream<Uint8Array>,
+  onOverflow: () => void,
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_OUTPUT_BYTES) {
+        onOverflow();
+        break;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    // The stream dies when the child is killed; that is the expected path
+    // after an overflow, not a separate failure to report.
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch { /* already released */ }
+  }
+  const out = new Uint8Array(total > MAX_OUTPUT_BYTES ? 0 : total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out;
 }
 
 /**
@@ -488,8 +562,28 @@ export async function resourceId(
   ...parts: string[]
 ): Promise<string> {
   const scoped = [host, ...parts];
-  const digest = await sha256Hex(scoped.join("\u0000"));
-  return [kind, ...scoped.map(slugPart)].join(PART_SEP) + "-" + digest;
+  return [kind, ...scoped.map(slugPart)].join(PART_SEP) + "-" +
+    await sha256Hex(frameParts(scoped));
+}
+
+/**
+ * Frame parts so no input can forge a boundary, without using a byte that
+ * inputs might contain.
+ *
+ * The first attempt joined with NUL, which is unambiguous only while every
+ * part is guaranteed NUL-free. Caller-supplied names are, because `SafeName`
+ * refuses control characters -- but names DISCOVERED on the host arrive from
+ * PowerShell and were never held to that rule, so the guarantee did not
+ * actually cover the inputs it needed to. Length-prefixing removes the
+ * question: `["ab","c"]` frames as `2:ab1:c`, `["a","bc"]` as `1:a2:bc`, and
+ * no choice of contents makes those collide, because the lengths are read
+ * before the content rather than inferred from a delimiter inside it.
+ *
+ * It also takes a control character out of the published source, which the
+ * identifier scan and any reader are entitled to be suspicious of.
+ */
+export function frameParts(parts: string[]): string {
+  return parts.map((p) => `${p.length}:${p}`).join("");
 }
 
 /** Hex SHA-256 via Web Crypto, so no dependency is added for one hash. */
@@ -524,14 +618,18 @@ export async function sha256Hex(input: string): Promise<string> {
  * default, so nothing unvalidated reaches a resource either way.)
  */
 export const PsVmHostRow = z.object({
-  Name: z.string().min(1),
+  Name: SafeName,
   LogicalProcessorCount: z.number().int().nonnegative(),
   MemoryCapacity: z.number().nonnegative(),
   VirtualMachinePath: z.string().min(1),
 });
 
 export const PsVmRow = z.object({
-  Name: z.string().min(1),
+  // Remote names feed resource IDs, so they are held to the same rule as
+  // caller-supplied ones. A host that reports a VM named with a control
+  // character is either broken or hostile, and either way its name should not
+  // reach an identifier.
+  Name: SafeName,
   State: z.string().min(1),
   Status: z.string(),
   Generation: z.number().int(),
@@ -544,7 +642,7 @@ export const PsVmRow = z.object({
 });
 
 export const PsSwitchRow = z.object({
-  Name: z.string().min(1),
+  Name: SafeName,
   // The raw enum number. Kept numeric on purpose: SWITCH_TYPES maps it, and a
   // test asserts that map covers the enum rather than spot-checking it.
   SwitchType: z.number().int(),
@@ -584,13 +682,58 @@ export const DiskDeleteEnvelope = z.object({
   })),
 });
 
+/**
+ * The states Hyper-V reports. Remote strings are interpolated into logs and
+ * errors, so the set they can come from is closed rather than "whatever the
+ * host said" -- an unrecognised value is rendered as a fixed token instead of
+ * echoed. Collection still stores the raw string; this governs what is
+ * allowed to reach a message.
+ */
+export const KNOWN_VM_STATES = new Set([
+  "Other",
+  "Running",
+  "Off",
+  "Stopping",
+  "Saved",
+  "Paused",
+  "Starting",
+  "Reset",
+  "Saving",
+  "Pausing",
+  "Resuming",
+  "FastSaved",
+  "FastSaving",
+  "ForceShutdown",
+  "ForceReboot",
+  "Hibernated",
+  "ComponentServicing",
+  "RunningCritical",
+  "OffCritical",
+  "StoppingCritical",
+  "SavedCritical",
+  "PausedCritical",
+  "StartingCritical",
+  "ResetCritical",
+  "SavingCritical",
+  "PausingCritical",
+  "ResumingCritical",
+  "FastSavedCritical",
+  "FastSavingCritical",
+]);
+
+/** Render a state for a human without letting the host choose the text. */
+export function safeState(v: string | null): string {
+  if (v === null) return "absent";
+  return KNOWN_VM_STATES.has(v) ? v : "unrecognised-state";
+}
+
 export const PsStateRow = z.object({
   state: z.string().nullable(),
 });
 
 export const PsCheckpointRow = z.object({
-  VMName: z.string().min(1),
-  Name: z.string().min(1),
+  VMName: SafeName,
+  Name: SafeName,
   CheckpointType: z.string(),
   // Either the /Date(ms)/ form PowerShell emits or an ISO string, depending
   // on how it was serialised. Both are strings; anything else is a bug.
@@ -735,9 +878,12 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
     );
   }
 
+  // Counts only. The host name is remote-discovered rather than
+  // caller-supplied, and it is already stored as a resource field and inside
+  // the resource ID -- there is nothing a log line adds except one more place
+  // it has to be scrubbed from later.
   ctx.logger.info(
-    `hyper-v: ${vms.length} VM(s), ${switches.length} switch(es) on ` +
-      hostRec.Name,
+    `hyper-v: ${vms.length} VM(s), ${switches.length} switch(es)`,
   );
   return handles;
 }
@@ -934,7 +1080,9 @@ async function start(args: z.infer<typeof VmNameArgs>, ctx: Ctx) {
   if (after !== "Running") {
     throw new Error(`start did not take: ${args.vmName} is ${after}`);
   }
-  ctx.logger.info(`${args.vmName}: ${before} -> ${after}`);
+  ctx.logger.info(
+    `${args.vmName}: ${safeState(before)} -> ${safeState(after)}`,
+  );
   return [];
 }
 
@@ -961,7 +1109,9 @@ async function stop(args: z.infer<typeof StopArgsSchema>, ctx: Ctx) {
   );
   const after = await vmState(g, args.vmName, ctx.signal);
   if (after !== "Off") throw new Error(`stop did not take: still ${after}`);
-  ctx.logger.info(`${args.vmName}: ${before} -> ${after}`);
+  ctx.logger.info(
+    `${args.vmName}: ${safeState(before)} -> ${safeState(after)}`,
+  );
   return [];
 }
 
@@ -1071,10 +1221,10 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
   const before = await vmState(g, args.vmName, ctx.signal);
   if (before === null) throw new Error(`no VM named ${args.vmName}`);
 
-  // Cutting power is its own decision. This path has no graceful shutdown --
-  // Stop-VM -TurnOff is the plug, not a request to the guest -- so a caller
-  // who only meant "remove this idle VM" should not silently get a hard power
-  // cut on a machine that turned out to be running.
+  // A courtesy pre-check: it fails fast with a clear message before anything
+  // is touched. It is NOT the guard -- a VM can start between this call and
+  // the delete script, so the binding refusal lives inside that script, on
+  // the host, using the state it sees at the moment it acts.
   if (before !== "Off" && !args.confirmForcePowerOff) {
     throw new Error(
       `${args.vmName} is ${before}. Deleting it cuts power with no graceful ` +
@@ -1091,8 +1241,20 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 $name = ${psQuote(args.vmName)}
+$allowForce = ${args.confirmForcePowerOff ? "$true" : "$false"}
 $disks = @(Get-VMHardDiskDrive -VMName $name | Select-Object -ExpandProperty Path)
-if ((Get-VM -Name $name).State -ne 'Off') { Stop-VM -Name $name -TurnOff -Force }
+$state = (Get-VM -Name $name).State.ToString()
+# The acknowledgement is enforced HERE, not only before the call. Checking
+# state in one SSH round trip and powering off in a later one leaves a window
+# where a VM starts in between -- and the old script then cut its power
+# regardless of what the caller had agreed to. The host makes this decision
+# with the state it has at that instant.
+if ($state -ne 'Off') {
+  if (-not $allowForce) {
+    throw "refusing to delete a VM that is $state without confirmForcePowerOff"
+  }
+  Stop-VM -Name $name -TurnOff -Force
+}
 Remove-VM -Name $name -Force
 $results = @()
 ${
