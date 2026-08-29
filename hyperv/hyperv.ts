@@ -127,7 +127,40 @@ export const SafeName = z
   )
   .refine((v) => v.trim() === v && v.trim() !== "", {
     message: "name must not be blank or padded with whitespace",
-  });
+  })
+  .refine(
+    (v) => {
+      // Iterating a string yields whole code points, so any surrogate still
+      // visible here is UNPAIRED. TextEncoder maps every one of them to the
+      // same replacement character before hashing, and slugPart drops them
+      // all -- so two different malformed names would produce one identical
+      // resource ID, which is exactly the collision the digest exists to
+      // prevent.
+      for (const ch of v) {
+        const cp = ch.codePointAt(0)!;
+        if (cp >= 0xd800 && cp <= 0xdfff) return false;
+      }
+      return true;
+    },
+    { message: "name must not contain unpaired surrogate code units" },
+  );
+
+/**
+ * A remote string that will be STORED but is not an identifier: status text,
+ * a checkpoint type, a filesystem path. It cannot be held to SafeName -- a
+ * path contains separators and a status contains spaces -- but it can be
+ * bounded. Unbounded and unscreened, a broken or hostile host could write
+ * control text or arbitrary bulk into a resource, and in one case into a
+ * datastore TAG, which is a queryable index rather than an opaque blob.
+ */
+export const RemoteText = (max: number) =>
+  z
+    .string()
+    .max(max)
+    // deno-lint-ignore no-control-regex
+    .refine((v) => !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(v), {
+      message: "value must not contain control or line-separator characters",
+    });
 
 export const GlobalArgsSchema = z.object({
   host: z
@@ -655,13 +688,19 @@ export function frameParts(parts: string[]): string {
 }
 
 /**
- * The stable identity of the machine this model was pointed at. Host and port
- * together, because two Hyper-V endpoints can live behind one address.
+ * The stable identity of the connection this model was pointed at: user, host
+ * and port.
+ *
+ * Host and port because two Hyper-V endpoints can live behind one address.
+ * The USER because two accounts on one host do not see the same thing --
+ * Hyper-V shows an unprivileged account a subset -- so two configurations
+ * differing only by account expose different inventories and must not
+ * overwrite each other's records.
  */
 export function targetKey(
-  g: { host: string; port: number },
+  g: { host: string; user: string; port: number },
 ): string {
-  return `${g.host}:${g.port}`;
+  return `${g.user}@${g.host}:${g.port}`;
 }
 
 /** Hex SHA-256 via Web Crypto, so no dependency is added for one hash. */
@@ -699,7 +738,7 @@ export const PsVmHostRow = z.object({
   Name: SafeName,
   LogicalProcessorCount: z.number().int().nonnegative(),
   MemoryCapacity: z.number().nonnegative(),
-  VirtualMachinePath: z.string().min(1),
+  VirtualMachinePath: RemoteText(4096).min(1),
 });
 
 export const PsVmRow = z.object({
@@ -708,8 +747,8 @@ export const PsVmRow = z.object({
   // character is either broken or hostile, and either way its name should not
   // reach an identifier.
   Name: SafeName,
-  State: z.string().min(1),
-  Status: z.string(),
+  State: RemoteText(64).min(1),
+  Status: RemoteText(256),
   Generation: z.number().int(),
   ProcessorCount: z.number().int().nonnegative(),
   MemoryAssigned: z.number().nonnegative(),
@@ -809,7 +848,7 @@ export function safeState(v: string | null): string {
 }
 
 export const PsStateRow = z.object({
-  state: z.string().nullable(),
+  state: RemoteText(64).min(1).nullable(),
 });
 
 /** ISO-8601 as PowerShell emits it, anchored so a prefix cannot pass. */
@@ -819,7 +858,7 @@ export const ISO_DATE =
 export const PsCheckpointRow = z.object({
   VMName: SafeName,
   Name: SafeName,
-  CheckpointType: z.string(),
+  CheckpointType: RemoteText(64),
   // Only the two forms PowerShell actually produces. Accepting any string and
   // letting dotNetDate return null for the rest meant a malformed timestamp
   // was written as "no creation time" -- a broken response wearing the shape

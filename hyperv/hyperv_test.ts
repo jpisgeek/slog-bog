@@ -37,6 +37,7 @@ import {
   PsStateRow,
   PsVmHostRow,
   PsVmRow,
+  RemoteText,
   RemoveCheckpointArgsSchema,
   resourceId,
   RestoreArgsSchema,
@@ -45,6 +46,7 @@ import {
   sshArgs,
   StopArgsSchema,
   SWITCH_TYPES,
+  targetKey,
   VmNameArgs,
 } from "./hyperv.ts";
 
@@ -827,4 +829,44 @@ Deno.test("the embedded PowerShell carries no backtick", async () => {
     const t = line.trim();
     if (t.startsWith("#")) assertEquals(t.includes("`"), false);
   }
+});
+
+// --- security review round 11 --------------------------------------------
+
+Deno.test("identity includes the account, not just host and port", () => {
+  // Hyper-V shows an unprivileged account a subset, so two configurations
+  // differing only by user expose different inventories and must not
+  // overwrite each other.
+  const a = targetKey({ host: "hv1", user: "admin", port: 22 });
+  const b = targetKey({ host: "hv1", user: "readonly", port: 22 });
+  assertEquals(a === b, false);
+});
+
+Deno.test("unpaired surrogates cannot collapse two names into one id", () => {
+  // TextEncoder maps every lone surrogate to the same replacement char
+  // before hashing, and slugPart drops them all -- so two different
+  // malformed names would have produced one identical ID.
+  const lone1 = "vm" + String.fromCharCode(0xd800);
+  const lone2 = "vm" + String.fromCharCode(0xd801);
+  assertEquals(VmNameArgs.safeParse({ vmName: lone1 }).success, false);
+  assertEquals(VmNameArgs.safeParse({ vmName: lone2 }).success, false);
+  // A well-formed pair is a real character and stays allowed.
+  assertEquals(VmNameArgs.safeParse({ vmName: "vm-load" }).success, true);
+});
+
+Deno.test("stored remote text is bounded and screened", () => {
+  const ok = RemoteText(16);
+  assertEquals(ok.safeParse("Operating normally").success, false);
+  assertEquals(ok.safeParse("Running").success, true);
+  // Control and line-separator characters cannot reach a stored field,
+  // and one of these fields is a datastore TAG -- a queryable index,
+  // not an opaque blob.
+  assertEquals(
+    ok.safeParse("a" + String.fromCharCode(0x2028) + "b").success,
+    false,
+  );
+  assertEquals(
+    ok.safeParse("a" + String.fromCharCode(0x1b) + "b").success,
+    false,
+  );
 });
