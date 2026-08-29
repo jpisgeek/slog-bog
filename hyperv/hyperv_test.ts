@@ -30,11 +30,13 @@ import {
   matchCheckpoints,
   MAX_OUTPUT_BYTES,
   num,
+  oneEnvelope,
   parseRow,
   PART_SEP,
   PsCheckpointRow,
   psQuote,
   PsStateRow,
+  PsSwitchRow,
   PsVmHostRow,
   PsVmRow,
   RemoteText,
@@ -946,4 +948,53 @@ Deno.test("every mutating verb resolves exactly one VM first", async () => {
   // And the guard itself appears once per mutating verb plus its definition.
   const uses = src.split("resolveOneVm(").length - 1;
   assertEquals(uses >= 6, true);
+});
+
+// --- security review round 15 --------------------------------------------
+
+Deno.test("one envelope means exactly one", () => {
+  // asArray(raw)[0] took the first of any number and discarded the rest
+  // unseen, so a stray Write-Output made a response look valid.
+  assertEquals(oneEnvelope('{"a":1}', "x").a, 1);
+  assertThrows(() => oneEnvelope("[]", "x"), Error, "got 0");
+  assertThrows(
+    () => oneEnvelope('[{"a":1},{"b":2}]', "x"),
+    Error,
+    "got 2",
+  );
+});
+
+Deno.test("a JSON array of non-objects is an error, not empty records", () => {
+  // A cast would have let these through and every field read downstream
+  // would be undefined rather than a failure.
+  assertThrows(() => asArray("[1,2,3]"), Error, "expected a JSON object");
+  assertThrows(() => asArray('["a"]'), Error, "expected a JSON object");
+  assertEquals(asArray('{"a":1}').length, 1);
+});
+
+Deno.test("an unknown switch type is rejected, not relabelled", () => {
+  // Inventing Type7 for an unrecognised enum stored malformed data under
+  // a plausible-looking label.
+  assertEquals(
+    PsSwitchRow.safeParse({ Name: "lan", SwitchType: 2 }).success,
+    true,
+  );
+  assertEquals(
+    PsSwitchRow.safeParse({ Name: "lan", SwitchType: 7 }).success,
+    false,
+  );
+  assertEquals(
+    PsSwitchRow.safeParse({ Name: "lan", SwitchType: -1 }).success,
+    false,
+  );
+});
+
+Deno.test("disk ownership fails closed, in the script that decides it", async () => {
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  // An unreadable chain or an over-long one must refuse, never fall back
+  // to treating an unreadable parent as "no parent".
+  assertStringIncludes(src, "refusing to judge disk ownership");
+  assertEquals(src.includes("catch { $next = $null }"), false);
 });

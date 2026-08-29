@@ -361,8 +361,16 @@ type Ctx = {
     info: (msg: string, props?: Record<string, unknown>) => void;
     warning: (msg: string, props?: Record<string, unknown>) => void;
   };
-  // deno-lint-ignore no-explicit-any
-  writeResource: (...a: any[]) => Promise<any>;
+  // Typed rather than `any`. This is the boundary that is supposed to
+  // guarantee only validated values reach a resource, and a signature of
+  // `(...a: any[]) => Promise<any>` guarantees nothing at all -- it would
+  // accept the raw remote object just as happily as the parsed one.
+  writeResource: (
+    spec: string,
+    id: string,
+    attributes: Record<string, unknown>,
+    options?: { tags?: Record<string, string> },
+  ) => Promise<unknown>;
 };
 
 /**
@@ -624,9 +632,20 @@ export function asArray(raw: string): Record<string, unknown>[] {
     );
   }
   if (v === null) return [];
-  return Array.isArray(v)
-    ? v as Record<string, unknown>[]
-    : [v as Record<string, unknown>];
+  // Narrowed, not asserted. A cast here would let a JSON array of numbers or
+  // strings through as if it were a list of records, and every field read
+  // downstream would then be undefined rather than an error.
+  const rows = Array.isArray(v) ? v : [v];
+  return rows.map((row, i) => {
+    if (typeof row !== "object" || row === null || Array.isArray(row)) {
+      throw new Error(
+        `expected a JSON object at position ${i}, got ${
+          row === null ? "null" : Array.isArray(row) ? "an array" : typeof row
+        }`,
+      );
+    }
+    return row as Record<string, unknown>;
+  });
 }
 
 /**
@@ -800,7 +819,12 @@ export const PsSwitchRow = z.object({
   Name: SafeName,
   // The raw enum number. Kept numeric on purpose: SWITCH_TYPES maps it, and a
   // test asserts that map covers the enum rather than spot-checking it.
-  SwitchType: z.number().int(),
+  // Only the enum Hyper-V defines. Accepting any integer and inventing
+  // `Type${n}` for the rest stored malformed data under a plausible-looking
+  // label instead of rejecting it.
+  SwitchType: z.number().int().refine((v) => v in SWITCH_TYPES, {
+    message: "SwitchType must be a known Hyper-V switch type",
+  }),
 });
 
 /**
@@ -921,6 +945,27 @@ export const CheckpointEnvelope = z.object({
 });
 
 /**
+ * Take the single top-level object a call is supposed to return.
+ *
+ * `asArray(raw)[0]` accepted an array of any length and silently used the
+ * first element, so a response carrying extra objects -- a stray Write-Output,
+ * a cmdlet that emitted more than intended -- was treated as valid and the
+ * remainder discarded unseen. One envelope means one.
+ */
+export function oneEnvelope(
+  raw: string,
+  what: string,
+): Record<string, unknown> {
+  const rows = asArray(raw);
+  if (rows.length !== 1) {
+    throw new Error(
+      `${what}: expected exactly one top-level object from the host, got ${rows.length}`,
+    );
+  }
+  return rows[0];
+}
+
+/**
  * Parse one PowerShell row, and fail with the field path rather than the
  * value. A zod message would otherwise quote the offending input straight
  * into an error that gets written to a resource and a log.
@@ -984,7 +1029,7 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
   const raw = await runPowerShell(g, ps, ctx.signal);
   const top = parseRow(
     DiscoverEnvelope,
-    asArray(raw)[0],
+    oneEnvelope(raw, "discover"),
     "discover envelope",
   );
 
@@ -1015,7 +1060,7 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
   for (const v of vms) {
     // Uptime arrives as a .NET TimeSpan, serialised as an object with
     // TotalSeconds -- not a number, and not a string.
-    const up = v.Uptime as Record<string, unknown> | null | undefined;
+    const up = v.Uptime;
     handles.push(
       await ctx.writeResource(
         "vm",
@@ -1027,7 +1072,7 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
           generation: v.Generation,
           cpuCount: v.ProcessorCount,
           memoryAssignedBytes: v.MemoryAssigned,
-          uptimeSeconds: up ? num(up.TotalSeconds) : null,
+          uptimeSeconds: up ? up.TotalSeconds : null,
         },
         { tags: { state: v.State } },
       ),
@@ -1041,7 +1086,7 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
         await resourceId(targetKey(g), "vmswitch", sw.Name),
         {
           name: sw.Name,
-          switchType: SWITCH_TYPES[sw.SwitchType] ?? `Type${sw.SwitchType}`,
+          switchType: SWITCH_TYPES[sw.SwitchType],
         },
       ),
     );
@@ -1118,7 +1163,11 @@ try {
   // "no such VM". The old form returned null for a malformed response too,
   // which made a broken probe indistinguishable from an absent machine --
   // and `delete` verifies its own success by asking exactly this question.
-  const o = parseRow(PsStateRow, asArray(raw)[0], "VM state probe");
+  const o = parseRow(
+    PsStateRow,
+    oneEnvelope(raw, "VM state probe"),
+    "VM state probe",
+  );
   return o.state;
 }
 
@@ -1212,17 +1261,15 @@ async function listCheckpoints(
   vmName: string,
   signal: AbortSignal,
 ): Promise<z.infer<typeof PsCheckpointRow>[]> {
-  const ps = `
-$ErrorActionPreference='Stop'
-$ProgressPreference='SilentlyContinue'
-$c = @(Get-VMSnapshot -VMName ${psQuote(vmName)} |
+  const ps = `${resolveOneVm(vmName)}
+$c = @(Get-VMSnapshot -VM $vm |
   Select-Object VMName,Name,CreationTime,ParentSnapshotName,
     @{n='CheckpointType';e={$_.SnapshotType.ToString()}})
 [pscustomobject]@{ checkpoints=$c } | ConvertTo-Json -Depth 4 -Compress`
     .trim();
   const top = parseRow(
     CheckpointEnvelope,
-    asArray(await runPowerShell(g, ps, signal))[0],
+    oneEnvelope(await runPowerShell(g, ps, signal), "checkpoints"),
     "checkpoint envelope",
   );
   return top.checkpoints;
@@ -1334,15 +1381,16 @@ async function checkpoint(
     g,
     `${resolveOneVm(args.vmName)}
 # Refuse a duplicate in the same call that creates, not one round trip earlier.
-$existing = @(Get-VMSnapshot -VMName ${psQuote(args.vmName)} -Name ${
+# Query through $vm, not by name again, and let a failed query FAIL. With
+# SilentlyContinue a permission, provider or storage error came back as an
+# empty list and was read as "no duplicate", after which this mutated anyway.
+$existing = @(Get-VMSnapshot -VM $vm -Name ${
       psQuote(args.name)
-    } -ErrorAction SilentlyContinue)
+    } -ErrorAction Stop)
 if ($existing.Count -ne 0) {
   throw "a checkpoint with that name already exists on this VM"
 }
-Checkpoint-VM -Name ${psQuote(args.vmName)} -SnapshotName ${
-      psQuote(args.name)
-    }`,
+Checkpoint-VM -VM $vm -SnapshotName ${psQuote(args.name)}`,
     ctx.signal,
   );
 
@@ -1394,9 +1442,7 @@ async function restoreCheckpoint(
 # earlier round trip left a window in which a second case-variant checkpoint
 # could appear, and Restore-VMSnapshot would then roll back to whichever it
 # matched -- discarding a different span of work than was acknowledged.
-$snaps = @(Get-VMSnapshot -VMName ${psQuote(args.vmName)} -Name ${
-      psQuote(args.name)
-    })
+$snaps = @(Get-VMSnapshot -VM $vm -Name ${psQuote(args.name)})
 if ($snaps.Count -ne 1) {
   throw "expected exactly one checkpoint matching the given name, found $($snaps.Count)"
 }
@@ -1440,9 +1486,7 @@ async function removeCheckpoint(
     g,
     `${resolveOneVm(args.vmName)}
 # Same reason as restore: the check and the deletion have to be one operation.
-$snaps = @(Get-VMSnapshot -VMName ${psQuote(args.vmName)} -Name ${
-      psQuote(args.name)
-    })
+$snaps = @(Get-VMSnapshot -VM $vm -Name ${psQuote(args.name)})
 if ($snaps.Count -ne 1) {
   throw "expected exactly one checkpoint matching the given name, found $($snaps.Count)"
 }
@@ -1489,7 +1533,7 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
   const ps = `${resolveOneVm(args.vmName)}
 $name = $vm.Name
 $allowForce = ${args.confirmForcePowerOff ? "$true" : "$false"}
-$disks = @(Get-VMHardDiskDrive -VMName $name | Select-Object -ExpandProperty Path)
+$disks = @(Get-VMHardDiskDrive -VM $vm | Select-Object -ExpandProperty Path)
 # A VHDX can be attached to more than one VM -- shared disks, differencing
 # chains, or simply the same file added twice. Deleting this VM's disks would
 # then destroy storage another machine is still using, and Remove-Item has no
@@ -1509,10 +1553,22 @@ function Get-OtherDiskSet {
       Get-VMHardDiskDrive | Select-Object -ExpandProperty Path)) {
     $cur = $p
     $depth = 0
-    while ($cur -and $depth -lt 32) {
+    while ($cur) {
       try { [void]$set.Add([System.IO.Path]::GetFullPath($cur)) } catch { [void]$set.Add($cur) }
+      if ($depth -ge 32) {
+        # A chain this long is either corrupt or something nobody intended.
+        # Refusing is the only safe answer: continuing would mean deleting
+        # from a set we know is incomplete.
+        throw "differencing chain deeper than 32 links; refusing to judge disk ownership"
+      }
       $next = $null
-      try { $next = (Get-VHD -Path $cur -ErrorAction Stop).ParentPath } catch { $next = $null }
+      try { $next = (Get-VHD -Path $cur -ErrorAction Stop).ParentPath }
+      catch {
+        # Fail CLOSED. A chain we cannot read is a chain we cannot clear, and
+        # treating an unreadable parent as "no parent" is how a base disk
+        # another VM depends on gets deleted.
+        throw "cannot inspect a disk chain; refusing to judge disk ownership"
+      }
       if (-not $next -or $next -eq $cur) { break }
       $cur = $next
       $depth++
@@ -1552,7 +1608,7 @@ ${
 }`
       : ""
   }
-Remove-VM -Name $name -Force
+Remove-VM -VM $vm -Force
 $results = @()
 ${
     args.deleteDisks
@@ -1583,7 +1639,7 @@ for ($i = 0; $i -lt $disks.Count; $i++) {
     .trim();
   const envelope = parseRow(
     DiskDeleteEnvelope,
-    asArray(await runPowerShell(g, ps, ctx.signal))[0],
+    oneEnvelope(await runPowerShell(g, ps, ctx.signal), "disk deletion"),
     "disk deletion envelope",
   );
 
