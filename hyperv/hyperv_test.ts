@@ -998,3 +998,32 @@ Deno.test("disk ownership fails closed, in the script that decides it", async ()
   assertStringIncludes(src, "refusing to judge disk ownership");
   assertEquals(src.includes("catch { $next = $null }"), false);
 });
+
+// --- security review round 16 --------------------------------------------
+
+Deno.test("a self-duplicate disk is refused before anything is removed", async () => {
+  // The README promised "the same file added twice" was refused and only
+  // other-VM sharing was ever implemented. Undetected, the first pass
+  // deletes the file and the second reports a failure for a disk already
+  // gone -- after Remove-VM, with nothing left to abort into.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  assertStringIncludes(src, "attached to this VM more than once");
+  // Both refusals must precede the removal, not follow it.
+  const guard = src.indexOf("attached to this VM more than once");
+  const removal = src.indexOf("Remove-VM -VM $vm -Force");
+  assertEquals(guard < removal && guard !== -1, true);
+});
+
+Deno.test("a genuine read failure is not swallowed as an overflow", async () => {
+  // Catching every stream error meant a broken transport ended the read
+  // quietly and handed back a partial response, which the caller then
+  // treated as complete. For a method that proves a deletion by reading a
+  // response, that is the worst available outcome.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  assertStringIncludes(src, "reading the remote response failed");
+  assertEquals(src.includes("} catch {\n    // The stream dies"), false);
+});

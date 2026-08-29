@@ -495,8 +495,8 @@ async function runPowerShell(
     } catch { /* already gone */ }
   };
   const [stdoutRaw, stderrRaw, status] = await Promise.all([
-    readCapped(child.stdout, kill),
-    readCapped(child.stderr, kill),
+    readCapped(child.stdout, kill, () => killed),
+    readCapped(child.stderr, kill, () => killed),
     child.status,
   ]);
 
@@ -539,6 +539,7 @@ export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 async function readCapped(
   stream: ReadableStream<Uint8Array>,
   onOverflow: () => void,
+  overflowed: () => boolean,
 ): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -554,9 +555,20 @@ async function readCapped(
       }
       chunks.push(value);
     }
-  } catch {
-    // The stream dies when the child is killed; that is the expected path
-    // after an overflow, not a separate failure to report.
+  } catch (e) {
+    // Swallow ONLY the error our own kill caused. Catching everything meant a
+    // genuine pipe failure -- a broken transport, a truncated read -- ended
+    // the loop quietly and handed back whatever had arrived so far, which the
+    // caller then treated as a complete response. For a method that proves a
+    // deletion by reading a response, a partial read accepted as whole is the
+    // worst available outcome.
+    if (!overflowed()) {
+      throw new Error(
+        `reading the remote response failed: ${
+          e instanceof Error ? e.name : "unknown error"
+        }`,
+      );
+    }
   } finally {
     try {
       reader.releaseLock();
@@ -1586,6 +1598,16 @@ function Normalise-Path([string]$p) {
 }
 $othersDisks = Get-OtherDiskSet
 $shared = @($disks | Where-Object { $othersDisks.Contains((Normalise-Path $_)) })
+# The same file attached twice to THIS VM is the other half of the promise the
+# README makes, and it was never implemented. Left undetected, the first pass
+# deletes the file and the second reports a failure for a disk that is already
+# gone -- after Remove-VM has run, so there is nothing left to abort into.
+$selfSeen = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+$selfDup = @()
+foreach ($d in $disks) {
+  $n = Normalise-Path $d
+  if (-not $selfSeen.Add($n)) { $selfDup += $n }
+}
 $state = $vm.State.ToString()
 # The acknowledgement is enforced HERE, not only before the call. Checking
 # state in one SSH round trip and powering off in a later one leaves a window
@@ -1605,6 +1627,9 @@ ${
     args.deleteDisks
       ? `if ($shared.Count -gt 0) {
   throw "refusing to delete: $($shared.Count) of $($disks.Count) disk(s) are attached to another VM"
+}
+if ($selfDup.Count -gt 0) {
+  throw "refusing to delete: $($selfDup.Count) disk path(s) are attached to this VM more than once"
 }`
       : ""
   }
