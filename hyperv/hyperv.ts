@@ -84,7 +84,17 @@ const USERLIKE = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
  * equalling `vmName` is satisfied by passing `*` twice, and the model would
  * have confirmed the caller's intent to destroy the entire host.
  *
- * Control characters are refused in the same place, for a different reason.
+ * The refused set is wider than ASCII controls, and each addition earns its
+ * place. C1 controls (U+0080-U+009F) are controls that survive a naive ASCII
+ * check. U+2028 and U+2029 are line and paragraph separators, so a name
+ * carrying one can forge an extra line in a log and make a record appear to
+ * say something it does not. The bidi and zero-width family
+ * (U+200B-U+200F, U+202A-U+202E, U+2066-U+2069, U+FEFF) can reorder or hide
+ * text on display, so what an operator reads before confirming a deletion is
+ * not what the string actually is -- which matters most in exactly the place
+ * this model asks a human to compare two names.
+ *
+ * Control characters are refused for one more reason.
  * Resource IDs are digested over parts joined by NUL, so a name allowed to
  * contain NUL could shift the boundary and make two different names produce
  * one ID -- the exact collision the digest exists to prevent.
@@ -100,9 +110,19 @@ export const SafeName = z
       "confirms nothing",
   })
   // deno-lint-ignore no-control-regex
-  .refine((v) => !/[\u0000-\u001f\u007f]/.test(v), {
+  .refine((v) => !/[\u0000-\u001f\u007f-\u009f]/.test(v), {
     message: "name must not contain control characters",
   })
+  .refine((v) => !/[\u2028\u2029]/.test(v), {
+    message: "name must not contain line or paragraph separators",
+  })
+  .refine(
+    (v) => !/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(v),
+    {
+      message:
+        "name must not contain zero-width or direction-formatting characters",
+    },
+  )
   .refine((v) => v.trim() === v && v.trim() !== "", {
     message: "name must not be blank or padded with whitespace",
   });
@@ -548,20 +568,25 @@ export const PART_SEP = "--";
 /**
  * Build a resource ID that is scoped, collision-free, and readable.
  *
- * Three properties, each load-bearing. It is SCOPED by host, so the same VM
- * name on two Hyper-V hosts does not overwrite one record with the other --
- * the previous form omitted the host entirely. It is COLLISION-FREE because
+ * Three properties, each load-bearing. It is SCOPED by the CONFIGURED target
+ * -- the address and port this model was pointed at -- so the same VM name on
+ * two Hyper-V hosts does not overwrite one record with the other. Scoping by
+ * the name the host REPORTS was the first attempt and is not sound: two
+ * machines can answer to the same hostname (a rebuild, a clone, a naming
+ * collision across sites), and then their VMs share IDs and silently
+ * overwrite each other. The configured address is the thing the operator
+ * actually distinguished when they wrote the model down. It is COLLISION-FREE because
  * the trailing digest is taken over the original parts with a delimiter that
  * cannot appear in them, so two different names cannot produce one ID even
  * after slugging flattens them. And it stays READABLE, because the slugs are
  * kept in front of the digest.
  */
 export async function resourceId(
+  target: string,
   kind: string,
-  host: string,
   ...parts: string[]
 ): Promise<string> {
-  const scoped = [host, ...parts];
+  const scoped = [target, ...parts];
   return [kind, ...scoped.map(slugPart)].join(PART_SEP) + "-" +
     await sha256Hex(frameParts(scoped));
 }
@@ -582,8 +607,35 @@ export async function resourceId(
  * It also takes a control character out of the published source, which the
  * identifier scan and any reader are entitled to be suspicious of.
  */
+/**
+ * Find the checkpoints a name would select ON THE HOST.
+ *
+ * PowerShell's `-Name` is CASE-INSENSITIVE. Comparing with `===` in
+ * JavaScript therefore asked a different question from the one the host would
+ * answer: a VM already holding "Nightly" passed a uniqueness precheck for
+ * "nightly", and the subsequent Checkpoint-VM or Remove-VMSnapshot acted on
+ * whichever one it matched. Ask the question the host will ask.
+ */
+export function matchCheckpoints<T extends { Name: string }>(
+  rows: T[],
+  name: string,
+): T[] {
+  const want = name.toLowerCase();
+  return rows.filter((c) => c.Name.toLowerCase() === want);
+}
+
 export function frameParts(parts: string[]): string {
   return parts.map((p) => `${p.length}:${p}`).join("");
+}
+
+/**
+ * The stable identity of the machine this model was pointed at. Host and port
+ * together, because two Hyper-V endpoints can live behind one address.
+ */
+export function targetKey(
+  g: { host: string; port: number },
+): string {
+  return `${g.host}:${g.port}`;
 }
 
 /** Hex SHA-256 via Web Crypto, so no dependency is added for one hash. */
@@ -747,7 +799,6 @@ export const PsCheckpointRow = z.object({
  * response missing the field must not read as "none, therefore verified".
  */
 export const CheckpointEnvelope = z.object({
-  host: z.string().min(1),
   checkpoints: z.array(PsCheckpointRow),
 });
 
@@ -830,7 +881,7 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
   handles.push(
     await ctx.writeResource(
       "vmHost",
-      await resourceId("vmhost", hostRec.Name),
+      await resourceId(targetKey(g), "vmhost", hostRec.Name),
       {
         name: hostRec.Name,
         logicalProcessorCount: hostRec.LogicalProcessorCount,
@@ -850,7 +901,7 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
     handles.push(
       await ctx.writeResource(
         "vm",
-        await resourceId("vm", hostRec.Name, v.Name),
+        await resourceId(targetKey(g), "vm", v.Name),
         {
           name: v.Name,
           state: v.State,
@@ -869,7 +920,7 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
     handles.push(
       await ctx.writeResource(
         "vmSwitch",
-        await resourceId("vmswitch", hostRec.Name, sw.Name),
+        await resourceId(targetKey(g), "vmswitch", sw.Name),
         {
           name: sw.Name,
           switchType: SWITCH_TYPES[sw.SwitchType] ?? `Type${sw.SwitchType}`,
@@ -930,11 +981,19 @@ $ProgressPreference='SilentlyContinue'
 try {
   $v = Get-VM -Name ${psQuote(vmName)} -ErrorAction Stop
   [pscustomobject]@{ state = $v.State.ToString() } | ConvertTo-Json -Compress
-} catch [Microsoft.HyperV.PowerShell.VirtualizationOperationFailedException] {
-  if ($_.Exception.Message -match 'not find|does not exist') { '{"state":null}' }
-  else { throw }
-} catch [System.Management.Automation.ItemNotFoundException] {
-  '{"state":null}'
+} catch {
+  # ONE condition means absent, and it has to satisfy both halves: the error
+  # must carry Hyper-V's own not-found identifier AND come from Get-VM. The
+  # previous form also caught ItemNotFoundException outright, which any
+  # provider, module or path failure can raise -- and the delete method proves
+  # itself by asking this question, so a broken host would have confirmed a
+  # deletion that never happened. Everything else propagates.
+  $id = $_.FullyQualifiedErrorId
+  $isMissing = ($id -like '*InvalidParameter*') -and ($id -like '*GetVM*')
+  if (-not $isMissing) {
+    $isMissing = ($id -like '*VirtualMachineNotFound*')
+  }
+  if ($isMissing) { '{"state":null}' } else { throw }
 }`.trim();
   const raw = await runPowerShell(g, ps, signal);
   // Strict: `state` must be present, and only an explicit JSON null means
@@ -1008,31 +1067,26 @@ export function psQuote(v: string): string {
  * nothing at all. `$ErrorActionPreference='Stop'` now governs it -- a VM with
  * genuinely no checkpoints still returns empty, because that is not an error
  * in PowerShell, so the two cases are finally distinguishable.
- *
- * The host's own name comes back in the same round trip, because resource IDs
- * are scoped by host and paying a second connection for a string that is
- * already on the wire would be silly.
  */
 async function listCheckpoints(
   g: z.infer<typeof GlobalArgsSchema>,
   vmName: string,
   signal: AbortSignal,
-): Promise<{ hostName: string; rows: z.infer<typeof PsCheckpointRow>[] }> {
+): Promise<z.infer<typeof PsCheckpointRow>[]> {
   const ps = `
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
-$h = (Get-VMHost).Name
 $c = @(Get-VMSnapshot -VMName ${psQuote(vmName)} |
   Select-Object VMName,Name,CreationTime,ParentSnapshotName,
     @{n='CheckpointType';e={$_.SnapshotType.ToString()}})
-[pscustomobject]@{ host=$h; checkpoints=$c } | ConvertTo-Json -Depth 4 -Compress`
+[pscustomobject]@{ checkpoints=$c } | ConvertTo-Json -Depth 4 -Compress`
     .trim();
   const top = parseRow(
     CheckpointEnvelope,
     asArray(await runPowerShell(g, ps, signal))[0],
     "checkpoint envelope",
   );
-  return { hostName: top.host, rows: top.checkpoints };
+  return top.checkpoints;
 }
 
 async function collectCheckpoints(
@@ -1040,13 +1094,13 @@ async function collectCheckpoints(
   vmName: string,
   ctx: Ctx,
 ): Promise<unknown[]> {
-  const { hostName, rows } = await listCheckpoints(g, vmName, ctx.signal);
+  const rows = await listCheckpoints(g, vmName, ctx.signal);
   const handles = [];
   for (const c of rows) {
     handles.push(
       await ctx.writeResource(
         "checkpoint",
-        await resourceId("checkpoint", hostName, c.VMName, c.Name),
+        await resourceId(targetKey(g), "checkpoint", c.VMName, c.Name),
         {
           vmName: c.VMName,
           name: c.Name,
@@ -1128,7 +1182,7 @@ async function checkpoint(
   // about a collision and the caller never learned which restore point they
   // ended up holding.
   const before = await listCheckpoints(g, args.vmName, ctx.signal);
-  if (before.rows.some((c) => c.Name === args.name)) {
+  if (matchCheckpoints(before, args.name).length > 0) {
     throw new Error(
       `${args.vmName} already has a checkpoint named ${args.name}; ` +
         `remove it first or choose another name`,
@@ -1148,7 +1202,7 @@ async function checkpoint(
   // creation that silently did nothing reported success on the strength of
   // someone else's restore point.
   const after = await listCheckpoints(g, args.vmName, ctx.signal);
-  if (!after.rows.some((c) => c.Name === args.name)) {
+  if (matchCheckpoints(after, args.name).length !== 1) {
     throw new Error(`checkpoint ${args.name} did not appear after creation`);
   }
   ctx.logger.info(`${args.vmName}: checkpoint ${args.name} created`);
@@ -1188,10 +1242,19 @@ async function removeCheckpoint(
   // Removing something that was never there is not success, it is a caller
   // working from a stale picture -- and staying quiet about it invites the
   // next call to assume the rest of that picture holds.
+  // Match the way the host will. Refusing an ambiguous target matters more
+  // here than anywhere else: Remove-VMSnapshot would act on whichever one it
+  // picked, and the caller confirmed a name, not a choice.
   const before = await listCheckpoints(g, args.vmName, ctx.signal);
-  if (!before.rows.some((c) => c.Name === args.name)) {
+  const targets = matchCheckpoints(before, args.name);
+  if (targets.length === 0) {
+    throw new Error(`${args.vmName} has no checkpoint named ${args.name}`);
+  }
+  if (targets.length > 1) {
     throw new Error(
-      `${args.vmName} has no checkpoint named ${args.name}`,
+      `${args.vmName} has ${targets.length} checkpoints matching ${args.name} ` +
+        `case-insensitively; PowerShell would pick one and this will not ` +
+        `choose for you`,
     );
   }
 
@@ -1206,7 +1269,7 @@ async function removeCheckpoint(
   // And confirm it actually went. Now that the query fails loudly instead of
   // returning empty, an absence here means absence rather than a broken read.
   const after = await listCheckpoints(g, args.vmName, ctx.signal);
-  if (after.rows.some((c) => c.Name === args.name)) {
+  if (matchCheckpoints(after, args.name).length > 0) {
     throw new Error(
       `checkpoint ${args.name} is still present on ${args.vmName} after removal`,
     );

@@ -27,6 +27,7 @@ import {
   encodeCommand,
   frameParts,
   GlobalArgsSchema,
+  matchCheckpoints,
   MAX_OUTPUT_BYTES,
   num,
   parseRow,
@@ -299,17 +300,22 @@ Deno.test("resource ids cannot collide once names are slugged", async () => {
   // record, each overwriting the last.
   const names = ["web server", "web-server", "web_server", "WEB  SERVER"];
   const ids = await Promise.all(
-    names.map((n) => resourceId("vm", "host-a", n)),
+    names.map((n) => resourceId("hv1:22", "vm", n)),
   );
   assertEquals(new Set(ids).size, names.length);
-  for (const id of ids) assertStringIncludes(id, "vm--host-a--web-server-");
+  for (const id of ids) assertStringIncludes(id, "vm--hv1-22--web-server-");
 });
 
-Deno.test("resource ids are scoped by host", async () => {
-  // Same VM name on two hosts is two machines, not one seen twice.
-  const a = await resourceId("vm", "host-a", "db");
-  const b = await resourceId("vm", "host-b", "db");
+Deno.test("resource ids are scoped by the configured target", async () => {
+  // Same VM name on two targets is two machines, not one seen twice. Scoping
+  // by the name the HOST reports was the first attempt and is unsound: two
+  // machines can answer to one hostname, and then their VMs share IDs.
+  const a = await resourceId("hv-a:22", "vm", "db");
+  const b = await resourceId("hv-b:22", "vm", "db");
   assertEquals(a === b, false);
+  // Same address, different port is still a different endpoint.
+  const c = await resourceId("hv-a:2222", "vm", "db");
+  assertEquals(a === c, false);
 });
 
 Deno.test("the part separator cannot occur inside a part", () => {
@@ -599,4 +605,33 @@ Deno.test("the output cap is a byte limit, not a time limit", () => {
   // A host that never stops talking should hit a byte cap, not a heap
   // limit. The timeout bounds how LONG it runs, not how much it can send.
   assertEquals(MAX_OUTPUT_BYTES, 4 * 1024 * 1024);
+});
+
+Deno.test("checkpoint names match the way PowerShell matches them", () => {
+  // -Name is case-insensitive on the host, so a case-sensitive === here
+  // asked a different question: a VM holding "Nightly" passed a uniqueness
+  // precheck for "nightly", and the cmdlet then acted on whichever it found.
+  const rows = [{ Name: "Nightly" }, { Name: "weekly" }];
+  assertEquals(matchCheckpoints(rows, "nightly").length, 1);
+  assertEquals(matchCheckpoints(rows, "NIGHTLY").length, 1);
+  assertEquals(matchCheckpoints(rows, "missing").length, 0);
+});
+
+Deno.test("an ambiguous checkpoint name is detectable, not guessed", () => {
+  const rows = [{ Name: "Nightly" }, { Name: "nightly" }];
+  // Two matches means the caller confirmed a name, not a choice.
+  assertEquals(matchCheckpoints(rows, "NightLy").length, 2);
+});
+
+Deno.test("invisible characters cannot enter a name", () => {
+  const bads = [
+    "a" + String.fromCharCode(0x85) + "b",
+    "a" + String.fromCharCode(0x2028) + "b",
+    "a" + String.fromCharCode(0x202e) + "b",
+    "a" + String.fromCharCode(0x200b) + "b",
+    "a" + String.fromCharCode(0xfeff) + "b",
+  ];
+  for (const bad of bads) {
+    assertEquals(VmNameArgs.safeParse({ vmName: bad }).success, false);
+  }
 });
