@@ -39,7 +39,7 @@
  * arrives as a .NET type rather than the thing it represents. VM `State` is an
  * enum number (a stopped VM is 3, not "Off"). `SecureBoot` is also an enum
  * number, where 0 means ON -- read as a boolean it reports the security
- * posture backwards. `CreationTime` arrives as `/Date(1787883964960)/`. Each
+ * posture backwards. `CreationTime` arrives as `/Date(1234567890000)/`. Each
  * parses cleanly into something wrong, which is the dangerous kind, so all
  * three are resolved PowerShell-side rather than decoded here from a table
  * that drifts as Microsoft adds values.
@@ -746,9 +746,21 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
 export function dotNetDate(v: unknown): string | null {
   if (typeof v !== "string") return null;
   const m = /^\/Date\((-?\d+)\)\/$/.exec(v);
-  if (!m) return v;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? new Date(n).toISOString() : null;
+  if (m) {
+    const n = Number(m[1]);
+    if (!Number.isFinite(n)) return null;
+    const d = new Date(n);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  // Already ISO-8601? Accept it. Anything else is not a timestamp, and the
+  // old `return v` passed it straight through to a field documented as
+  // ISO-8601 -- so a cmdlet returning "Unknown" was stored as if it were a
+  // date, and every consumer downstream inherited that lie.
+  const d = new Date(v);
+  if (!Number.isNaN(d.getTime()) && /^\d{4}-\d{2}-\d{2}/.test(v)) {
+    return d.toISOString();
+  }
+  return null;
 }
 
 /** Read one VM's state by name, or null when it does not exist. */
@@ -757,12 +769,26 @@ async function vmState(
   vmName: string,
   signal: AbortSignal,
 ): Promise<string | null> {
+  // Handle ONLY the not-found case; let everything else fail.
+  //
+  // This ran under $ErrorActionPreference='SilentlyContinue', which turned
+  // every Get-VM failure -- no permission, provider not loaded, WMI broken --
+  // into `state: null`, i.e. "that VM does not exist". `delete` verifies
+  // itself by asking this exact question, so a host that had stopped
+  // answering would have confirmed a deletion that never happened. Now the
+  // specific "not found" exception answers null and any other error
+  // propagates.
   const ps = `
-$ErrorActionPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
-$v = Get-VM -Name ${psQuote(vmName)}
-if ($null -eq $v) { '{"state":null}' } else {
+try {
+  $v = Get-VM -Name ${psQuote(vmName)} -ErrorAction Stop
   [pscustomobject]@{ state = $v.State.ToString() } | ConvertTo-Json -Compress
+} catch [Microsoft.HyperV.PowerShell.VirtualizationOperationFailedException] {
+  if ($_.Exception.Message -match 'not find|does not exist') { '{"state":null}' }
+  else { throw }
+} catch [System.Management.Automation.ItemNotFoundException] {
+  '{"state":null}'
 }`.trim();
   const raw = await runPowerShell(g, ps, signal);
   // Strict: `state` must be present, and only an explicit JSON null means
@@ -1128,6 +1154,32 @@ ${
   return [];
 }
 
+/**
+ * WHY CALLER-SUPPLIED NAMES STAY IN ERRORS AND LOGS -- a deliberate decision,
+ * recorded here so it is reviewable rather than assumed.
+ *
+ * Messages like `no VM named web01` name infrastructure, and this model is
+ * emphatic elsewhere about not doing that. The distinction is where the string
+ * came from. Remote OUTPUT is screened hard: stderr is classified to a fixed
+ * verdict, malformed stdout is reported as a byte count, and parse failures
+ * name the field rather than the value -- because none of that was chosen by
+ * the caller and all of it can carry things nobody asked for.
+ *
+ * A `vmName` is different. The caller typed it. It is already in the workflow
+ * definition that invoked the method, and -- per the retention trade-off the
+ * README states plainly -- it is already stored as a resource field, as a tag,
+ * and in readable form inside the resource ID itself. Redacting it from the
+ * error while writing it to the record beside that error protects nothing; it
+ * only makes a destructive method impossible to diagnose. "delete refused"
+ * without saying which machine is worse than useless when a workflow passes
+ * the wrong input, which is precisely the failure the confirmation guards
+ * exist to catch.
+ *
+ * The honest description is that this model treats caller-supplied names as
+ * the operator's own data, and remote output as untrusted. Anyone unwilling to
+ * accept the first half should not accept the resource records either, and
+ * that is the operator-decision the README already asks them to make.
+ */
 /**
  * The model: read-only collection, plus lifecycle methods that mutate and are
  * guarded. Resource lifetimes are `infinite` with garbage collection rather

@@ -53,9 +53,11 @@ security: |
   no guest filesystem data.
 
   **What the identifiers themselves reveal.** Resource IDs are not opaque. Each
-  is built as `<kind>--<host>--<name>[--<name>]-<sha256>`, where the readable
+  is built as `<kind>--<host>[--<name>[--<name>]]-<sha256>`, where the readable
   parts are lowercase-slugged versions of the host name, and of the VM, switch
-  or checkpoint name. The digest exists to prevent collisions, not to conceal:
+  or checkpoint name. The host record is the one case with no name component
+  of its own — it is `vmhost--<host>-<sha256>`, because the host *is* the
+  subject rather than something on it. The digest exists to prevent collisions, not to conceal:
   anyone who can list resource IDs can read your host and VM names out of them.
   Checkpoint resources additionally carry a `vm` tag holding the VM name, and
   VM resources carry a `state` tag. This is deliberate — IDs that cannot be
@@ -88,6 +90,18 @@ security: |
 
   The point of both guards is a `vmName` arriving from a workflow input: it
   should fail rather than succeed against the wrong machine.
+
+  **Caller-supplied names appear in errors and logs; remote output does not.**
+  A message like `no VM named web01` names infrastructure deliberately. The
+  distinction is provenance: remote output is screened hard — stderr is
+  reduced to a fixed verdict, malformed stdout is reported as a byte count,
+  and parse failures name the field rather than the value — because none of it
+  was chosen by you. A VM name you passed in is already in your workflow
+  definition, already a resource field, already a tag, and already readable
+  inside the resource ID. Redacting it from an error while writing it to the
+  record beside that error protects nothing and makes a destructive method
+  undiagnosable. If that trade is wrong for your environment, the resource
+  records are the thing to reconsider, not the error text.
 
   **Names must identify one object.** PowerShell's `-Name` parameters accept
   wildcards, so `*` is a well-formed argument that means *every* machine.

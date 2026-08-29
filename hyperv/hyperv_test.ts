@@ -139,10 +139,15 @@ Deno.test("dotNetDate decodes /Date(ms)/ to ISO", () => {
   );
 });
 
-Deno.test("dotNetDate passes through a string that is already a date", () => {
-  // Not every field arrives wrapped; passing through is deliberate.
-  assertEquals(dotNetDate("2026-08-29T00:00:00Z"), "2026-08-29T00:00:00Z");
-  assertEquals(dotNetDate("not a date"), "not a date");
+Deno.test("dotNetDate normalises ISO input and rejects everything else", () => {
+  // An already-ISO value is accepted and normalised.
+  assertEquals(dotNetDate("2026-08-29T00:00:00Z"), "2026-08-29T00:00:00.000Z");
+  // It used to `return v` for anything unrecognised, so a cmdlet answering
+  // "Unknown" was stored in a field documented as ISO-8601 and every consumer
+  // downstream inherited that as a date. Not a timestamp is now null.
+  assertEquals(dotNetDate("not a date"), null);
+  assertEquals(dotNetDate("Unknown"), null);
+  assertEquals(dotNetDate(""), null);
 });
 
 Deno.test("dotNetDate returns null for non-strings", () => {
