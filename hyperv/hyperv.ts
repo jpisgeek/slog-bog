@@ -1175,6 +1175,27 @@ export function psQuote(v: string): string {
 }
 
 /**
+ * PowerShell that resolves a VM name to exactly one machine, or refuses.
+ *
+ * Hyper-V matches names case-insensitively, so a host can legitimately hold
+ * two VMs whose names differ only in case and a confirmed NAME is not a
+ * confirmed TARGET. `delete` learned this first and the other verbs did not,
+ * which left start, stop and the checkpoint methods acting on whichever match
+ * the host picked. Every mutating verb now begins with this, and every one of
+ * them then acts on `$vm` -- the resolved object -- rather than passing the
+ * name a second time and inviting the host to resolve it again, differently.
+ */
+function resolveOneVm(vmName: string): string {
+  return `$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+$hits = @(Get-VM -Name ${psQuote(vmName)} -ErrorAction SilentlyContinue)
+if ($hits.Count -ne 1) {
+  throw "expected exactly one VM matching the given name, found $($hits.Count)"
+}
+$vm = $hits[0]`;
+}
+
+/**
  * Read a VM's checkpoints, and let a failed read fail.
  *
  * This query previously carried `-ErrorAction SilentlyContinue`, which made
@@ -1243,9 +1264,8 @@ async function start(args: z.infer<typeof VmNameArgs>, ctx: Ctx) {
   }
   await runPowerShell(
     g,
-    `$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';Start-VM -Name ${
-      psQuote(args.vmName)
-    }`,
+    `${resolveOneVm(args.vmName)}
+Start-VM -VM $vm`,
     ctx.signal,
   );
   const after = await vmState(g, args.vmName, ctx.signal);
@@ -1276,9 +1296,8 @@ async function stop(args: z.infer<typeof StopArgsSchema>, ctx: Ctx) {
   }
   await runPowerShell(
     g,
-    `$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';Stop-VM -Name ${
-      psQuote(args.vmName)
-    }${args.force ? " -TurnOff -Force" : " -Force"}`,
+    `${resolveOneVm(args.vmName)}
+Stop-VM -VM $vm${args.force ? " -TurnOff -Force" : " -Force"}`,
     ctx.signal,
   );
   const after = await vmState(g, args.vmName, ctx.signal);
@@ -1313,8 +1332,7 @@ async function checkpoint(
 
   await runPowerShell(
     g,
-    `$ErrorActionPreference='Stop'
-$ProgressPreference='SilentlyContinue'
+    `${resolveOneVm(args.vmName)}
 # Refuse a duplicate in the same call that creates, not one round trip earlier.
 $existing = @(Get-VMSnapshot -VMName ${psQuote(args.vmName)} -Name ${
       psQuote(args.name)
@@ -1371,8 +1389,7 @@ async function restoreCheckpoint(
   }
   await runPowerShell(
     g,
-    `$ErrorActionPreference='Stop'
-$ProgressPreference='SilentlyContinue'
+    `${resolveOneVm(args.vmName)}
 # Uniqueness is settled HERE, in the call that mutates. Deciding it in an
 # earlier round trip left a window in which a second case-variant checkpoint
 # could appear, and Restore-VMSnapshot would then roll back to whichever it
@@ -1421,8 +1438,7 @@ async function removeCheckpoint(
 
   await runPowerShell(
     g,
-    `$ErrorActionPreference='Stop'
-$ProgressPreference='SilentlyContinue'
+    `${resolveOneVm(args.vmName)}
 # Same reason as restore: the check and the deletion have to be one operation.
 $snaps = @(Get-VMSnapshot -VMName ${psQuote(args.vmName)} -Name ${
       psQuote(args.name)
@@ -1470,18 +1486,8 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
   // SilentlyContinue while the method logged "disks removed" and threw the
   // result object away, so a disk that could not be deleted -- locked, in use,
   // on a disconnected volume -- was indistinguishable from one that was.
-  const ps = `
-$ErrorActionPreference='Stop'
-$ProgressPreference='SilentlyContinue'
-$name = ${psQuote(args.vmName)}
-# Exactly one, or nothing happens. Get-VM -Name matches case-insensitively and
-# a host can legitimately hold two VMs whose names differ only in case, so a
-# confirmed name is not by itself a confirmed target -- and every verb below
-# is destructive.
-$matches = @(Get-VM -Name $name -ErrorAction SilentlyContinue)
-if ($matches.Count -ne 1) {
-  throw "expected exactly one VM matching the given name, found $($matches.Count)"
-}
+  const ps = `${resolveOneVm(args.vmName)}
+$name = $vm.Name
 $allowForce = ${args.confirmForcePowerOff ? "$true" : "$false"}
 $disks = @(Get-VMHardDiskDrive -VMName $name | Select-Object -ExpandProperty Path)
 # A VHDX can be attached to more than one VM -- shared disks, differencing
@@ -1524,7 +1530,7 @@ function Normalise-Path([string]$p) {
 }
 $othersDisks = Get-OtherDiskSet
 $shared = @($disks | Where-Object { $othersDisks.Contains((Normalise-Path $_)) })
-$state = (Get-VM -Name $name).State.ToString()
+$state = $vm.State.ToString()
 # The acknowledgement is enforced HERE, not only before the call. Checking
 # state in one SSH round trip and powering off in a later one leaves a window
 # where a VM starts in between -- and the old script then cut its power
@@ -1534,7 +1540,7 @@ if ($state -ne 'Off') {
   if (-not $allowForce) {
     throw "refusing to delete a VM that is $state without confirmForcePowerOff"
   }
-  Stop-VM -Name $name -TurnOff -Force
+  Stop-VM -VM $vm -TurnOff -Force
 }
 # Order matters: once Remove-VM has run, the attachment information this
 # check depends on no longer exists, so a shared disk would be undetectable

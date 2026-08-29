@@ -924,3 +924,26 @@ Deno.test("Hyper-V has two generations and no others", () => {
   assertEquals(PsVmRow.safeParse({ ...vm, Generation: 7 }).success, false);
   assertEquals(PsVmRow.safeParse({ ...vm, ProcessorCount: 0 }).success, false);
 });
+
+Deno.test("every mutating verb resolves exactly one VM first", async () => {
+  // delete learned this and the others did not, so start, stop and the
+  // checkpoint verbs acted on whichever match the host picked. Assert the
+  // property over the source: any cmdlet that mutates must be handed the
+  // resolved object, never a name for the host to resolve a second time.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  for (
+    const bad of [
+      "Start-VM -Name",
+      "Stop-VM -Name ${",
+      "Restore-VMSnapshot -VMName",
+      "Remove-VMSnapshot -VMName",
+    ]
+  ) {
+    assertEquals(src.includes(bad), false);
+  }
+  // And the guard itself appears once per mutating verb plus its definition.
+  const uses = src.split("resolveOneVm(").length - 1;
+  assertEquals(uses >= 6, true);
+});
