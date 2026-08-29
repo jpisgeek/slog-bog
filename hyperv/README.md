@@ -2,9 +2,11 @@
 
 # @jpisgeek/hyperv
 
-A Hyper-V host, read over SSH and acted on deliberately. Collection is read-only
-and covers the host's capacity, one record per virtual machine, per checkpoint,
-and per virtual switch. Lifecycle methods mutate, and each destructive one makes
+A Hyper-V host, read over SSH and acted on deliberately. `discover` is read-only
+and covers the host's capacity, one record per virtual machine, and one per
+virtual switch. Checkpoints are recorded by the checkpoint methods rather than
+by `discover`, so a checkpoint record reflects a deliberate act on that VM and
+not a periodic sweep. Lifecycle methods mutate, and each destructive one makes
 the caller name what it is about to destroy. There is no REST or JSON-RPC
 surface for Hyper-V, so PowerShell is the API and SSH is how it is reached.
 
@@ -62,10 +64,10 @@ warns when used.
 Take a checkpoint. Verifies the checkpoint actually appeared afterwards -- a
 zero exit is not proof it exists.
 
-| argument | type   | required | default | description                              |
-| -------- | ------ | -------- | ------- | ---------------------------------------- |
-| `vmName` | string | yes      |         |                                          |
-| `name`   | string | yes      |         | Checkpoint name. Must not already exist. |
+| argument | type   | required | default | description                                                                                                                                                                                                                                    |
+| -------- | ------ | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vmName` | string | yes      |         |                                                                                                                                                                                                                                                |
+| `name`   | string | yes      |         | Checkpoint name to create. Must not already exist on this VM: the method refuses a duplicate rather than letting Hyper-V decide what to do about the collision, because the caller would not then know which restore point they ended up with. |
 
 #### `restoreCheckpoint`
 
@@ -84,10 +86,10 @@ checkpoint name.
 Delete a checkpoint, merging its differencing disk. Does not change the running
 state of the VM.
 
-| argument | type   | required | default | description                              |
-| -------- | ------ | -------- | ------- | ---------------------------------------- |
-| `vmName` | string | yes      |         |                                          |
-| `name`   | string | yes      |         | Checkpoint name. Must not already exist. |
+| argument | type   | required | default | description                                                                                     |
+| -------- | ------ | -------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `vmName` | string | yes      |         |                                                                                                 |
+| `name`   | string | yes      |         | Checkpoint to remove. Must already exist on this VM; it is the checkpoint that will be deleted. |
 
 #### `delete`
 
@@ -95,11 +97,12 @@ Delete a VM. DESTRUCTIVE: confirmName must exactly equal vmName. Disks are LEFT
 IN PLACE unless deleteDisks is set, matching Hyper-V's own default rather than
 being harsher than it.
 
-| argument      | type    | required | default | description                                                                                                                                                               |
-| ------------- | ------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vmName`      | string  | yes      |         |                                                                                                                                                                           |
-| `confirmName` | string  | yes      |         | Must exactly equal vmName. Deleting removes the machine and its checkpoints; a vmName arriving from a workflow input is not something to take on trust.                   |
-| `deleteDisks` | boolean | no       | `false` | Also delete the VHDX files. Off by default: Hyper-V's own Remove-VM leaves disks behind, and silently destroying them would be a harsher default than the platform's own. |
+| argument               | type    | required | default | description                                                                                                                                                                                                                                                                                                                |
+| ---------------------- | ------- | -------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vmName`               | string  | yes      |         |                                                                                                                                                                                                                                                                                                                            |
+| `confirmName`          | string  | yes      |         | Must exactly equal vmName. Deleting removes the machine and its checkpoints; a vmName arriving from a workflow input is not something to take on trust.                                                                                                                                                                    |
+| `confirmForcePowerOff` | boolean | no       | `false` | Required when the VM is RUNNING. Deleting a running machine cuts its power -- there is no graceful shutdown in this path and the guest filesystem takes the same risk as pulling the plug. Deletion of a running VM is refused unless this is set, so the power-off is a decision rather than a side effect of the delete. |
+| `deleteDisks`          | boolean | no       | `false` | Also delete the VHDX files. Off by default: Hyper-V's own Remove-VM leaves disks behind, and silently destroying them would be a harsher default than the platform's own.                                                                                                                                                  |
 
 ### Data written
 
@@ -115,8 +118,8 @@ being harsher than it.
 ```yaml
 globalArguments:
   # Source both from a vault so no machine identity lands in a tracked file.
-  host: ${{ vault.get(lab, hypervisor-address) }}
-  user: ${{ vault.get(lab, hypervisor-user) }}
+  host: ${{ vault.get(<your-vault>, <your-host-address-item>) }}
+  user: ${{ vault.get(<your-vault>, <your-host-user-item>) }}
   port: 22
   timeoutSec: 30
 ```
@@ -169,6 +172,15 @@ both require an explicit acknowledgement that repeats the target's name:
 - `restoreCheckpoint` discards every change made since the checkpoint was taken.
   That loss is silent — Hyper-V does not warn and there is no undo — so
   `confirmDiscardSince` must repeat the checkpoint name.
+- Deleting a **running** VM cuts its power: this path has no graceful shutdown,
+  and the guest filesystem takes the same risk as pulling the plug. It is
+  refused unless `confirmForcePowerOff` is set, so the power cut is a decision
+  rather than a side effect of the delete.
+
+When `deleteDisks` is used, each file is removed and then verified absent, and
+any disk that survives fails the method. Failures are reported by position,
+never by path — a disk path names a volume layout and usually the VM, and these
+messages reach logs and stored resources.
 
 The point of both guards is a `vmName` arriving from a workflow input: it should
 fail rather than succeed against the wrong machine.

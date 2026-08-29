@@ -195,6 +195,13 @@ export const DeleteArgsSchema = z.object({
       "checkpoints; a vmName arriving from a workflow input is not something " +
       "to take on trust.",
   ),
+  confirmForcePowerOff: z.boolean().default(false).describe(
+    "Required when the VM is RUNNING. Deleting a running machine cuts its " +
+      "power -- there is no graceful shutdown in this path and the guest " +
+      "filesystem takes the same risk as pulling the plug. Deletion of a " +
+      "running VM is refused unless this is set, so the power-off is a " +
+      "decision rather than a side effect of the delete.",
+  ),
   deleteDisks: z.boolean().default(false).describe(
     "Also delete the VHDX files. Off by default: Hyper-V's own Remove-VM " +
       "leaves disks behind, and silently destroying them would be a harsher " +
@@ -397,6 +404,132 @@ export function asArray(raw: string): Record<string, unknown>[] {
 }
 
 /**
+ * Collapse an untrusted remote name into something safe to put in a resource
+ * ID, and say how much was lost.
+ *
+ * VM, checkpoint, and switch names come from the host and are chosen by
+ * whoever runs it. They can hold spaces, slashes, unicode, or nothing at all.
+ * A raw name in an ID is two problems: characters a datastore may not accept,
+ * and -- worse -- ambiguity, because `a-b` and `a` + `b` collapse to the same
+ * string once you join with a dash.
+ */
+export function slugPart(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "unnamed";
+}
+
+/**
+ * The separator between ID parts. Two dashes is unambiguous because
+ * `slugPart` collapses every run of non-alphanumerics to a SINGLE dash, so a
+ * doubled dash cannot occur inside a part and can only ever be the join.
+ */
+export const PART_SEP = "--";
+
+/**
+ * Build a resource ID that is scoped, collision-free, and readable.
+ *
+ * Three properties, each load-bearing. It is SCOPED by host, so the same VM
+ * name on two Hyper-V hosts does not overwrite one record with the other --
+ * the previous form omitted the host entirely. It is COLLISION-FREE because
+ * the trailing digest is taken over the original parts with a delimiter that
+ * cannot appear in them, so two different names cannot produce one ID even
+ * after slugging flattens them. And it stays READABLE, because the slugs are
+ * kept in front of the digest.
+ */
+export async function resourceId(
+  kind: string,
+  host: string,
+  ...parts: string[]
+): Promise<string> {
+  const scoped = [host, ...parts];
+  const digest = await sha256Hex(scoped.join("\u0000"));
+  return [kind, ...scoped.map(slugPart)].join(PART_SEP) + "-" + digest;
+}
+
+/** Hex SHA-256 via Web Crypto, so no dependency is added for one hash. */
+export async function sha256Hex(input: string): Promise<string> {
+  const buf = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(input),
+  );
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * The shapes PowerShell is expected to return, declared rather than assumed.
+ *
+ * These were previously read by casting -- `String(row.Name ?? "")`,
+ * `num(row.MemoryCapacity) ?? 0` -- which cannot fail. A cmdlet that returned
+ * nothing for a field produced an empty string or a zero, and a partially
+ * collected host was then written down as a complete one. A host with 0 GB of
+ * memory and a VM with an empty name are not plausible readings of reality;
+ * they are the shape of a silent collection failure, and the schemas make
+ * that failure loud.
+ *
+ * Unknown keys are tolerated -- Windows adds properties between builds and
+ * that is not this model's business -- but every field it actually reads must
+ * be present and of the right type.
+ */
+export const PsVmHostRow = z.object({
+  Name: z.string().min(1),
+  LogicalProcessorCount: z.number().int().nonnegative(),
+  MemoryCapacity: z.number().nonnegative(),
+  VirtualMachinePath: z.string().min(1),
+});
+
+export const PsVmRow = z.object({
+  Name: z.string().min(1),
+  State: z.string().min(1),
+  Status: z.string(),
+  Generation: z.number().int(),
+  ProcessorCount: z.number().int().nonnegative(),
+  MemoryAssigned: z.number().nonnegative(),
+  // A .NET TimeSpan, serialised as an OBJECT carrying TotalSeconds -- not a
+  // number and not a string. Typed loosely here and narrowed at the read.
+  Uptime: z.unknown().optional(),
+});
+
+export const PsSwitchRow = z.object({
+  Name: z.string().min(1),
+  // The raw enum number. Kept numeric on purpose: SWITCH_TYPES maps it, and a
+  // test asserts that map covers the enum rather than spot-checking it.
+  SwitchType: z.number().int(),
+});
+
+export const PsCheckpointRow = z.object({
+  VMName: z.string().min(1),
+  Name: z.string().min(1),
+  CheckpointType: z.string(),
+  CreationTime: z.unknown(),
+  ParentSnapshotName: z.string().nullable().optional(),
+});
+
+/**
+ * Parse one PowerShell row, and fail with the field path rather than the
+ * value. A zod message would otherwise quote the offending input straight
+ * into an error that gets written to a resource and a log.
+ */
+export function parseRow<T>(
+  schema: z.ZodType<T>,
+  row: unknown,
+  what: string,
+): T {
+  const r = schema.safeParse(row);
+  if (r.success) return r.data;
+  const where = r.error.issues
+    .map((i) => `${i.path.join(".") || "<root>"}: ${i.code}`)
+    .join("; ");
+  throw new Error(
+    `${what} from the host did not match the expected shape (${where})`,
+  );
+}
+
+/**
  * Virtual switch types, keyed by the number `Get-VMSwitch` actually returns.
  * Exported so the tests can assert the map covers the enum rather than
  * checking a couple of values by hand and missing one when Microsoft adds it.
@@ -441,53 +574,68 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
   const top = asArray(raw)[0];
   if (!top) throw new Error("PowerShell returned no host record");
 
-  const hostRec = (top.host ?? {}) as Record<string, unknown>;
-  const vms = asArray(JSON.stringify(top.vms ?? []));
-  const switches = asArray(JSON.stringify(top.switches ?? []));
+  // Parsed, not cast. A field the host failed to return is an error here
+  // rather than an empty string or a zero written down as fact.
+  const hostRec = parseRow(PsVmHostRow, top.host ?? {}, "host record");
+  const vms = asArray(JSON.stringify(top.vms ?? []))
+    .map((r) => parseRow(PsVmRow, r, "VM record"));
+  const switches = asArray(JSON.stringify(top.switches ?? []))
+    .map((r) => parseRow(PsSwitchRow, r, "switch record"));
 
   handles.push(
-    await ctx.writeResource("vmHost", `vmhost-${String(hostRec.Name)}`, {
-      name: String(hostRec.Name ?? ""),
-      logicalProcessorCount: num(hostRec.LogicalProcessorCount) ?? 0,
-      memoryCapacityBytes: num(hostRec.MemoryCapacity) ?? 0,
-      virtualMachinePath: String(hostRec.VirtualMachinePath ?? ""),
-      vmCount: vms.length,
-      switchCount: switches.length,
-    }, { tags: { vmCount: String(vms.length) } }),
+    await ctx.writeResource(
+      "vmHost",
+      await resourceId("vmhost", hostRec.Name),
+      {
+        name: hostRec.Name,
+        logicalProcessorCount: hostRec.LogicalProcessorCount,
+        memoryCapacityBytes: hostRec.MemoryCapacity,
+        virtualMachinePath: hostRec.VirtualMachinePath,
+        vmCount: vms.length,
+        switchCount: switches.length,
+      },
+      { tags: { vmCount: String(vms.length) } },
+    ),
   );
 
   for (const v of vms) {
-    const name = String(v.Name ?? "");
     // Uptime arrives as a .NET TimeSpan, serialised as an object with
     // TotalSeconds -- not a number, and not a string.
-    const up = v.Uptime as Record<string, unknown> | null;
+    const up = v.Uptime as Record<string, unknown> | null | undefined;
     handles.push(
-      await ctx.writeResource("vm", `vm-${name}`, {
-        name,
-        state: String(v.State ?? ""),
-        status: String(v.Status ?? ""),
-        generation: num(v.Generation),
-        cpuCount: num(v.ProcessorCount),
-        memoryAssignedBytes: num(v.MemoryAssigned),
-        uptimeSeconds: up ? num(up.TotalSeconds) : null,
-      }, { tags: { state: String(v.State ?? "") } }),
+      await ctx.writeResource(
+        "vm",
+        await resourceId("vm", hostRec.Name, v.Name),
+        {
+          name: v.Name,
+          state: v.State,
+          status: v.Status,
+          generation: v.Generation,
+          cpuCount: v.ProcessorCount,
+          memoryAssignedBytes: v.MemoryAssigned,
+          uptimeSeconds: up ? num(up.TotalSeconds) : null,
+        },
+        { tags: { state: v.State } },
+      ),
     );
   }
 
-  for (const s of switches) {
-    const name = String(s.Name ?? "");
-    const t = num(s.SwitchType);
+  for (const sw of switches) {
     handles.push(
-      await ctx.writeResource("vmSwitch", `vmswitch-${name}`, {
-        name,
-        switchType: t === null ? "Unknown" : (SWITCH_TYPES[t] ?? `Type${t}`),
-      }),
+      await ctx.writeResource(
+        "vmSwitch",
+        await resourceId("vmswitch", hostRec.Name, sw.Name),
+        {
+          name: sw.Name,
+          switchType: SWITCH_TYPES[sw.SwitchType] ?? `Type${sw.SwitchType}`,
+        },
+      ),
     );
   }
 
   ctx.logger.info(
     `hyper-v: ${vms.length} VM(s), ${switches.length} switch(es) on ` +
-      String(hostRec.Name),
+      hostRec.Name,
   );
   return handles;
 }
@@ -571,30 +719,65 @@ export function psQuote(v: string): string {
   return "'" + v.replace(/'/g, "''") + "'";
 }
 
+/**
+ * Read a VM's checkpoints, and let a failed read fail.
+ *
+ * This query previously carried `-ErrorAction SilentlyContinue`, which made
+ * "the query broke" and "this VM has no checkpoints" the same answer: an
+ * empty array. That is not a cosmetic difference. `restoreCheckpoint` and
+ * `removeCheckpoint` both return this list as their proof of what happened,
+ * so a suppressed failure let a mutation report success while having verified
+ * nothing at all. `$ErrorActionPreference='Stop'` now governs it -- a VM with
+ * genuinely no checkpoints still returns empty, because that is not an error
+ * in PowerShell, so the two cases are finally distinguishable.
+ *
+ * The host's own name comes back in the same round trip, because resource IDs
+ * are scoped by host and paying a second connection for a string that is
+ * already on the wire would be silly.
+ */
+async function listCheckpoints(
+  g: z.infer<typeof GlobalArgsSchema>,
+  vmName: string,
+  signal: AbortSignal,
+): Promise<{ hostName: string; rows: z.infer<typeof PsCheckpointRow>[] }> {
+  const ps = `
+$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+$h = (Get-VMHost).Name
+$c = @(Get-VMSnapshot -VMName ${psQuote(vmName)} |
+  Select-Object VMName,Name,CreationTime,ParentSnapshotName,
+    @{n='CheckpointType';e={$_.SnapshotType.ToString()}})
+[pscustomobject]@{ host=$h; checkpoints=$c } | ConvertTo-Json -Depth 4 -Compress`
+    .trim();
+  const top = asArray(await runPowerShell(g, ps, signal))[0];
+  if (!top) throw new Error("PowerShell returned no checkpoint envelope");
+  const hostName = z.string().min(1).parse(top.host);
+  const rows = asArray(JSON.stringify(top.checkpoints ?? []))
+    .map((r) => parseRow(PsCheckpointRow, r, "checkpoint record"));
+  return { hostName, rows };
+}
+
 async function collectCheckpoints(
   g: z.infer<typeof GlobalArgsSchema>,
   vmName: string,
   ctx: Ctx,
 ): Promise<unknown[]> {
-  const ps = `
-$ErrorActionPreference='Stop'
-$ProgressPreference='SilentlyContinue'
-@(Get-VMSnapshot -VMName ${psQuote(vmName)} -ErrorAction SilentlyContinue |
-  Select-Object VMName,Name,CreationTime,ParentSnapshotName,
-    @{n='CheckpointType';e={$_.SnapshotType.ToString()}}) |
-  ConvertTo-Json -Depth 4 -Compress`.trim();
-  const rows = asArray(await runPowerShell(g, ps, ctx.signal));
+  const { hostName, rows } = await listCheckpoints(g, vmName, ctx.signal);
   const handles = [];
   for (const c of rows) {
-    const name = String(c.Name ?? "");
     handles.push(
-      await ctx.writeResource("checkpoint", `checkpoint-${vmName}-${name}`, {
-        vmName,
-        name,
-        checkpointType: String(c.CheckpointType ?? ""),
-        createdAt: dotNetDate(c.CreationTime),
-        parentName: c.ParentSnapshotName ? String(c.ParentSnapshotName) : null,
-      }, { tags: { vm: vmName } }),
+      await ctx.writeResource(
+        "checkpoint",
+        await resourceId("checkpoint", hostName, c.VMName, c.Name),
+        {
+          vmName: c.VMName,
+          name: c.Name,
+          checkpointType: c.CheckpointType,
+          createdAt: dotNetDate(c.CreationTime),
+          parentName: c.ParentSnapshotName ?? null,
+        },
+        { tags: { vm: c.VMName } },
+      ),
     );
   }
   return handles;
@@ -658,6 +841,18 @@ async function checkpoint(
   if ((await vmState(g, args.vmName, ctx.signal)) === null) {
     throw new Error(`no VM named ${args.vmName}`);
   }
+  // Refuse a duplicate BEFORE mutating. The uniqueness rule used to live only
+  // in the argument's description, which meant Hyper-V decided what to do
+  // about a collision and the caller never learned which restore point they
+  // ended up holding.
+  const before = await listCheckpoints(g, args.vmName, ctx.signal);
+  if (before.rows.some((c) => c.Name === args.name)) {
+    throw new Error(
+      `${args.vmName} already has a checkpoint named ${args.name}; ` +
+        `remove it first or choose another name`,
+    );
+  }
+
   await runPowerShell(
     g,
     `$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';Checkpoint-VM -Name ${
@@ -665,15 +860,17 @@ async function checkpoint(
     } -SnapshotName ${psQuote(args.name)}`,
     ctx.signal,
   );
-  const handles = await collectCheckpoints(g, args.vmName, ctx);
-  // Read back: a checkpoint that did not appear is a failure even if the
-  // cmdlet exited zero.
-  const made = handles.length > 0;
-  if (!made) {
+
+  // Read back, and look for THIS checkpoint. The old check was
+  // `handles.length > 0`, which any pre-existing checkpoint satisfied -- so a
+  // creation that silently did nothing reported success on the strength of
+  // someone else's restore point.
+  const after = await listCheckpoints(g, args.vmName, ctx.signal);
+  if (!after.rows.some((c) => c.Name === args.name)) {
     throw new Error(`checkpoint ${args.name} did not appear after creation`);
   }
   ctx.logger.info(`${args.vmName}: checkpoint ${args.name} created`);
-  return handles;
+  return await collectCheckpoints(g, args.vmName, ctx);
 }
 
 async function restoreCheckpoint(
@@ -701,10 +898,21 @@ async function restoreCheckpoint(
 }
 
 async function removeCheckpoint(
-  args: z.infer<typeof CheckpointArgsSchema>,
+  args: z.infer<typeof RemoveCheckpointArgsSchema>,
   ctx: Ctx,
 ) {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
+
+  // Removing something that was never there is not success, it is a caller
+  // working from a stale picture -- and staying quiet about it invites the
+  // next call to assume the rest of that picture holds.
+  const before = await listCheckpoints(g, args.vmName, ctx.signal);
+  if (!before.rows.some((c) => c.Name === args.name)) {
+    throw new Error(
+      `${args.vmName} has no checkpoint named ${args.name}`,
+    );
+  }
+
   await runPowerShell(
     g,
     `$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';Remove-VMSnapshot -VMName ${
@@ -712,6 +920,15 @@ async function removeCheckpoint(
     } -Name ${psQuote(args.name)}`,
     ctx.signal,
   );
+
+  // And confirm it actually went. Now that the query fails loudly instead of
+  // returning empty, an absence here means absence rather than a broken read.
+  const after = await listCheckpoints(g, args.vmName, ctx.signal);
+  if (after.rows.some((c) => c.Name === args.name)) {
+    throw new Error(
+      `checkpoint ${args.name} is still present on ${args.vmName} after removal`,
+    );
+  }
   ctx.logger.info(`${args.vmName}: checkpoint ${args.name} removed`);
   return await collectCheckpoints(g, args.vmName, ctx);
 }
@@ -722,6 +939,22 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
   const before = await vmState(g, args.vmName, ctx.signal);
   if (before === null) throw new Error(`no VM named ${args.vmName}`);
 
+  // Cutting power is its own decision. This path has no graceful shutdown --
+  // Stop-VM -TurnOff is the plug, not a request to the guest -- so a caller
+  // who only meant "remove this idle VM" should not silently get a hard power
+  // cut on a machine that turned out to be running.
+  if (before !== "Off" && !args.confirmForcePowerOff) {
+    throw new Error(
+      `${args.vmName} is ${before}. Deleting it cuts power with no graceful ` +
+        `shutdown, risking the guest filesystem. Stop it first, or pass ` +
+        `confirmForcePowerOff to accept that.`,
+    );
+  }
+
+  // Disk removal reports per file. It used to run with -ErrorAction
+  // SilentlyContinue while the method logged "disks removed" and threw the
+  // result object away, so a disk that could not be deleted -- locked, in use,
+  // on a disconnected volume -- was indistinguishable from one that was.
   const ps = `
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
@@ -729,16 +962,21 @@ $name = ${psQuote(args.vmName)}
 $disks = @(Get-VMHardDiskDrive -VMName $name | Select-Object -ExpandProperty Path)
 if ((Get-VM -Name $name).State -ne 'Off') { Stop-VM -Name $name -TurnOff -Force }
 Remove-VM -Name $name -Force
+$results = @()
 ${
     args.deleteDisks
-      ? "foreach ($d in $disks) { Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue }"
+      ? `foreach ($d in $disks) {
+  $ok = $false
+  try { Remove-Item -LiteralPath $d -Force -ErrorAction Stop; $ok = $true } catch { $ok = $false }
+  # Verify absence rather than trusting the call.
+  if (Test-Path -LiteralPath $d) { $ok = $false }
+  $results += [pscustomobject]@{ index = $results.Count; removed = $ok }
+}`
       : ""
   }
-[pscustomobject]@{ removedDisks = ${
-    args.deleteDisks ? "$disks" : "@()"
-  } } | ConvertTo-Json -Compress`
+[pscustomobject]@{ diskCount = $disks.Count; results = @($results) } | ConvertTo-Json -Depth 4 -Compress`
     .trim();
-  await runPowerShell(g, ps, ctx.signal);
+  const top = asArray(await runPowerShell(g, ps, ctx.signal))[0];
 
   // Read back rather than trust the cmdlet.
   const after = await vmState(g, args.vmName, ctx.signal);
@@ -747,11 +985,28 @@ ${
       `delete did not take: ${args.vmName} still present (${after})`,
     );
   }
-  ctx.logger.info(
-    `${args.vmName}: deleted${
-      args.deleteDisks ? " (disks removed)" : " (disks left in place)"
-    }`,
-  );
+
+  if (args.deleteDisks) {
+    const results = asArray(JSON.stringify(top?.results ?? []));
+    const failed = results.filter((r) => r.removed !== true).length;
+    if (failed > 0) {
+      // Positions, never paths: a disk path names a volume layout and often
+      // the VM, and this message reaches logs and resources.
+      throw new Error(
+        `${args.vmName} was deleted, but ${failed} of ${results.length} ` +
+          `disk(s) could not be removed and are still on disk ` +
+          `(positions: ${
+            results.map((r, i) => r.removed !== true ? i : -1)
+              .filter((i) => i >= 0).join(", ")
+          })`,
+      );
+    }
+    ctx.logger.info(
+      `${args.vmName}: deleted, ${results.length} disk(s) removed and verified absent`,
+    );
+  } else {
+    ctx.logger.info(`${args.vmName}: deleted (disks left in place)`);
+  }
   return [];
 }
 

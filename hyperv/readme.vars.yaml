@@ -2,17 +2,19 @@
 # comes from the code. Placeholders only, never a real host, path, or vault item.
 package: "@jpisgeek/hyperv"
 purpose: >-
-  A Hyper-V host, read over SSH and acted on deliberately. Collection is
+  A Hyper-V host, read over SSH and acted on deliberately. `discover` is
   read-only and covers the host's capacity, one record per virtual machine,
-  per checkpoint, and per virtual switch. Lifecycle methods mutate, and each
-  destructive one makes the caller name what it is about to destroy. There is
-  no REST or JSON-RPC surface for Hyper-V, so PowerShell is the API and SSH is
-  how it is reached.
+  and one per virtual switch. Checkpoints are recorded by the checkpoint
+  methods rather than by `discover`, so a checkpoint record reflects a
+  deliberate act on that VM and not a periodic sweep. Lifecycle methods
+  mutate, and each destructive one makes the caller name what it is about to
+  destroy. There is no REST or JSON-RPC surface for Hyper-V, so PowerShell is
+  the API and SSH is how it is reached.
 example: |
   globalArguments:
     # Source both from a vault so no machine identity lands in a tracked file.
-    host: ${{ vault.get(lab, hypervisor-address) }}
-    user: ${{ vault.get(lab, hypervisor-user) }}
+    host: ${{ vault.get(<your-vault>, <your-host-address-item>) }}
+    user: ${{ vault.get(<your-vault>, <your-host-user-item>) }}
     port: 22
     timeoutSec: 30
 caveats: |
@@ -62,6 +64,15 @@ security: |
   - `restoreCheckpoint` discards every change made since the checkpoint was
     taken. That loss is silent — Hyper-V does not warn and there is no undo —
     so `confirmDiscardSince` must repeat the checkpoint name.
+  - Deleting a **running** VM cuts its power: this path has no graceful
+    shutdown, and the guest filesystem takes the same risk as pulling the
+    plug. It is refused unless `confirmForcePowerOff` is set, so the power cut
+    is a decision rather than a side effect of the delete.
+
+  When `deleteDisks` is used, each file is removed and then verified absent,
+  and any disk that survives fails the method. Failures are reported by
+  position, never by path — a disk path names a volume layout and usually the
+  VM, and these messages reach logs and stored resources.
 
   The point of both guards is a `vmName` arriving from a workflow input: it
   should fail rather than succeed against the wrong machine.

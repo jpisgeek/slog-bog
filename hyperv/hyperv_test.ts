@@ -13,18 +13,27 @@ import {
   assertStringIncludes,
   assertThrows,
 } from "jsr:@std/assert@1";
+import { z } from "npm:zod@4";
 import {
   asArray,
   assertDeleteConfirmed,
   assertRestoreConfirmed,
   CheckpointArgsSchema,
+  classifyRemote,
   DeleteArgsSchema,
   dotNetDate,
   encodeCommand,
   GlobalArgsSchema,
   num,
+  parseRow,
+  PART_SEP,
   psQuote,
+  PsVmHostRow,
+  PsVmRow,
+  RemoveCheckpointArgsSchema,
+  resourceId,
   RestoreArgsSchema,
+  slugPart,
   StopArgsSchema,
   SWITCH_TYPES,
   VmNameArgs,
@@ -268,5 +277,157 @@ Deno.test("switch types cover the enum Hyper-V actually returns", () => {
     SWITCH_TYPES[3],
     undefined,
     "unknown stays unknown, not guessed",
+  );
+});
+
+// --- security review round 2 -----------------------------------------------
+
+Deno.test("resource ids cannot collide once names are slugged", async () => {
+  // The whole point of the digest. These four VM names all slug to the same
+  // string, and the old `vm-${name}` form would have written them all to one
+  // record, each overwriting the last.
+  const names = ["web server", "web-server", "web_server", "WEB  SERVER"];
+  const ids = await Promise.all(
+    names.map((n) => resourceId("vm", "host-a", n)),
+  );
+  assertEquals(new Set(ids).size, names.length);
+  for (const id of ids) assertStringIncludes(id, "vm--host-a--web-server-");
+});
+
+Deno.test("resource ids are scoped by host", async () => {
+  // Same VM name on two hosts is two machines, not one seen twice.
+  const a = await resourceId("vm", "host-a", "db");
+  const b = await resourceId("vm", "host-b", "db");
+  assertEquals(a === b, false);
+});
+
+Deno.test("the part separator cannot occur inside a part", () => {
+  // Two dashes is only unambiguous because slugPart collapses every run of
+  // non-alphanumerics to exactly one dash. If that ever stops being true the
+  // separator stops being a separator.
+  for (const raw of ["a--b", "a  b", "a__b", "a...b", "-a-", "a/b\\c"]) {
+    assertEquals(slugPart(raw).includes(PART_SEP), false);
+  }
+});
+
+Deno.test("slugPart never returns an empty id fragment", () => {
+  for (const raw of ["", "   ", "!!!", "---"]) {
+    assertEquals(slugPart(raw), "unnamed");
+  }
+});
+
+Deno.test("host records are rejected rather than zero-filled", () => {
+  // The failure this guards: a cmdlet that returns nothing for MemoryCapacity
+  // used to become 0, and a half-collected host was written down as a whole
+  // one. A host with no memory is not a reading, it is a broken query.
+  assertThrows(
+    () =>
+      parseRow(PsVmHostRow, {
+        Name: "hv1",
+        LogicalProcessorCount: 8,
+        VirtualMachinePath: "C:\\VMs",
+      }, "host record"),
+    Error,
+    "did not match the expected shape",
+  );
+});
+
+Deno.test("parse failures name the field, never the value", () => {
+  try {
+    parseRow(PsVmRow, {
+      Name: "SECRET-VM-NAME",
+      State: "Running",
+      Status: "OK",
+      Generation: "two",
+      ProcessorCount: 2,
+      MemoryAssigned: 1,
+    }, "VM record");
+    throw new Error("should have thrown");
+  } catch (e) {
+    const msg = String(e);
+    assertStringIncludes(msg, "Generation");
+    // The offending row must not be echoed back into a message that lands in
+    // a log or a resource.
+    assertEquals(msg.includes("SECRET-VM-NAME"), false);
+  }
+});
+
+Deno.test("remote stderr is classified, never echoed", () => {
+  const leaky =
+    "ssh: connect to host hv-01.corp.example port 22: Connection refused";
+  const verdict = classifyRemote(leaky);
+  assertEquals(verdict, "connection-failed");
+  assertEquals(verdict.includes("hv-01"), false);
+});
+
+Deno.test("an unrecognised failure yields a verdict, not a sample", () => {
+  const v = classifyRemote("C:\\ClusterStorage\\Volume1\\vm.vhdx is haunted");
+  assertEquals(v, "unclassified");
+  assertEquals(v.includes("vhdx"), false);
+});
+
+Deno.test("host strings that would redirect the connection are refused", () => {
+  // ssh honours the LAST userinfo section, so a host carrying `user@` quietly
+  // sends the connection somewhere else. A leading dash is read as an option.
+  for (
+    const bad of [
+      "attacker@elsewhere",
+      "-oProxyCommand=curl evil",
+      "host with space",
+      "ssh://host",
+      "host:22",
+      "host\nnewline",
+    ]
+  ) {
+    assertEquals(
+      GlobalArgsSchema.safeParse({ host: bad, user: "admin" }).success,
+      false,
+    );
+  }
+});
+
+Deno.test("ordinary hosts still parse", () => {
+  for (const ok of ["hv1", "hv-01.lan", "10.0.0.5", "[fe80::1]"]) {
+    assertEquals(
+      GlobalArgsSchema.safeParse({ host: ok, user: "admin" }).success,
+      true,
+    );
+  }
+});
+
+Deno.test("user strings that would smuggle an option are refused", () => {
+  for (const bad of ["-oProxyCommand=x", "a b", "u@h", ""]) {
+    assertEquals(
+      GlobalArgsSchema.safeParse({ host: "hv1", user: bad }).success,
+      false,
+    );
+  }
+});
+
+Deno.test("create and remove no longer share one description", () => {
+  // They shared a schema, so removeCheckpoint published the exact inverse of
+  // the truth: that the checkpoint must NOT already exist.
+  const create = z.toJSONSchema(CheckpointArgsSchema) as Record<string, any>;
+  const remove = z.toJSONSchema(RemoveCheckpointArgsSchema) as Record<
+    string,
+    any
+  >;
+  assertStringIncludes(create.properties.name.description, "Must not already");
+  assertStringIncludes(remove.properties.name.description, "Must already");
+});
+
+Deno.test("deleting a running VM needs the power-off acknowledged", () => {
+  const args = z.toJSONSchema(DeleteArgsSchema) as Record<string, any>;
+  assertStringIncludes(
+    args.properties.confirmForcePowerOff.description,
+    "RUNNING",
+  );
+  // Off by default: the acknowledgement has to be an act, not an inheritance.
+  assertEquals(
+    DeleteArgsSchema.parse({
+      vmName: "a",
+      confirmName: "a",
+    }).confirmForcePowerOff,
+    false,
   );
 });

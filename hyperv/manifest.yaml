@@ -3,10 +3,12 @@ name: "@jpisgeek/hyperv"
 version: 2026.08.29.1
 description: >
   Read a Hyper-V host over SSH and act on its VMs. Collection is read-only:
-  the host's capacity, one record per virtual machine, checkpoint, and virtual
-  switch. Lifecycle methods mutate and are guarded, because delete destroys a
-  machine and its disks and restoreCheckpoint silently discards everything
-  since the checkpoint was taken -- both require the caller to name what they
+  the host's capacity, one record per virtual machine, and one per virtual
+  switch. Checkpoints are recorded by the checkpoint methods, not by the
+  read-only sweep. Lifecycle methods mutate and are guarded, because delete
+  removes a machine and its checkpoints -- its disks only when explicitly
+  asked, off by default -- and restoreCheckpoint silently discards everything
+  since the checkpoint was taken. Both require the caller to name what they
   are destroying, so a wrong name arriving from a workflow input fails instead
   of succeeding against the wrong machine. There is no REST surface for
   Hyper-V, so PowerShell is the API and SSH is how it is reached; commands go
