@@ -3,8 +3,9 @@
  *
  * Reached by SSH to the Windows OpenSSH server, running PowerShell there.
  * There is no REST or JSON-RPC surface for Hyper-V, so PowerShell is the API,
- * and SSH is how we get to it -- the box already carries the fleet's machine
- * key, so no password or WinRM credential is needed anywhere.
+ * and SSH is how we get to it. Authentication is whatever identity the ambient
+ * ssh-agent already holds, so no password or WinRM credential is accepted,
+ * read, or stored by this model.
  *
  * Two things make the transport less fragile than it looks:
  *
@@ -51,16 +52,57 @@ import { z } from "npm:zod@4";
  * Windows the login account is frequently not the fleet's usual one. Source
  * both from a vault expression so no machine identity lands in a tracked file.
  */
+/**
+ * A hostname, IPv4 literal, or bracketed IPv6 literal -- and nothing else.
+ *
+ * This string becomes half of an ssh destination argument, so the shapes it
+ * must refuse are not hypothetical. `user@evil` in the host smuggles a second
+ * userinfo section and ssh honours the LAST one, silently redirecting the
+ * connection. A leading `-` is read by ssh as an option rather than a
+ * destination. Whitespace and control characters split or truncate the
+ * argument. None of these need a shell to be dangerous; ssh's own parser is
+ * enough.
+ */
+const HOSTLIKE =
+  /^(?:\[[0-9A-Fa-f:.]+\]|[0-9A-Za-z](?:[0-9A-Za-z-]*[0-9A-Za-z])?(?:\.[0-9A-Za-z](?:[0-9A-Za-z-]*[0-9A-Za-z])?)*)$/;
+
+/**
+ * A login name. Deliberately narrower than what Windows will accept: the
+ * point is to refuse `-oProxyCommand=...` and anything carrying `@`, a space,
+ * or a control character, not to model every legal account name. A host whose
+ * account does not fit this can be reached by an ssh_config Host block.
+ */
+const USERLIKE = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
+
 export const GlobalArgsSchema = z.object({
-  host: z.string().min(1).describe(
-    "Address of the Hyper-V host's SSH server. Source it from a vault " +
-      "expression so no machine identity lands in a tracked file.",
-  ),
-  user: z.string().min(1).describe(
-    "Login user for SSH. Also vault-sourced; on Windows this is frequently " +
-      "an account whose name differs from the fleet default.",
-  ),
-  port: z.number().int().positive().default(22),
+  host: z
+    .string()
+    .min(1)
+    .max(253)
+    .regex(
+      HOSTLIKE,
+      "host must be a bare hostname, IPv4 literal, or bracketed IPv6 " +
+        "literal: no userinfo, scheme, port, whitespace, or leading dash",
+    )
+    .describe(
+      "Address of the Hyper-V host's SSH server. Source it from a vault " +
+        "expression so no machine identity lands in a tracked file.",
+    )
+    .meta({ sensitive: true }),
+  user: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(
+      USERLIKE,
+      "user must be a plain login name: no @, whitespace, or leading dash",
+    )
+    .describe(
+      "Login user for SSH. Also vault-sourced; on Windows this is frequently " +
+        "an account whose name differs from the fleet default.",
+    )
+    .meta({ sensitive: true }),
+  port: z.number().int().positive().max(65535).default(22),
   timeoutSec: z.number().int().positive().default(30),
 });
 
@@ -98,7 +140,27 @@ export const StopArgsSchema = z.object({
  */
 export const CheckpointArgsSchema = z.object({
   vmName: z.string().min(1),
-  name: z.string().min(1).describe("Checkpoint name. Must not already exist."),
+  name: z.string().min(1).describe(
+    "Checkpoint name to create. Must not already exist on this VM: the " +
+      "method refuses a duplicate rather than letting Hyper-V decide what to " +
+      "do about the collision, because the caller would not then know which " +
+      "restore point they ended up with.",
+  ),
+});
+
+/**
+ * `removeCheckpoint`, which is the mirror of `checkpoint` and therefore needs
+ * the opposite precondition. It shared `CheckpointArgsSchema` until a review
+ * pointed out that the published description then told callers of THIS method
+ * that the name must not already exist -- the exact inverse of the truth. Two
+ * verbs, two schemas.
+ */
+export const RemoveCheckpointArgsSchema = z.object({
+  vmName: z.string().min(1),
+  name: z.string().min(1).describe(
+    "Checkpoint to remove. Must already exist on this VM; it is the " +
+      "checkpoint that will be deleted.",
+  ),
 });
 
 /**
@@ -206,12 +268,44 @@ async function runPowerShell(
 ): Promise<string> {
   const out = await new Deno.Command("ssh", {
     args: [
+      // Everything ssh will otherwise take from ambient config is pinned
+      // here, because this model's guarantees have to be its own rather than
+      // the environment's. StrictHostKeyChecking=yes refuses an unknown or
+      // changed host key instead of trusting it -- a Hyper-V host that has
+      // been replaced underneath you is exactly the case worth failing on.
+      // ControlMaster/ControlPath matter more than they look: an already-open
+      // multiplexed socket makes ssh reuse that connection and skip the host
+      // key policy entirely, so a strict setting here would be decorative
+      // without them. ProxyCommand and PermitLocalCommand both run local
+      // programs, and forwarding hands this process's agent to the remote
+      // host, where a socket signs for every key it holds.
       "-o",
       "BatchMode=yes",
+      "-o",
+      "StrictHostKeyChecking=yes",
+      "-o",
+      "ControlMaster=no",
+      "-o",
+      "ControlPath=none",
+      "-o",
+      "ProxyCommand=none",
+      "-o",
+      "PermitLocalCommand=no",
+      "-o",
+      "ForwardAgent=no",
+      "-o",
+      "ForwardX11=no",
+      "-o",
+      "ForwardX11Trusted=no",
+      "-o",
+      "ClearAllForwardings=yes",
       "-o",
       `ConnectTimeout=${Math.min(g.timeoutSec, 10)}`,
       "-p",
       String(g.port),
+      // `--` so a destination can never be read as an option, belt to the
+      // regex's braces.
+      "--",
       `${g.user}@${g.host}`,
       `powershell -NoProfile -NonInteractive -EncodedCommand ${
         encodeCommand(ps)
@@ -228,14 +322,58 @@ async function runPowerShell(
 
   const stdout = new TextDecoder().decode(out.stdout).trim();
   if (out.code !== 0) {
-    const err = new TextDecoder().decode(out.stderr).trim();
+    const err = new TextDecoder().decode(out.stderr);
     throw new Error(
-      `powershell over ssh failed (exit ${out.code}): ${
-        err.split("\n")[0] || "no stderr"
-      }`,
+      `powershell over ssh failed (exit ${out.code}): ${classifyRemote(err)}`,
     );
   }
   return stdout;
+}
+
+/**
+ * Turn remote stderr into one of a fixed set of verdicts, and let nothing
+ * else out.
+ *
+ * The matching reads the full text; only the verdict escapes. That split is
+ * the whole point: stderr from a Windows host routinely carries the hostname,
+ * an account name, a filesystem path, a VM name, or whatever a failing cmdlet
+ * decided to print, and this text was previously copied verbatim into thrown
+ * errors -- which are written into resources AND logs, so one unlucky failure
+ * publishes infrastructure detail into the datastore permanently.
+ *
+ * An unrecognised failure returns "unclassified" rather than a sample of the
+ * text. Losing detail on rare failures is the price; the alternative leaks by
+ * default and is only safe by luck.
+ */
+export function classifyRemote(stderr: string): string {
+  const patterns: [RegExp, string][] = [
+    [
+      /host key verification failed|remote host identification/i,
+      "host-key-refused",
+    ],
+    [
+      /permission denied|access denied|authentication failed/i,
+      "permission-denied",
+    ],
+    [
+      /connection (refused|closed|timed out)|no route to host|network is unreachable/i,
+      "connection-failed",
+    ],
+    [
+      /could not resolve|name or service not known|nodename nor servname/i,
+      "host-unresolved",
+    ],
+    [
+      /is not recognized as|commandnotfound|term '.*' is not recognized/i,
+      "powershell-or-cmdlet-missing",
+    ],
+    [
+      /not authorized|requires elevation|access is denied/i,
+      "insufficient-privilege",
+    ],
+  ];
+  for (const [re, code] of patterns) if (re.test(stderr)) return code;
+  return stderr.trim() ? "unclassified" : "no-stderr";
 }
 
 /** Parse JSON that may be a single object, an array, or empty. */
@@ -245,8 +383,11 @@ export function asArray(raw: string): Record<string, unknown>[] {
   try {
     v = JSON.parse(raw);
   } catch {
+    // Deliberately no sample of `raw`. Malformed stdout is still remote
+    // output and can carry the same infrastructure detail stderr does; the
+    // byte count is enough to tell "empty" from "something came back wrong".
     throw new Error(
-      `expected JSON from PowerShell, got: ${raw.slice(0, 120)}`,
+      `expected JSON from PowerShell, got ${raw.length} byte(s) that did not parse`,
     );
   }
   if (v === null) return [];
@@ -691,7 +832,7 @@ export const model = {
     removeCheckpoint: {
       description: "Delete a checkpoint, merging its differencing disk. " +
         "Does not change the running state of the VM.",
-      arguments: CheckpointArgsSchema,
+      arguments: RemoveCheckpointArgsSchema,
       execute: removeCheckpoint,
     },
     delete: {
