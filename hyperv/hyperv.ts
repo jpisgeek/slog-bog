@@ -20,11 +20,13 @@
  *     many an array; code that assumes one shape breaks the first time the
  *     count changes.
  *
- * Authentication is the ambient ssh-agent. Load an identity that the target
- * authorizes before running anything here; this model never handles key
- * material, never reads a key file, and never takes a password argument. If
- * no agent is reachable the ssh call fails, which is the intended outcome
- * rather than a fallback to something weaker.
+ * Authentication is public key only, and which key is offered is ssh's
+ * decision, not this model's. An agent identity or an identity file named by
+ * the caller's ssh configuration will both be used; this model handles no key
+ * material and takes no password argument, and it narrows ssh to publickey so
+ * a host offering passwords cannot be used as a fallback. It does not claim
+ * to control which identities ssh loads -- that is listed as an operator
+ * decision in the README rather than as a guarantee.
  *
  * Collection is read-only; lifecycle methods mutate and are guarded.
  *
@@ -310,6 +312,83 @@ type Ctx = {
   writeResource: (...a: any[]) => Promise<any>;
 };
 
+/**
+ * The ssh argument vector, built in one place so it can be asserted by
+ * property rather than by reading the call site.
+ *
+ * Everything ssh would otherwise take from ambient configuration is pinned
+ * here, because this model's guarantees have to be its own rather than the
+ * environment's -- and it carries a `delete` verb, so "connected somewhere
+ * slightly different than you thought" is not a survivable failure mode.
+ */
+export function sshArgs(
+  g: { host: string; user: string; port: number; timeoutSec: number },
+  remote: string,
+): string[] {
+  return [
+    // Everything ssh will otherwise take from ambient config is pinned
+    // here, because this model's guarantees have to be its own rather than
+    // the environment's. StrictHostKeyChecking=yes refuses an unknown or
+    // changed host key instead of trusting it -- a Hyper-V host that has
+    // been replaced underneath you is exactly the case worth failing on.
+    // ControlMaster/ControlPath matter more than they look: an already-open
+    // multiplexed socket makes ssh reuse that connection and skip the host
+    // key policy entirely, so a strict setting here would be decorative
+    // without them. ProxyCommand and PermitLocalCommand both run local
+    // programs, and forwarding hands this process's agent to the remote
+    // host, where a socket signs for every key it holds.
+    // An ssh_config `Host` block can rewrite HostName, and canonicalisation
+    // can rewrite it again -- so a host string this model validated can
+    // still resolve to a different machine, which for a model with `delete`
+    // in it is the whole ballgame. HostName is pinned to the validated
+    // value and canonicalisation is off, so config may still supply
+    // per-host settings but cannot change WHERE this connects.
+    "-o",
+    `HostName=${g.host}`,
+    "-o",
+    "CanonicalizeHostname=no",
+    "-o",
+    "BatchMode=yes",
+    // BatchMode only suppresses PROMPTS. On its own ssh will still try
+    // password and keyboard-interactive against a host that offers them,
+    // and will still read default identity files. Public key only, so the
+    // set of things that can authenticate is the set the caller configured.
+    "-o",
+    "PreferredAuthentications=publickey",
+    "-o",
+    "PasswordAuthentication=no",
+    "-o",
+    "KbdInteractiveAuthentication=no",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+    "-o",
+    "ProxyCommand=none",
+    "-o",
+    "PermitLocalCommand=no",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "ForwardX11Trusted=no",
+    "-o",
+    "ClearAllForwardings=yes",
+    "-o",
+    `ConnectTimeout=${Math.min(g.timeoutSec, 10)}`,
+    "-p",
+    String(g.port),
+    // `--` so a destination can never be read as an option, belt to the
+    // regex's braces.
+    "--",
+    `${g.user}@${g.host}`,
+    `powershell -NoProfile -NonInteractive -EncodedCommand ${remote}`,
+  ];
+}
+
 /** base64 of the UTF-16LE bytes, which is what -EncodedCommand expects. */
 export function encodeCommand(ps: string): string {
   const u16 = new Uint8Array(ps.length * 2);
@@ -327,60 +406,7 @@ async function runPowerShell(
   signal: AbortSignal,
 ): Promise<string> {
   const cmd = new Deno.Command("ssh", {
-    args: [
-      // Everything ssh will otherwise take from ambient config is pinned
-      // here, because this model's guarantees have to be its own rather than
-      // the environment's. StrictHostKeyChecking=yes refuses an unknown or
-      // changed host key instead of trusting it -- a Hyper-V host that has
-      // been replaced underneath you is exactly the case worth failing on.
-      // ControlMaster/ControlPath matter more than they look: an already-open
-      // multiplexed socket makes ssh reuse that connection and skip the host
-      // key policy entirely, so a strict setting here would be decorative
-      // without them. ProxyCommand and PermitLocalCommand both run local
-      // programs, and forwarding hands this process's agent to the remote
-      // host, where a socket signs for every key it holds.
-      "-o",
-      "BatchMode=yes",
-      // BatchMode only suppresses PROMPTS. On its own ssh will still try
-      // password and keyboard-interactive against a host that offers them,
-      // and will still read default identity files. Public key only, so the
-      // set of things that can authenticate is the set the caller configured.
-      "-o",
-      "PreferredAuthentications=publickey",
-      "-o",
-      "PasswordAuthentication=no",
-      "-o",
-      "KbdInteractiveAuthentication=no",
-      "-o",
-      "StrictHostKeyChecking=yes",
-      "-o",
-      "ControlMaster=no",
-      "-o",
-      "ControlPath=none",
-      "-o",
-      "ProxyCommand=none",
-      "-o",
-      "PermitLocalCommand=no",
-      "-o",
-      "ForwardAgent=no",
-      "-o",
-      "ForwardX11=no",
-      "-o",
-      "ForwardX11Trusted=no",
-      "-o",
-      "ClearAllForwardings=yes",
-      "-o",
-      `ConnectTimeout=${Math.min(g.timeoutSec, 10)}`,
-      "-p",
-      String(g.port),
-      // `--` so a destination can never be read as an option, belt to the
-      // regex's braces.
-      "--",
-      `${g.user}@${g.host}`,
-      `powershell -NoProfile -NonInteractive -EncodedCommand ${
-        encodeCommand(ps)
-      }`,
-    ],
+    args: sshArgs(g, encodeCommand(ps)),
     stdin: "null",
     stdout: "piped",
     stderr: "piped",
@@ -786,13 +812,22 @@ export const PsStateRow = z.object({
   state: z.string().nullable(),
 });
 
+/** ISO-8601 as PowerShell emits it, anchored so a prefix cannot pass. */
+export const ISO_DATE =
+  /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/;
+
 export const PsCheckpointRow = z.object({
   VMName: SafeName,
   Name: SafeName,
   CheckpointType: z.string(),
-  // Either the /Date(ms)/ form PowerShell emits or an ISO string, depending
-  // on how it was serialised. Both are strings; anything else is a bug.
-  CreationTime: z.string(),
+  // Only the two forms PowerShell actually produces. Accepting any string and
+  // letting dotNetDate return null for the rest meant a malformed timestamp
+  // was written as "no creation time" -- a broken response wearing the shape
+  // of missing data.
+  CreationTime: z.string().refine(
+    (v) => /^\/Date\((-?\d+)\)\/$/.test(v) || ISO_DATE.test(v),
+    { message: "CreationTime must be a .NET /Date(ms)/ or ISO-8601 value" },
+  ),
   // Required, nullable. A root checkpoint genuinely has no parent; a
   // response that omits the field has not told us either way.
   ParentSnapshotName: SafeName.nullable(),
@@ -954,13 +989,13 @@ export function dotNetDate(v: unknown): string | null {
     const d = new Date(n);
     return Number.isNaN(d.getTime()) ? null : d.toISOString();
   }
-  // Already ISO-8601? Accept it. Anything else is not a timestamp, and the
-  // old `return v` passed it straight through to a field documented as
-  // ISO-8601 -- so a cmdlet returning "Unknown" was stored as if it were a
-  // date, and every consumer downstream inherited that lie.
-  const d = new Date(v);
-  if (!Number.isNaN(d.getTime()) && /^\d{4}-\d{2}-\d{2}/.test(v)) {
-    return d.toISOString();
+  // Already ISO-8601? Accept it. The schema now rejects anything that is
+  // neither form before this is reached, so a null from here means the value
+  // was structurally a date and still unrepresentable -- not that the host
+  // sent something else entirely.
+  if (ISO_DATE.test(v)) {
+    const d = new Date(v);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
   }
   return null;
 }
@@ -1342,11 +1377,23 @@ $disks = @(Get-VMHardDiskDrive -VMName $name | Select-Object -ExpandProperty Pat
 # then destroy storage another machine is still using, and Remove-Item has no
 # idea it is doing that. Collect every path attached to any OTHER VM and treat
 # those as untouchable.
-$othersDisks = @(
-  Get-VM | Where-Object { $_.Name -ne $name } |
-    Get-VMHardDiskDrive | Select-Object -ExpandProperty Path
-)
-$shared = @($disks | Where-Object { $othersDisks -contains $_ })
+function Get-OtherDiskSet {
+  # Normalise before comparing. Two spellings of one file -- a relative
+  # segment, a trailing slash, different case on a case-insensitive volume --
+  # are the same storage, and a plain string compare calls them different and
+  # deletes one of them.
+  $set = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+  foreach ($p in @(Get-VM | Where-Object { $_.Name -ne $name } |
+      Get-VMHardDiskDrive | Select-Object -ExpandProperty Path)) {
+    try { [void]$set.Add([System.IO.Path]::GetFullPath($p)) } catch { [void]$set.Add($p) }
+  }
+  return $set
+}
+function Normalise-Path([string]$p) {
+  try { return [System.IO.Path]::GetFullPath($p) } catch { return $p }
+}
+$othersDisks = Get-OtherDiskSet
+$shared = @($disks | Where-Object { $othersDisks.Contains((Normalise-Path $_)) })
 $state = (Get-VM -Name $name).State.ToString()
 # The acknowledgement is enforced HERE, not only before the call. Checking
 # state in one SSH round trip and powering off in a later one leaves a window
@@ -1373,12 +1420,22 @@ Remove-VM -Name $name -Force
 $results = @()
 ${
     args.deleteDisks
-      ? `for ($i = 0; $i -lt $disks.Count; $i++) {
+      ? `# Re-check ownership immediately before each delete, not once up front. The
+# earlier snapshot cannot be atomic -- another VM can attach a disk in the
+# window -- so the window is made as small as this transport allows rather
+# than pretended away. A disk that became shared since the snapshot is
+# refused here and reported, not removed.
+$current = Get-OtherDiskSet
+for ($i = 0; $i -lt $disks.Count; $i++) {
   $d = $disks[$i]
   $ok = $false
-  try { Remove-Item -LiteralPath $d -Force -ErrorAction Stop; $ok = $true } catch { $ok = $false }
-  # Verify absence rather than trusting the call.
-  if (Test-Path -LiteralPath $d) { $ok = $false }
+  if ($current.Contains((Normalise-Path $d))) {
+    $ok = $false
+  } else {
+    try { Remove-Item -LiteralPath $d -Force -ErrorAction Stop; $ok = $true } catch { $ok = $false }
+    # Verify absence rather than trusting the call.
+    if (Test-Path -LiteralPath $d) { $ok = $false }
+  }
   $results += [pscustomobject]@{ index = $i; removed = $ok }
 }`
       : ""

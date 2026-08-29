@@ -139,13 +139,18 @@ or brace gets mangled twice before PowerShell ever sees it, so commands are sent
 with `-EncodedCommand` as base64 UTF-16LE. This is not premature: a literal pipe
 in a remote command has already truncated a script and left a file half-written.
 
-**Three .NET serialisation traps are resolved host-side, not here.** VM `State`
-is an enum number, so a stopped VM reports `3`, not `"Off"`. `SecureBoot` is
-also an enum where **0 means ON**, so reading it as a boolean reports the
-security posture backwards. `CreationTime` arrives as `/Date(1234567890000)/`.
-Each parses cleanly into something wrong, which is the dangerous kind of wrong,
-so all three are resolved in PowerShell rather than decoded here against a table
-that drifts as Microsoft adds values.
+**.NET serialisation traps.** VM `State` is an enum that serialises as its
+NUMBER, so a stopped VM arrives as `3` rather than `"Off"`; it is resolved
+host-side with `ToString()` rather than against an enum table here that would
+drift as Microsoft adds values. `CreationTime` arrives as
+`/Date(1234567890000)/` and is converted in TypeScript, where the accepted forms
+are validated rather than softened — a value that is neither the .NET form nor
+ISO-8601 is rejected, not stored as "no timestamp". Both parse cleanly into
+something wrong if taken at face value, which is the dangerous kind of wrong.
+
+(Hyper-V's `SecureBoot` has the same shape — an enum where **0 means ON**, so
+reading it as a boolean reports the security posture backwards. This extension
+does not collect it. Worth knowing if you extend the model.)
 
 `ConvertTo-Json` returns an object for one item and an array for many, so the
 remote side is always told to emit an array. Code that assumes one shape breaks
@@ -216,6 +221,17 @@ Redacting it from an error while writing it to the record beside that error
 protects nothing and makes a destructive method undiagnosable. If that trade is
 wrong for your environment, the resource records are the thing to reconsider,
 not the error text.
+
+**Shared disks are refused, but the check cannot be atomic.** `deleteDisks` will
+not remove a VHDX that is attached to another VM — a shared disk, a differencing
+chain, or the same file added twice — because deleting one VM would otherwise
+destroy storage another machine is still using. Ownership is checked before
+`Remove-VM` runs (afterwards the attachment information no longer exists) and
+re-checked immediately before each file is removed, with paths normalised so two
+spellings of one file are not treated as two files. A residual window remains:
+another VM can attach a disk between the last check and the delete. Over SSH
+that window can be narrowed, not closed, and it is stated here rather than
+papered over.
 
 **Names must identify one object.** PowerShell's `-Name` parameters accept
 wildcards, so `*` is a well-formed argument that means _every_ machine. Every

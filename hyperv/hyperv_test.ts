@@ -42,6 +42,7 @@ import {
   RestoreArgsSchema,
   safeState,
   slugPart,
+  sshArgs,
   StopArgsSchema,
   SWITCH_TYPES,
   VmNameArgs,
@@ -713,4 +714,78 @@ Deno.test("no remote state reaches a message unscreened", async () => {
   );
   const bare = src.match(/\$\{(?:before|after)\}/g) ?? [];
   assertEquals(bare.length, 0);
+});
+
+// --- security review round 9 ---------------------------------------------
+
+Deno.test("a timestamp is one of two forms or it is rejected", () => {
+  const base = {
+    VMName: "vm1",
+    Name: "cp",
+    CheckpointType: "Standard",
+    ParentSnapshotName: null,
+  };
+  // Both real forms pass.
+  for (const t of ["/Date(1234567890000)/", "2026-01-01T00:00:00Z"]) {
+    assertEquals(
+      PsCheckpointRow.safeParse({ ...base, CreationTime: t }).success,
+      true,
+    );
+  }
+  // Anything else is a broken response, not a missing date. Accepting it
+  // and letting dotNetDate return null stored "no creation time" for a
+  // value that was never a time at all.
+  for (const t of ["Unknown", "", "2026", "later"]) {
+    assertEquals(
+      PsCheckpointRow.safeParse({ ...base, CreationTime: t }).success,
+      false,
+    );
+  }
+});
+
+Deno.test("the destination cannot be rewritten by ambient ssh config", () => {
+  // A Host block in ssh_config can rewrite HostName, and canonicalisation
+  // can rewrite it again -- so a validated host could still resolve to a
+  // different machine, which for a model carrying delete is the whole
+  // ballgame. Both are pinned on the command line.
+  const args = sshArgs(
+    { host: "hv1", user: "admin", port: 22, timeoutSec: 30 },
+    "BASE64",
+  ).join(" ");
+  assertStringIncludes(args, "HostName=hv1");
+  assertStringIncludes(args, "CanonicalizeHostname=no");
+});
+
+Deno.test("the transport refuses everything it should, by property", () => {
+  const args = sshArgs(
+    { host: "hv1", user: "admin", port: 2222, timeoutSec: 30 },
+    "BASE64",
+  );
+  const opt = (name: string) => {
+    const i = args.indexOf("-o");
+    let at = i;
+    while (at !== -1) {
+      if (args[at + 1]?.startsWith(name + "=")) return args[at + 1];
+      at = args.indexOf("-o", at + 1);
+    }
+    return undefined;
+  };
+  // Asserted by option name, not argv position, so reordering cannot make
+  // this pass while the guarantee is gone.
+  assertEquals(opt("StrictHostKeyChecking"), "StrictHostKeyChecking=yes");
+  assertEquals(opt("ControlMaster"), "ControlMaster=no");
+  assertEquals(opt("ControlPath"), "ControlPath=none");
+  assertEquals(opt("ProxyCommand"), "ProxyCommand=none");
+  assertEquals(opt("PermitLocalCommand"), "PermitLocalCommand=no");
+  assertEquals(opt("ForwardAgent"), "ForwardAgent=no");
+  assertEquals(opt("ClearAllForwardings"), "ClearAllForwardings=yes");
+  assertEquals(
+    opt("PreferredAuthentications"),
+    "PreferredAuthentications=publickey",
+  );
+  assertEquals(opt("PasswordAuthentication"), "PasswordAuthentication=no");
+  // The destination is last and preceded by `--`, so it can never be read as
+  // an option however it was spelled.
+  assertEquals(args[args.length - 3], "--");
+  assertEquals(args[args.length - 2], "admin@hv1");
 });
