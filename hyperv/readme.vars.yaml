@@ -54,8 +54,8 @@ security: |
   identity ssh selects — an agent identity, or an identity file your own ssh
   configuration names or defaults to. This model narrows ssh to public-key
   authentication but does not choose the key; that remains yours to configure,
-  and it is listed as an operator decision below rather than a guarantee. No
-  credential is read, stored, or accepted
+  and it is listed as an operator decision below rather than a guarantee.
+  Nothing is read, stored, or accepted
   as an argument.
 
   **What is written.** Summaries only: names, states, capacity, switch types,
@@ -123,8 +123,10 @@ security: |
   records are the thing to reconsider, not the error text.
 
   **Shared disks are refused, but the check cannot be atomic.** `deleteDisks`
-  will not remove a VHDX that is attached to another VM — a shared disk, a
-  differencing chain, or the same file added twice — because deleting one VM
+  will not remove a VHDX that another VM depends on — a shared disk, the same
+  file added twice, or a **parent in a differencing chain**, which is followed
+  to its root so that deleting a base disk out from under a child is refused
+  too — because deleting one VM
   would otherwise destroy storage another machine is still using. Ownership is
   checked before `Remove-VM` runs (afterwards the attachment information no
   longer exists) and re-checked immediately before each file is removed, with

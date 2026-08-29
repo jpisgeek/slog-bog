@@ -160,7 +160,27 @@ export const RemoteText = (max: number) =>
     // deno-lint-ignore no-control-regex
     .refine((v) => !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(v), {
       message: "value must not contain control or line-separator characters",
-    });
+    })
+    // The same families SafeName refuses. They were added there and not here,
+    // which left the gap open on the class of strings that is actually
+    // remote-controlled -- including the queryable state tag. Bidi and
+    // zero-width characters reorder or hide displayed text; unpaired
+    // surrogates survive as replacement characters and make distinct values
+    // look identical.
+    .refine(
+      (v) => !/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(v),
+      {
+        message:
+          "value must not contain zero-width or direction-formatting characters",
+      },
+    )
+    .refine((v) => {
+      for (const ch of v) {
+        const cp = ch.codePointAt(0)!;
+        if (cp >= 0xd800 && cp <= 0xdfff) return false;
+      }
+      return true;
+    }, { message: "value must not contain unpaired surrogate code units" });
 
 export const GlobalArgsSchema = z.object({
   host: z
@@ -438,15 +458,13 @@ async function runPowerShell(
   ps: string,
   signal: AbortSignal,
 ): Promise<string> {
+  const timedOut = AbortSignal.timeout((g.timeoutSec + 10) * 1000);
   const cmd = new Deno.Command("ssh", {
     args: sshArgs(g, encodeCommand(ps)),
     stdin: "null",
     stdout: "piped",
     stderr: "piped",
-    signal: AbortSignal.any([
-      signal,
-      AbortSignal.timeout((g.timeoutSec + 10) * 1000),
-    ]),
+    signal: AbortSignal.any([signal, timedOut]),
   });
 
   // Read both streams with a hard byte cap instead of buffering to
@@ -478,6 +496,18 @@ async function runPowerShell(
     throw new Error(
       `powershell over ssh produced more than ${MAX_OUTPUT_BYTES} bytes and ` +
         `was terminated`,
+    );
+  }
+  // Distinguish OUR abort from THEIR failure. Both arrive as a non-zero child
+  // status, and reporting a caller cancellation or a local timeout as
+  // "powershell over ssh failed" sends whoever is debugging to the wrong
+  // machine entirely.
+  if (signal.aborted) {
+    throw new Error("cancelled before the remote command completed");
+  }
+  if (timedOut.aborted) {
+    throw new Error(
+      `timed out locally after ${g.timeoutSec + 10}s waiting for the host`,
     );
   }
   const stdout = new TextDecoder().decode(stdoutRaw).trim();
@@ -736,8 +766,12 @@ export async function sha256Hex(input: string): Promise<string> {
  */
 export const PsVmHostRow = z.object({
   Name: SafeName,
-  LogicalProcessorCount: z.number().int().nonnegative(),
-  MemoryCapacity: z.number().nonnegative(),
+  // Positive, not merely non-negative. The comment above claimed a host with
+  // zero memory is not a plausible reading of reality; the schema accepted it
+  // anyway, which is the gap between saying a thing and enforcing it. A
+  // hypervisor with no processors or no memory is a failed query.
+  LogicalProcessorCount: z.number().int().positive(),
+  MemoryCapacity: z.number().positive(),
   VirtualMachinePath: RemoteText(4096).min(1),
 });
 
@@ -749,8 +783,9 @@ export const PsVmRow = z.object({
   Name: SafeName,
   State: RemoteText(64).min(1),
   Status: RemoteText(256),
-  Generation: z.number().int(),
-  ProcessorCount: z.number().int().nonnegative(),
+  // Hyper-V has exactly two generations. Anything else is not a VM record.
+  Generation: z.union([z.literal(1), z.literal(2)]),
+  ProcessorCount: z.number().int().positive(),
   MemoryAssigned: z.number().nonnegative(),
   // A .NET TimeSpan, serialised as an OBJECT carrying TotalSeconds -- not a
   // number and not a string. Typed, rather than left unknown and narrowed by
@@ -1278,9 +1313,18 @@ async function checkpoint(
 
   await runPowerShell(
     g,
-    `$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';Checkpoint-VM -Name ${
-      psQuote(args.vmName)
-    } -SnapshotName ${psQuote(args.name)}`,
+    `$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+# Refuse a duplicate in the same call that creates, not one round trip earlier.
+$existing = @(Get-VMSnapshot -VMName ${psQuote(args.vmName)} -Name ${
+      psQuote(args.name)
+    } -ErrorAction SilentlyContinue)
+if ($existing.Count -ne 0) {
+  throw "a checkpoint with that name already exists on this VM"
+}
+Checkpoint-VM -Name ${psQuote(args.vmName)} -SnapshotName ${
+      psQuote(args.name)
+    }`,
     ctx.signal,
   );
 
@@ -1327,9 +1371,19 @@ async function restoreCheckpoint(
   }
   await runPowerShell(
     g,
-    `$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';Restore-VMSnapshot -VMName ${
-      psQuote(args.vmName)
-    } -Name ${psQuote(args.name)} -Confirm:$false`,
+    `$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+# Uniqueness is settled HERE, in the call that mutates. Deciding it in an
+# earlier round trip left a window in which a second case-variant checkpoint
+# could appear, and Restore-VMSnapshot would then roll back to whichever it
+# matched -- discarding a different span of work than was acknowledged.
+$snaps = @(Get-VMSnapshot -VMName ${psQuote(args.vmName)} -Name ${
+      psQuote(args.name)
+    })
+if ($snaps.Count -ne 1) {
+  throw "expected exactly one checkpoint matching the given name, found $($snaps.Count)"
+}
+Restore-VMSnapshot -VMSnapshot $snaps[0] -Confirm:$false`,
     ctx.signal,
   );
   ctx.logger.info(`${args.vmName}: restored to ${args.name}`);
@@ -1367,9 +1421,16 @@ async function removeCheckpoint(
 
   await runPowerShell(
     g,
-    `$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';Remove-VMSnapshot -VMName ${
-      psQuote(args.vmName)
-    } -Name ${psQuote(args.name)}`,
+    `$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+# Same reason as restore: the check and the deletion have to be one operation.
+$snaps = @(Get-VMSnapshot -VMName ${psQuote(args.vmName)} -Name ${
+      psQuote(args.name)
+    })
+if ($snaps.Count -ne 1) {
+  throw "expected exactly one checkpoint matching the given name, found $($snaps.Count)"
+}
+Remove-VMSnapshot -VMSnapshot $snaps[0]`,
     ctx.signal,
   );
 
@@ -1413,6 +1474,14 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 $name = ${psQuote(args.vmName)}
+# Exactly one, or nothing happens. Get-VM -Name matches case-insensitively and
+# a host can legitimately hold two VMs whose names differ only in case, so a
+# confirmed name is not by itself a confirmed target -- and every verb below
+# is destructive.
+$matches = @(Get-VM -Name $name -ErrorAction SilentlyContinue)
+if ($matches.Count -ne 1) {
+  throw "expected exactly one VM matching the given name, found $($matches.Count)"
+}
 $allowForce = ${args.confirmForcePowerOff ? "$true" : "$false"}
 $disks = @(Get-VMHardDiskDrive -VMName $name | Select-Object -ExpandProperty Path)
 # A VHDX can be attached to more than one VM -- shared disks, differencing
@@ -1426,9 +1495,22 @@ function Get-OtherDiskSet {
   # are the same storage, and a plain string compare calls them different and
   # deletes one of them.
   $set = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+  # Attached paths are not the whole story. A differencing disk names a
+  # PARENT, and that parent is storage another VM depends on just as directly
+  # -- deleting it destroys the child. Walk each chain to its root, with a
+  # depth bound so a corrupt or circular chain cannot spin here forever.
   foreach ($p in @(Get-VM | Where-Object { $_.Name -ne $name } |
       Get-VMHardDiskDrive | Select-Object -ExpandProperty Path)) {
-    try { [void]$set.Add([System.IO.Path]::GetFullPath($p)) } catch { [void]$set.Add($p) }
+    $cur = $p
+    $depth = 0
+    while ($cur -and $depth -lt 32) {
+      try { [void]$set.Add([System.IO.Path]::GetFullPath($cur)) } catch { [void]$set.Add($cur) }
+      $next = $null
+      try { $next = (Get-VHD -Path $cur -ErrorAction Stop).ParentPath } catch { $next = $null }
+      if (-not $next -or $next -eq $cur) { break }
+      $cur = $next
+      $depth++
+    }
   }
   # The unary comma is load-bearing. A bare return lets PowerShell ENUMERATE
   # the HashSet on the way out, so the caller receives null, a bare string, or

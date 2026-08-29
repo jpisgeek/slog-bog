@@ -870,3 +870,57 @@ Deno.test("stored remote text is bounded and screened", () => {
     false,
   );
 });
+
+// --- security review round 13 --------------------------------------------
+
+Deno.test("stored remote text refuses the same families names do", () => {
+  // These were added to SafeName and not to RemoteText, leaving the gap
+  // open on the class of strings that is actually remote-controlled --
+  // including the queryable state tag.
+  const t = RemoteText(64);
+  assertEquals(
+    t.safeParse("a" + String.fromCharCode(0x202e) + "b").success,
+    false,
+  );
+  assertEquals(
+    t.safeParse("a" + String.fromCharCode(0x200b) + "b").success,
+    false,
+  );
+  assertEquals(t.safeParse("a" + String.fromCharCode(0xd800)).success, false);
+  assertEquals(t.safeParse("Operating normally").success, true);
+});
+
+Deno.test("impossible hardware values are rejected, not stored", () => {
+  // The comment claimed a zero-memory host is not a plausible reading of
+  // reality while the schema accepted it -- the gap between saying a thing
+  // and enforcing it.
+  const base = {
+    Name: "hv1",
+    LogicalProcessorCount: 8,
+    MemoryCapacity: 1,
+    VirtualMachinePath: "C:\\VMs",
+  };
+  assertEquals(PsVmHostRow.safeParse(base).success, true);
+  assertEquals(
+    PsVmHostRow.safeParse({ ...base, MemoryCapacity: 0 }).success,
+    false,
+  );
+  assertEquals(
+    PsVmHostRow.safeParse({ ...base, LogicalProcessorCount: 0 }).success,
+    false,
+  );
+});
+
+Deno.test("Hyper-V has two generations and no others", () => {
+  const vm = {
+    Name: "vm1",
+    State: "Running",
+    Status: "OK",
+    ProcessorCount: 2,
+    MemoryAssigned: 1,
+    Uptime: null,
+  };
+  assertEquals(PsVmRow.safeParse({ ...vm, Generation: 2 }).success, true);
+  assertEquals(PsVmRow.safeParse({ ...vm, Generation: 7 }).success, false);
+  assertEquals(PsVmRow.safeParse({ ...vm, ProcessorCount: 0 }).success, false);
+});
