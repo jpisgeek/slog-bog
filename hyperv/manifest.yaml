@@ -1,0 +1,37 @@
+manifestVersion: 1
+name: "@jpisgeek/hyperv"
+version: 2026.08.29.1
+description: >
+  Read a Hyper-V host over SSH and act on its VMs. Collection is read-only:
+  the host's capacity, one record per virtual machine, checkpoint, and virtual
+  switch. Lifecycle methods mutate and are guarded, because delete destroys a
+  machine and its disks and restoreCheckpoint silently discards everything
+  since the checkpoint was taken -- both require the caller to name what they
+  are destroying, so a wrong name arriving from a workflow input fails instead
+  of succeeding against the wrong machine. There is no REST surface for
+  Hyper-V, so PowerShell is the API and SSH is how it is reached; commands go
+  as base64 UTF-16LE because the Windows sshd's default shell is cmd.exe and
+  mangles quoting twice before PowerShell sees it.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/hyperv
+paths:
+  base: manifest
+models:
+  - hyperv.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - hyper-v
+  - virtualisation
+  - windows
+  - vm
+  - checkpoint
+dependencies: []
