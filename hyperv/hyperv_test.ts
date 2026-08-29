@@ -1228,9 +1228,14 @@ Deno.test("disk deletion collects the chain, not just the attached leaf", async 
   assertEquals(at > 0, true);
   const body = src.slice(at, at + 900);
   assertStringIncludes(body, "ParentPath");
-  assertStringIncludes(body, "Select-Object -Unique");
   // And the whole collection must precede the removal.
   assertEquals(at < src.indexOf("Remove-VM -VM $vm -Force"), true);
+  // Dedup must come AFTER the self-duplicate guard. Collapsing the list first
+  // made that guard structurally incapable of ever firing, since it would
+  // have been reading a list with the duplicates already removed.
+  const dedup = src.indexOf("Select-Object -Unique");
+  const dupGuard = src.indexOf("$selfDup += $n");
+  assertEquals(dedup > dupGuard && dupGuard > 0, true);
 });
 
 Deno.test("a pass-through disk is skipped, not treated as a broken chain", async () => {

@@ -1627,7 +1627,9 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
   const ps = `${resolveOneVm(args.vmName)}
 $name = $vm.Name
 $allowForce = ${args.confirmForcePowerOff ? "$true" : "$false"}
-# Get-VMHardDiskDrive reports the file the drive is CURRENTLY attached to.
+${
+    args.deleteDisks
+      ? `# Get-VMHardDiskDrive reports the file the drive is CURRENTLY attached to.
 # The moment a VM has a checkpoint, Hyper-V repoints that drive at an
 # automatic differencing disk (.avhdx) and the base .vhdx -- the file holding
 # the data anyone cares about -- becomes a read-only parent further up the
@@ -1659,7 +1661,10 @@ foreach ($attached in @(Get-VMHardDiskDrive -VM $vm | Select-Object -ExpandPrope
     $depth++
   }
 }
-$disks = @($disks | Select-Object -Unique)
+# NOT deduplicated here. The self-duplicate guard below exists to notice the
+# same file attached twice, and collapsing the list first made that guard
+# structurally incapable of ever firing -- it would have been reading a list
+# with the duplicates already removed.
 # A VHDX can be attached to more than one VM -- shared disks, differencing
 # chains, or simply the same file added twice. Deleting this VM's disks would
 # then destroy storage another machine is still using, and Remove-Item has no
@@ -1716,7 +1721,9 @@ function Get-OtherDiskSet {
 function Normalise-Path([string]$p) {
   try { return [System.IO.Path]::GetFullPath($p) } catch { return $p }
 }
-$othersDisks = Get-OtherDiskSet
+$othersDisks = Get-OtherDiskSet`
+      : "# Disks are staying: no chain is walked and no ownership judged. An\n# unreadable VHD chain must not block an operation that never asked to\n# touch a disk."
+  }
 $shared = @($disks | Where-Object { $othersDisks.Contains((Normalise-Path $_)) })
 # The same file attached twice to THIS VM is the other half of the promise the
 # README makes, and it was never implemented. Left undetected, the first pass
@@ -1728,6 +1735,9 @@ foreach ($d in $disks) {
   $n = Normalise-Path $d
   if (-not $selfSeen.Add($n)) { $selfDup += $n }
 }
+# Collapse only NOW, after the guard above has had a chance to see the
+# duplicates. The removal loop should then visit each file once.
+$disks = @($disks | Select-Object -Unique)
 $state = $vm.State.ToString()
 # The acknowledgement is enforced HERE, not only before the call. Checking
 # state in one SSH round trip and powering off in a later one leaves a window
@@ -1787,9 +1797,19 @@ for ($i = 0; $i -lt $disks.Count; $i++) {
   if ($blocked) {
     $ok = $false
   } else {
-    try { Remove-Item -LiteralPath $d -Force -ErrorAction Stop; $ok = $true } catch { $ok = $false }
-    # Verify absence rather than trusting the call.
-    if (Test-Path -LiteralPath $d) { $ok = $false }
+    if (-not (Test-Path -LiteralPath $d)) {
+      # Already gone, and that is the outcome this method wanted. Hyper-V's
+      # own cleanup removes automatic differencing disks when the VM and its
+      # checkpoints go, so by the time this loop runs some files legitimately
+      # no longer exist. The old form reported those as a failed removal and
+      # said they were "still on disk" -- about a file that was not.
+      $ok = $true
+    } else {
+      try { Remove-Item -LiteralPath $d -Force -ErrorAction Stop; $ok = $true } catch { $ok = $false }
+      # Verify absence rather than trusting the call. Note this can only turn
+      # a claimed success into a failure, never the reverse.
+      if (Test-Path -LiteralPath $d) { $ok = $false }
+    }
   }
   $results += [pscustomobject]@{ index = $i; removed = $ok }
 }`
