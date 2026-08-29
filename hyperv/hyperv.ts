@@ -182,6 +182,26 @@ export const RemoteText = (max: number) =>
       return true;
     }, { message: "value must not contain unpaired surrogate code units" });
 
+/**
+ * A physical measurement from the host: finite, and inside the range the
+ * hardware could actually produce.
+ *
+ * `z.number()` alone accepts -99999999 seconds of uptime and 1e308 bytes of
+ * memory -- both schema-valid, both nonsense, both written straight into a
+ * resource. zod does reject Infinity, so that vector was already closed, but
+ * "large finite absurdity" was not. The bounds are deliberately generous
+ * (roughly a petabyte of RAM, a century of uptime, 4096 processors): they are
+ * there to catch a broken or hostile response, not to predict hardware.
+ *
+ * This file already had `num()` for exactly this purpose, with a comment
+ * explaining the failure it prevents -- and it was never called from the
+ * production path. A guard that exists and is not wired up is worse than one
+ * that was never written, because reading the file suggests the problem is
+ * handled.
+ */
+export const Measure = (min: number, max: number) =>
+  z.number().finite().min(min).max(max);
+
 export const GlobalArgsSchema = z.object({
   host: z
     .string()
@@ -510,13 +530,23 @@ async function runPowerShell(
   // status, and reporting a caller cancellation or a local timeout as
   // "powershell over ssh failed" sends whoever is debugging to the wrong
   // machine entirely.
-  if (signal.aborted) {
-    throw new Error("cancelled before the remote command completed");
-  }
-  if (timedOut.aborted) {
-    throw new Error(
-      `timed out locally after ${g.timeoutSec + 10}s waiting for the host`,
-    );
+  //
+  // But only when the command did NOT finish. Promise.all above resolves only
+  // once child.status has, so by the time control reaches here the process has
+  // already exited -- possibly cleanly, with a complete and valid response
+  // sitting in stdoutRaw. A cancellation that fires in that same window says
+  // nothing about the remote work, which demonstrably completed. Claiming
+  // "cancelled before the remote command completed" would then be specifically
+  // false, and for a mutation it would throw away the proof that it succeeded.
+  if (status.code !== 0) {
+    if (signal.aborted) {
+      throw new Error("cancelled before the remote command completed");
+    }
+    if (timedOut.aborted) {
+      throw new Error(
+        `timed out locally after ${g.timeoutSec + 10}s waiting for the host`,
+      );
+    }
   }
   const stdout = new TextDecoder().decode(stdoutRaw).trim();
   if (status.code !== 0) {
@@ -672,6 +702,12 @@ export function asArray(raw: string): Record<string, unknown>[] {
  */
 export function slugPart(raw: string): string {
   return raw
+    // NFC first. "café" spelled with a combining accent and "café" spelled
+    // with a precomposed one render identically and are different strings, so
+    // a host alternating between the forms would produce two unrelated
+    // records for one machine -- identity fragmentation rather than a
+    // collision, but still a lie about how many VMs exist.
+    .normalize("NFC")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
@@ -745,7 +781,12 @@ export function matchCheckpoints<T extends { Name: string }>(
 }
 
 export function frameParts(parts: string[]): string {
-  return parts.map((p) => `${p.length}:${p}`).join("");
+  // Normalised here too, so the digest agrees with the slug about what counts
+  // as the same name.
+  return parts.map((p) => {
+    const n = p.normalize("NFC");
+    return `${n.length}:${n}`;
+  }).join("");
 }
 
 /**
@@ -801,8 +842,8 @@ export const PsVmHostRow = z.object({
   // zero memory is not a plausible reading of reality; the schema accepted it
   // anyway, which is the gap between saying a thing and enforcing it. A
   // hypervisor with no processors or no memory is a failed query.
-  LogicalProcessorCount: z.number().int().positive(),
-  MemoryCapacity: z.number().positive(),
+  LogicalProcessorCount: z.number().int().positive().max(4096),
+  MemoryCapacity: Measure(1, 1.2e15),
   VirtualMachinePath: RemoteText(4096).min(1),
 });
 
@@ -816,15 +857,15 @@ export const PsVmRow = z.object({
   Status: RemoteText(256),
   // Hyper-V has exactly two generations. Anything else is not a VM record.
   Generation: z.union([z.literal(1), z.literal(2)]),
-  ProcessorCount: z.number().int().positive(),
-  MemoryAssigned: z.number().nonnegative(),
+  ProcessorCount: z.number().int().positive().max(4096),
+  MemoryAssigned: Measure(0, 1.2e15),
   // A .NET TimeSpan, serialised as an OBJECT carrying TotalSeconds -- not a
   // number and not a string. Typed, rather than left unknown and narrowed by
   // hand at the read, which is where a wrong assumption used to survive.
   // Required. `optional()` let a response that omitted uptime entirely read
   // as "uptime unknown" rather than "this response is incomplete", which is
   // the same class of lie as a zeroed memory capacity.
-  Uptime: z.object({ TotalSeconds: z.number() }).nullable(),
+  Uptime: z.object({ TotalSeconds: Measure(0, 3.2e9) }).nullable(),
 });
 
 export const PsSwitchRow = z.object({
@@ -850,8 +891,14 @@ export const PsSwitchRow = z.object({
  */
 export const DiscoverEnvelope = z.object({
   host: PsVmHostRow,
-  vms: z.array(PsVmRow),
-  switches: z.array(PsSwitchRow),
+  // Bounded. The only previous limit was the 4 MiB transcript cap, and a
+  // minimal valid VM object is about 100 bytes -- so one response could carry
+  // tens of thousands of individually-clean records, each one an awaited
+  // write with its own resource ID. Every record valid, the aggregate a
+  // datastore flood. A host with more than 2048 VMs or 512 switches is not
+  // one this model should be quietly writing down.
+  vms: z.array(PsVmRow).max(2048),
+  switches: z.array(PsSwitchRow).max(512),
 });
 
 /** The state probe. `state` must be present; only its VALUE may be null. */
@@ -922,9 +969,19 @@ export const PsStateRow = z.object({
   state: RemoteText(64).min(1).nullable(),
 });
 
-/** ISO-8601 as PowerShell emits it, anchored so a prefix cannot pass. */
+/**
+ * ISO-8601 as PowerShell emits it, anchored so a prefix cannot pass -- and
+ * with the zone REQUIRED.
+ *
+ * It was optional, and `new Date("2026-01-01T23:30:00")` parses a zone-less
+ * string as the executing process's LOCAL time. The stored `createdAt` then
+ * silently depended on where the sweep happened to run and whether it was
+ * daylight saving, while reading like authoritative UTC to anyone looking at
+ * the datastore. A five-hour shift that rolls the calendar day is not a
+ * rounding difference.
+ */
 export const ISO_DATE =
-  /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/;
+  /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/;
 
 export const PsCheckpointRow = z.object({
   VMName: SafeName,
@@ -937,7 +994,15 @@ export const PsCheckpointRow = z.object({
   // Shape AND value. `2026-13-45T99:99:99Z` matches the pattern and is not a
   // date; letting it through meant dotNetDate returned null and the record
   // said "no creation time" for a response that was actually malformed.
-  CreationTime: z.string().refine((v) => dotNetDate(v) !== null, {
+  CreationTime: z.string().refine((v) => {
+    const iso = dotNetDate(v);
+    if (iso === null) return false;
+    // `/Date(8640000000000000)/` is a real instant -- the maximum JS can
+    // represent -- and decodes to the year 275760. Real is not the same as
+    // plausible for a checkpoint on a running hypervisor.
+    const y = Number(iso.slice(0, 4));
+    return y >= 2000 && y <= 2200;
+  }, {
     message:
       "CreationTime must be a .NET /Date(ms)/ or ISO-8601 value that names a " +
       "real instant",
@@ -953,7 +1018,7 @@ export const PsCheckpointRow = z.object({
  * response missing the field must not read as "none, therefore verified".
  */
 export const CheckpointEnvelope = z.object({
-  checkpoints: z.array(PsCheckpointRow),
+  checkpoints: z.array(PsCheckpointRow).max(1024),
 });
 
 /**
@@ -1086,7 +1151,11 @@ $sw = @(Get-VMSwitch | Select-Object Name,SwitchType)
           memoryAssignedBytes: v.MemoryAssigned,
           uptimeSeconds: up ? up.TotalSeconds : null,
         },
-        { tags: { state: v.State } },
+        // The tag gets the screened form. A tag is a queryable index, and
+        // RemoteText does not carry SafeName's wildcard refusal, so a state of
+        // "*" or one full of glob metacharacters would otherwise land in it.
+        // The raw string is still stored in the attribute above.
+        { tags: { state: safeState(v.State) } },
       ),
     );
   }
@@ -1393,12 +1462,23 @@ async function checkpoint(
     g,
     `${resolveOneVm(args.vmName)}
 # Refuse a duplicate in the same call that creates, not one round trip earlier.
-# Query through $vm, not by name again, and let a failed query FAIL. With
-# SilentlyContinue a permission, provider or storage error came back as an
-# empty list and was read as "no duplicate", after which this mutated anyway.
-$existing = @(Get-VMSnapshot -VM $vm -Name ${
-      psQuote(args.name)
-    } -ErrorAction Stop)
+# Ask for the LIST and filter here, rather than asking for a name that by
+# definition should not exist yet.
+#
+# Get-VMSnapshot -Name follows the same convention as Get-VM -Name, which this
+# file already had to work around twice: it FAILS when nothing matches rather
+# than returning empty. Combined with -ErrorAction Stop that made the normal
+# case -- a genuinely new checkpoint name -- a terminating error, so every
+# legitimate checkpoint would have failed and only an actual collision would
+# have proceeded. Exactly backwards, and it would have failed on first real
+# use rather than in review.
+#
+# Listing without -Name returns empty for a VM with no checkpoints without
+# throwing, so a genuine failure still propagates while mere absence does not.
+# That keeps the earlier requirement -- a suppressed error must never read as
+# "no duplicate" -- without manufacturing the failure it was guarding against.
+$all = @(Get-VMSnapshot -VM $vm)
+$existing = @($all | Where-Object { $_.Name -eq ${psQuote(args.name)} })
 if ($existing.Count -ne 0) {
   throw "a checkpoint with that name already exists on this VM"
 }
@@ -1454,7 +1534,8 @@ async function restoreCheckpoint(
 # earlier round trip left a window in which a second case-variant checkpoint
 # could appear, and Restore-VMSnapshot would then roll back to whichever it
 # matched -- discarding a different span of work than was acknowledged.
-$snaps = @(Get-VMSnapshot -VM $vm -Name ${psQuote(args.name)})
+$all = @(Get-VMSnapshot -VM $vm)
+$snaps = @($all | Where-Object { $_.Name -eq ${psQuote(args.name)} })
 if ($snaps.Count -ne 1) {
   throw "expected exactly one checkpoint matching the given name, found $($snaps.Count)"
 }
@@ -1498,7 +1579,8 @@ async function removeCheckpoint(
     g,
     `${resolveOneVm(args.vmName)}
 # Same reason as restore: the check and the deletion have to be one operation.
-$snaps = @(Get-VMSnapshot -VM $vm -Name ${psQuote(args.name)})
+$all = @(Get-VMSnapshot -VM $vm)
+$snaps = @($all | Where-Object { $_.Name -eq ${psQuote(args.name)} })
 if ($snaps.Count -ne 1) {
   throw "expected exactly one checkpoint matching the given name, found $($snaps.Count)"
 }
@@ -1545,7 +1627,39 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
   const ps = `${resolveOneVm(args.vmName)}
 $name = $vm.Name
 $allowForce = ${args.confirmForcePowerOff ? "$true" : "$false"}
-$disks = @(Get-VMHardDiskDrive -VM $vm | Select-Object -ExpandProperty Path)
+# Get-VMHardDiskDrive reports the file the drive is CURRENTLY attached to.
+# The moment a VM has a checkpoint, Hyper-V repoints that drive at an
+# automatic differencing disk (.avhdx) and the base .vhdx -- the file holding
+# the data anyone cares about -- becomes a read-only parent further up the
+# chain. So on any checkpointed VM this list named the wrong files: the
+# .avhdx, which Remove-VM was about to clean up anyway (reporting a false
+# deletion failure for a file already gone), while the real disk was never in
+# the set at all and would have survived, orphaned and unaccounted for, with
+# the method still reporting success.
+#
+# Collect each attached disk AND every parent behind it, so the set is the
+# storage this VM actually owns. Shared and self-duplicate checks below then
+# apply to the whole chain, which is what stops a base disk another VM
+# depends on from going with it.
+$disks = @()
+foreach ($attached in @(Get-VMHardDiskDrive -VM $vm | Select-Object -ExpandProperty Path)) {
+  if (-not $attached) { continue }
+  $cur = $attached
+  $depth = 0
+  while ($cur) {
+    $disks += $cur
+    if ($depth -ge 32) {
+      throw "differencing chain deeper than 32 links; refusing to judge disk ownership"
+    }
+    $next = $null
+    try { $next = (Get-VHD -Path $cur -ErrorAction Stop).ParentPath }
+    catch { throw "cannot inspect this VM's disk chain; refusing to delete disks" }
+    if (-not $next -or $next -eq $cur) { break }
+    $cur = $next
+    $depth++
+  }
+}
+$disks = @($disks | Select-Object -Unique)
 # A VHDX can be attached to more than one VM -- shared disks, differencing
 # chains, or simply the same file added twice. Deleting this VM's disks would
 # then destroy storage another machine is still using, and Remove-Item has no
@@ -1563,6 +1677,12 @@ function Get-OtherDiskSet {
   # depth bound so a corrupt or circular chain cannot spin here forever.
   foreach ($p in @(Get-VM | Where-Object { $_.Name -ne $name } |
       Get-VMHardDiskDrive | Select-Object -ExpandProperty Path)) {
+    # A pass-through (physical) disk has no Path -- it is addressed by disk
+    # number -- so there is no file to protect and nothing to walk. Skipping
+    # it is correct; feeding $null to Get-VHD is a parameter-binding failure
+    # that the fail-closed catch below would turn into a host-wide refusal to
+    # delete ANY VM's disks, for a disk that was never a file.
+    if (-not $p) { continue }
     $cur = $p
     $depth = 0
     while ($cur) {
@@ -1648,8 +1768,23 @@ for ($i = 0; $i -lt $disks.Count; $i++) {
   # Per iteration, not once before the loop. A single snapshot ahead of the
   # loop is the same non-atomic check this was supposed to replace, just
   # slightly later -- and the window grows with every disk deleted.
-  $current = Get-OtherDiskSet
-  if ($current.Contains((Normalise-Path $d))) {
+  # Past the point of no return, this loop must never THROW. Get-OtherDiskSet
+  # fails closed by design -- an unreadable differencing chain refuses rather
+  # than guesses -- which is right BEFORE Remove-VM and catastrophic after it:
+  # a transient Get-VHD failure on some unrelated VM's storage would abort the
+  # whole script with the VM already gone and disks already deleted, returning
+  # nothing but a generic transport error. The caller would not learn the VM
+  # was destroyed, nor which disks went with it. So here a failed re-check
+  # means "do not delete this one", recorded and reported, not "abandon
+  # everything mid-way".
+  $blocked = $false
+  try {
+    $current = Get-OtherDiskSet
+    if ($current.Contains((Normalise-Path $d))) { $blocked = $true }
+  } catch {
+    $blocked = $true
+  }
+  if ($blocked) {
     $ok = $false
   } else {
     try { Remove-Item -LiteralPath $d -Force -ErrorAction Stop; $ok = $true } catch { $ok = $false }
@@ -1668,8 +1803,27 @@ for ($i = 0; $i -lt $disks.Count; $i++) {
     "disk deletion envelope",
   );
 
-  // Read back rather than trust the cmdlet.
-  const after = await vmState(g, args.vmName, ctx.signal);
+  // Read back rather than trust the cmdlet -- but do not let the READ-BACK's
+  // own failure erase what the envelope above already proved.
+  //
+  // By this line Remove-VM has run and the disk results have been parsed and
+  // validated, so the destructive work is done and accounted for. The check
+  // below is a separate SSH round trip on a fresh process, and it can fail on
+  // its own merits: a transport blip, a timeout. Letting that bubble up bare
+  // would report an irreversible success as an unresolved failure, and throw
+  // away the per-disk evidence sitting right here.
+  let after: string | null;
+  try {
+    after = await vmState(g, args.vmName, ctx.signal);
+  } catch (e) {
+    throw new Error(
+      `${args.vmName} WAS deleted and its disks were accounted for ` +
+        `(${envelope.results.filter((r) => r.removed).length}/` +
+        `${envelope.diskCount} removed), but the confirming read failed: ` +
+        `${e instanceof Error ? e.message : "unknown error"}. No further ` +
+        `action is needed for the VM itself.`,
+    );
+  }
   if (after !== null) {
     throw new Error(
       `delete did not take: ${args.vmName} still present (${safeState(after)})`,

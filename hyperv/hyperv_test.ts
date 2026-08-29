@@ -1027,3 +1027,218 @@ Deno.test("a genuine read failure is not swallowed as an overflow", async () => 
   assertStringIncludes(src, "reading the remote response failed");
   assertEquals(src.includes("} catch {\n    // The stream dies"), false);
 });
+
+// --- adversarial pass: concurrency and partial failure --------------------
+
+Deno.test("nothing past the point of no return may throw", async () => {
+  // Get-OtherDiskSet fails CLOSED by design, which is right before
+  // Remove-VM and catastrophic after it: a transient Get-VHD failure on an
+  // unrelated VM would abort the script with the VM already gone and disks
+  // already deleted, returning only a generic transport error. The caller
+  // would never learn the VM was destroyed.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  const removal = src.indexOf("Remove-VM -VM $vm -Force");
+  const after = src.slice(removal);
+  const loop = after.indexOf("for ($i = 0; $i -lt $disks.Count");
+  assertEquals(loop > 0, true);
+  // The ownership re-check inside the loop must be wrapped.
+  const body = after.slice(loop, loop + 1200);
+  assertStringIncludes(body, "try {");
+  assertStringIncludes(body, "$blocked = $true");
+});
+
+Deno.test("a finished command is never reported as cancelled", async () => {
+  // Promise.all resolves only once child.status has, so the process has
+  // already exited by then -- possibly cleanly, with a valid response in
+  // hand. A cancellation firing in that window says nothing about the
+  // remote work, and for a mutation would discard the proof it succeeded.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  // Target the THROW, not the comment that explains it.
+  const at = src.indexOf(
+    'throw new Error("cancelled before the remote command completed")',
+  );
+  assertEquals(at > 0, true);
+  // The abort classification must sit inside a non-zero-exit branch, so a
+  // clean exit with a valid response is never relabelled as a cancellation.
+  const before = src.slice(Math.max(0, at - 400), at);
+  assertStringIncludes(before, "status.code !== 0");
+});
+
+Deno.test("an irreversible success is never reported as a bare failure", async () => {
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  // If the confirming read fails, the message must still say the VM was
+  // deleted -- the envelope already proved it one line earlier.
+  assertStringIncludes(src, "WAS deleted and its disks were accounted for");
+});
+
+// --- adversarial pass: the compromised host --------------------------------
+
+Deno.test("measurements must be finite and physically possible", () => {
+  const vm = {
+    Name: "vm1",
+    State: "Running",
+    Status: "OK",
+    Generation: 2,
+    ProcessorCount: 1,
+    MemoryAssigned: 1,
+  };
+  // A VM running for a negative amount of time, or 1e308 seconds.
+  assertEquals(
+    PsVmRow.safeParse({ ...vm, Uptime: { TotalSeconds: -99999999 } }).success,
+    false,
+  );
+  assertEquals(
+    PsVmRow.safeParse({ ...vm, Uptime: { TotalSeconds: 1e308 } }).success,
+    false,
+  );
+  assertEquals(
+    PsVmRow.safeParse({ ...vm, Uptime: { TotalSeconds: 3600 } }).success,
+    true,
+  );
+  // A hypervisor with 9007199254740991 processors is a broken response.
+  const host = {
+    Name: "hv1",
+    LogicalProcessorCount: 8,
+    MemoryCapacity: 1,
+    VirtualMachinePath: "C:\\VMs",
+  };
+  assertEquals(
+    PsVmHostRow.safeParse({ ...host, LogicalProcessorCount: 9007199254740991 })
+      .success,
+    false,
+  );
+  assertEquals(
+    PsVmHostRow.safeParse({ ...host, MemoryCapacity: 1e308 }).success,
+    false,
+  );
+});
+
+Deno.test("a timestamp without a zone is refused, not localised", () => {
+  // new Date("2026-01-01T23:30:00") parses as the PROCESS LOCAL time, so a
+  // zone-less value made createdAt depend on where the sweep ran and
+  // whether it was daylight saving -- while reading as authoritative UTC.
+  assertEquals(dotNetDate("2026-01-01T23:30:00"), null);
+  assertEquals(
+    dotNetDate("2026-01-01T23:30:00Z"),
+    "2026-01-01T23:30:00.000Z",
+  );
+  assertEquals(
+    dotNetDate("2026-01-01T23:30:00+05:00"),
+    "2026-01-01T18:30:00.000Z",
+  );
+});
+
+Deno.test("a real instant still has to be a plausible one", () => {
+  const base = {
+    VMName: "vm1",
+    Name: "cp",
+    CheckpointType: "Standard",
+    ParentSnapshotName: null,
+  };
+  // The maximum instant JS can represent decodes to the year 275760.
+  assertEquals(
+    PsCheckpointRow.safeParse({
+      ...base,
+      CreationTime: "/Date(8640000000000000)/",
+    }).success,
+    false,
+  );
+  assertEquals(
+    PsCheckpointRow.safeParse({
+      ...base,
+      CreationTime: "/Date(1767225600000)/",
+    }).success,
+    true,
+  );
+});
+
+Deno.test("one response cannot flood the datastore", () => {
+  // Every record individually clean, the aggregate a flood: the only
+  // previous limit was a 4 MiB transcript cap and a minimal VM object is
+  // about 100 bytes.
+  const vm = {
+    Name: "vm1",
+    State: "Running",
+    Status: "OK",
+    Generation: 2,
+    ProcessorCount: 1,
+    MemoryAssigned: 1,
+    Uptime: null,
+  };
+  const many = Array.from({ length: 2049 }, (_, i) => ({
+    ...vm,
+    Name: `vm${i}`,
+  }));
+  assertEquals(
+    DiscoverEnvelope.safeParse({
+      host: {
+        Name: "hv1",
+        LogicalProcessorCount: 8,
+        MemoryCapacity: 1,
+        VirtualMachinePath: "C:\\VMs",
+      },
+      vms: many,
+      switches: [],
+    }).success,
+    false,
+  );
+});
+
+Deno.test("two spellings of one name are one record", () => {
+  // NFC vs NFD render identically. Without normalisation a host could
+  // alternate forms and make one machine appear as two.
+  const nfc: string = "caf\u00e9-01";
+  const nfd: string = "cafe\u0301-01";
+  // Distinct strings, identical to a reader.
+  assertEquals(nfc.length === nfd.length, false);
+  assertEquals(slugPart(nfc), slugPart(nfd));
+  assertEquals(frameParts([nfc]), frameParts([nfd]));
+});
+
+// --- adversarial pass: Windows and PowerShell semantics -------------------
+
+Deno.test("checkpoint probes list and filter, never -Name a new name", async () => {
+  // Get-VMSnapshot -Name follows Get-VM -Name: it FAILS when nothing
+  // matches rather than returning empty. With -ErrorAction Stop that made
+  // the normal case -- a genuinely new checkpoint name -- a terminating
+  // error, so every legitimate checkpoint would have failed and only a
+  // real collision would have proceeded. Exactly backwards.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  assertEquals(src.includes("Get-VMSnapshot -VM $vm -Name"), false);
+  assertStringIncludes(src, "$all = @(Get-VMSnapshot -VM $vm)");
+});
+
+Deno.test("disk deletion collects the chain, not just the attached leaf", async () => {
+  // A checkpointed VM has its drive repointed at an .avhdx; the base .vhdx
+  // holding the data becomes a read-only parent. Collecting only the
+  // attached path meant deleting the wrong file and orphaning the right
+  // one, while still reporting success.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  const at = src.indexOf("foreach ($attached in");
+  assertEquals(at > 0, true);
+  const body = src.slice(at, at + 900);
+  assertStringIncludes(body, "ParentPath");
+  assertStringIncludes(body, "Select-Object -Unique");
+  // And the whole collection must precede the removal.
+  assertEquals(at < src.indexOf("Remove-VM -VM $vm -Force"), true);
+});
+
+Deno.test("a pass-through disk is skipped, not treated as a broken chain", async () => {
+  // Physical disks are addressed by number and have no Path. Feeding null
+  // to Get-VHD is a binding failure that the fail-closed catch would turn
+  // into a host-wide refusal to delete ANY VM\u0027s disks.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  assertStringIncludes(src, "if (-not $p) { continue }");
+});
