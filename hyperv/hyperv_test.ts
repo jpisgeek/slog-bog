@@ -32,6 +32,7 @@ import {
   num,
   parseRow,
   PART_SEP,
+  PsCheckpointRow,
   psQuote,
   PsStateRow,
   PsVmHostRow,
@@ -634,4 +635,71 @@ Deno.test("invisible characters cannot enter a name", () => {
   for (const bad of bads) {
     assertEquals(VmNameArgs.safeParse({ vmName: bad }).success, false);
   }
+});
+
+// --- security review round 7 ---------------------------------------------
+
+Deno.test("disk proof requires coverage, not just a matching count", () => {
+  // Three results for three disks can still be indices 0, 0, 1 -- the
+  // totals agree while disk 2 is unaccounted for.
+  const dup = DiskDeleteEnvelope.parse({
+    diskCount: 3,
+    results: [
+      { index: 0, removed: true },
+      { index: 0, removed: true },
+      { index: 1, removed: true },
+    ],
+  });
+  const seen = new Set(dup.results.map((r) => r.index));
+  assertEquals(seen.size === dup.diskCount, false);
+});
+
+Deno.test("uptime and parent are required, not optional", () => {
+  // optional() let a response that omitted the field read as "unknown"
+  // rather than "incomplete" -- the same lie as a zeroed capacity.
+  assertThrows(
+    () =>
+      parseRow(PsVmRow, {
+        Name: "vm1",
+        State: "Running",
+        Status: "OK",
+        Generation: 2,
+        ProcessorCount: 1,
+        MemoryAssigned: 1,
+      }, "VM record"),
+    Error,
+    "did not match the expected shape",
+  );
+  // A null uptime is legitimate for a stopped machine.
+  const ok = parseRow(PsVmRow, {
+    Name: "vm1",
+    State: "Off",
+    Status: "OK",
+    Generation: 2,
+    ProcessorCount: 1,
+    MemoryAssigned: 1,
+    Uptime: null,
+  }, "VM record");
+  assertEquals(ok.Uptime, null);
+});
+
+Deno.test("a root checkpoint has no parent, a broken row has no field", () => {
+  const root = parseRow(PsCheckpointRow, {
+    VMName: "vm1",
+    Name: "base",
+    CheckpointType: "Standard",
+    CreationTime: "2026-01-01T00:00:00Z",
+    ParentSnapshotName: null,
+  }, "checkpoint record");
+  assertEquals(root.ParentSnapshotName, null);
+  assertThrows(
+    () =>
+      parseRow(PsCheckpointRow, {
+        VMName: "vm1",
+        Name: "base",
+        CheckpointType: "Standard",
+        CreationTime: "2026-01-01T00:00:00Z",
+      }, "checkpoint record"),
+    Error,
+  );
 });

@@ -690,7 +690,10 @@ export const PsVmRow = z.object({
   // A .NET TimeSpan, serialised as an OBJECT carrying TotalSeconds -- not a
   // number and not a string. Typed, rather than left unknown and narrowed by
   // hand at the read, which is where a wrong assumption used to survive.
-  Uptime: z.object({ TotalSeconds: z.number() }).nullable().optional(),
+  // Required. `optional()` let a response that omitted uptime entirely read
+  // as "uptime unknown" rather than "this response is incomplete", which is
+  // the same class of lie as a zeroed memory capacity.
+  Uptime: z.object({ TotalSeconds: z.number() }).nullable(),
 });
 
 export const PsSwitchRow = z.object({
@@ -790,7 +793,9 @@ export const PsCheckpointRow = z.object({
   // Either the /Date(ms)/ form PowerShell emits or an ISO string, depending
   // on how it was serialised. Both are strings; anything else is a bug.
   CreationTime: z.string(),
-  ParentSnapshotName: z.string().nullable().optional(),
+  // Required, nullable. A root checkpoint genuinely has no parent; a
+  // response that omits the field has not told us either way.
+  ParentSnapshotName: SafeName.nullable(),
 });
 
 /**
@@ -1132,7 +1137,9 @@ async function start(args: z.infer<typeof VmNameArgs>, ctx: Ctx) {
   );
   const after = await vmState(g, args.vmName, ctx.signal);
   if (after !== "Running") {
-    throw new Error(`start did not take: ${args.vmName} is ${after}`);
+    throw new Error(
+      `start did not take: ${args.vmName} is ${safeState(after)}`,
+    );
   }
   ctx.logger.info(
     `${args.vmName}: ${safeState(before)} -> ${safeState(after)}`,
@@ -1218,6 +1225,26 @@ async function restoreCheckpoint(
   if ((await vmState(g, args.vmName, ctx.signal)) === null) {
     throw new Error(`no VM named ${args.vmName}`);
   }
+
+  // Restore is the least reversible verb here, so it gets the same
+  // one-target requirement the other checkpoint methods have. Under
+  // PowerShell's case-insensitive matching, "Nightly" and "nightly" are both
+  // candidates; rolling back to whichever the host happened to pick would
+  // discard a different span of work than the caller acknowledged.
+  const candidates = matchCheckpoints(
+    await listCheckpoints(g, args.vmName, ctx.signal),
+    args.name,
+  );
+  if (candidates.length === 0) {
+    throw new Error(`${args.vmName} has no checkpoint named ${args.name}`);
+  }
+  if (candidates.length > 1) {
+    throw new Error(
+      `${args.vmName} has ${candidates.length} checkpoints matching ` +
+        `${args.name} case-insensitively; refusing to guess which span of ` +
+        `work to discard`,
+    );
+  }
   await runPowerShell(
     g,
     `$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';Restore-VMSnapshot -VMName ${
@@ -1290,7 +1317,9 @@ async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
   // the host, using the state it sees at the moment it acts.
   if (before !== "Off" && !args.confirmForcePowerOff) {
     throw new Error(
-      `${args.vmName} is ${before}. Deleting it cuts power with no graceful ` +
+      `${args.vmName} is ${
+        safeState(before)
+      }. Deleting it cuts power with no graceful ` +
         `shutdown, risking the guest filesystem. Stop it first, or pass ` +
         `confirmForcePowerOff to accept that.`,
     );
@@ -1306,6 +1335,16 @@ $ProgressPreference='SilentlyContinue'
 $name = ${psQuote(args.vmName)}
 $allowForce = ${args.confirmForcePowerOff ? "$true" : "$false"}
 $disks = @(Get-VMHardDiskDrive -VMName $name | Select-Object -ExpandProperty Path)
+# A VHDX can be attached to more than one VM -- shared disks, differencing
+# chains, or simply the same file added twice. Deleting this VM's disks would
+# then destroy storage another machine is still using, and Remove-Item has no
+# idea it is doing that. Collect every path attached to any OTHER VM and treat
+# those as untouchable.
+$othersDisks = @(
+  Get-VM | Where-Object { $_.Name -ne $name } |
+    Get-VMHardDiskDrive | Select-Object -ExpandProperty Path
+)
+$shared = @($disks | Where-Object { $othersDisks -contains $_ })
 $state = (Get-VM -Name $name).State.ToString()
 # The acknowledgement is enforced HERE, not only before the call. Checking
 # state in one SSH round trip and powering off in a later one leaves a window
@@ -1318,16 +1357,27 @@ if ($state -ne 'Off') {
   }
   Stop-VM -Name $name -TurnOff -Force
 }
+# Order matters: once Remove-VM has run, the attachment information this
+# check depends on no longer exists, so a shared disk would be undetectable
+# at exactly the moment it is about to be deleted.
+${
+    args.deleteDisks
+      ? `if ($shared.Count -gt 0) {
+  throw "refusing to delete: $($shared.Count) of $($disks.Count) disk(s) are attached to another VM"
+}`
+      : ""
+  }
 Remove-VM -Name $name -Force
 $results = @()
 ${
     args.deleteDisks
-      ? `foreach ($d in $disks) {
+      ? `for ($i = 0; $i -lt $disks.Count; $i++) {
+  $d = $disks[$i]
   $ok = $false
   try { Remove-Item -LiteralPath $d -Force -ErrorAction Stop; $ok = $true } catch { $ok = $false }
   # Verify absence rather than trusting the call.
   if (Test-Path -LiteralPath $d) { $ok = $false }
-  $results += [pscustomobject]@{ index = $results.Count; removed = $ok }
+  $results += [pscustomobject]@{ index = $i; removed = $ok }
 }`
       : ""
   }
@@ -1343,7 +1393,7 @@ ${
   const after = await vmState(g, args.vmName, ctx.signal);
   if (after !== null) {
     throw new Error(
-      `delete did not take: ${args.vmName} still present (${after})`,
+      `delete did not take: ${args.vmName} still present (${safeState(after)})`,
     );
   }
 
@@ -1351,11 +1401,19 @@ ${
     const results = envelope.results;
     // Reconcile before judging. Fewer results than disks means the loop did
     // not finish, and an all-`removed` list of the wrong length is not proof.
-    if (results.length !== envelope.diskCount) {
+    // Count alone is not coverage: three results for three disks can still be
+    // indices 0, 0, 1, leaving disk 2 unaccounted for while the totals agree.
+    // Require exactly one result per index over 0..diskCount-1.
+    const seen = new Set(results.map((r) => r.index));
+    const covered = seen.size === envelope.diskCount &&
+      results.length === envelope.diskCount &&
+      [...Array(envelope.diskCount).keys()].every((i) => seen.has(i));
+    if (!covered) {
       throw new Error(
         `${args.vmName} was deleted, but disk removal is unaccounted for: ` +
           `the host reported ${envelope.diskCount} disk(s) and returned ` +
-          `${results.length} result(s)`,
+          `${results.length} result(s) covering ${seen.size} distinct ` +
+          `position(s)`,
       );
     }
     const failed = results.filter((r) => !r.removed).length;
@@ -1383,7 +1441,7 @@ ${
  * WHY CALLER-SUPPLIED NAMES STAY IN ERRORS AND LOGS -- a deliberate decision,
  * recorded here so it is reviewable rather than assumed.
  *
- * Messages like `no VM named web01` name infrastructure, and this model is
+ * Messages like `no VM named <your-vm-name>` name infrastructure, and this model is
  * emphatic elsewhere about not doing that. The distinction is where the string
  * came from. Remote OUTPUT is screened hard: stderr is classified to a fixed
  * verdict, malformed stdout is reported as a byte count, and parse failures

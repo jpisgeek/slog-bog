@@ -45,7 +45,11 @@ caveats: |
   breaks the first time the count changes.
 security: |
   **Transport.** SSH to the host's OpenSSH server, authenticated by whatever
-  identity the ambient agent holds. No credential is read, stored, or accepted
+  identity ssh selects — an agent identity, or an identity file your own ssh
+  configuration names or defaults to. This model narrows ssh to public-key
+  authentication but does not choose the key; that remains yours to configure,
+  and it is listed as an operator decision below rather than a guarantee. No
+  credential is read, stored, or accepted
   as an argument.
 
   **What is written.** Summaries only: names, states, capacity, switch types,
@@ -53,11 +57,14 @@ security: |
   no guest filesystem data.
 
   **What the identifiers themselves reveal.** Resource IDs are not opaque. Each
-  is built as `<kind>--<host>[--<name>[--<name>]]-<sha256>`, where the readable
-  parts are lowercase-slugged versions of the host name, and of the VM, switch
-  or checkpoint name. The host record is the one case with no name component
-  of its own — it is `vmhost--<host>-<sha256>`, because the host *is* the
-  subject rather than something on it. The digest exists to prevent collisions, not to conceal:
+  is built as `<kind>--<target>--<name>[--<name>]-<sha256>`, where `<target>`
+  is the slugged `host:port` you configured — not the name the machine reports
+  about itself, since two machines can answer to one hostname and would then
+  share IDs. The remaining readable parts are lowercase-slugged VM, switch or
+  checkpoint names; checkpoints carry two, the VM and the checkpoint. The host
+  record is `vmhost--<target>--<reported-name>-<sha256>`: scoped by the target
+  like everything else, with the name the host reports about itself as its
+  subject. The digest exists to prevent collisions, not to conceal:
   anyone who can list resource IDs can read your host and VM names out of them.
   Checkpoint resources additionally carry a `vm` tag holding the VM name, and
   VM resources carry a `state` tag. This is deliberate — IDs that cannot be
