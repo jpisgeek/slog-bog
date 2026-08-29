@@ -1169,7 +1169,9 @@ async function stop(args: z.infer<typeof StopArgsSchema>, ctx: Ctx) {
     ctx.signal,
   );
   const after = await vmState(g, args.vmName, ctx.signal);
-  if (after !== "Off") throw new Error(`stop did not take: still ${after}`);
+  if (after !== "Off") {
+    throw new Error(`stop did not take: still ${safeState(after)}`);
+  }
   ctx.logger.info(
     `${args.vmName}: ${safeState(before)} -> ${safeState(after)}`,
   );

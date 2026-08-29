@@ -703,3 +703,14 @@ Deno.test("a root checkpoint has no parent, a broken row has no field", () => {
     Error,
   );
 });
+
+Deno.test("no remote state reaches a message unscreened", async () => {
+  // Three of these were fixed one round and a fourth was missed because it
+  // was worded differently. Assert the property over the source instead of
+  // trusting that every site was found by eye.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  const bare = src.match(/\$\{(?:before|after)\}/g) ?? [];
+  assertEquals(bare.length, 0);
+});
