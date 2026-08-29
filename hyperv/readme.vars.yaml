@@ -64,16 +64,22 @@ security: |
 
   **What the identifiers themselves reveal.** Resource IDs are not opaque. Each
   is built as `<kind>--<target>--<name>[--<name>]-<sha256>`, where `<target>`
-  is the slugged `host:port` you configured — not the name the machine reports
-  about itself, since two machines can answer to one hostname and would then
-  share IDs. The remaining readable parts are lowercase-slugged VM, switch or
+  is the slugged `user@host:port` you configured — **including the login
+  user**, which is therefore readable in every resource ID. The user is part
+  of identity because Hyper-V shows an unprivileged account a subset of what a
+  privileged one sees, so two configurations differing only by account see
+  different inventories and must not overwrite each other. It is the reported
+  machine name that is deliberately *not* used, since two machines can answer
+  to one hostname and would then share IDs. The remaining readable parts are lowercase-slugged VM, switch or
   checkpoint names; checkpoints carry two, the VM and the checkpoint. The host
   record is `vmhost--<target>--<reported-name>-<sha256>`: scoped by the target
   like everything else, with the name the host reports about itself as its
   subject. The digest exists to prevent collisions, not to conceal:
   anyone who can list resource IDs can read your host and VM names out of them.
-  Checkpoint resources additionally carry a `vm` tag holding the VM name, and
-  VM resources carry a `state` tag. This is deliberate — IDs that cannot be
+  Tags carry inventory too: checkpoint resources have a `vm` tag holding the
+  VM name, VM resources have a `state` tag, and the host resource has a
+  `vmCount` tag. Tags are a queryable index rather than an opaque field, so
+  they are part of this exposure and not a footnote to it. This is deliberate — IDs that cannot be
   read are IDs nobody can operate on — but it means the ID namespace is part
   of the inventory exposure described below, not a way around it.
 
