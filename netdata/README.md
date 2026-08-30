@@ -98,7 +98,14 @@ which would be indistinguishable from a real reading of zero. Pruning of
 departed records happens only on a full sweep. A single-node run
 (`--input node=<name>`) never deletes anything. Instance names for alarms and
 mounts carry a hash suffix, so look them up with `swamp data list <model>`
-rather than constructing them.
+rather than constructing them. Node names must stay distinct after
+normalisation, not just as typed: the node record's instance name is
+`node-<slug>`, so `NAS` and `nas`, or `db 1` and `db-1`, name the same record
+and are rejected at the start of the sweep rather than silently overwriting each
+other. A response that is not the shape the endpoint promises -- an `alarms` or
+`charts` value that is not an object, a `/data` row that is not an array -- is
+treated as a failed sub-fetch and carried forward, not read as zero alarms or an
+empty filesystem.
 
 ## Security
 
@@ -109,17 +116,26 @@ the responses too (return no alarms so a firing critical reads as cleared, or
 inject text into the stored `error`/`info` fields). Prefer the SSH transport, or
 HTTPS for anything off a trusted LAN. `url` is restricted to `http(s)` and
 rejected if it embeds userinfo, and it is persisted verbatim as non-sensitive
-data. The SSH transport uses `BatchMode=yes` (unknown host keys fail closed) and
-never assembles a local shell command. Because that rewrite is in the threat
-model, the volume a single agent can impose is bounded as well as its content:
-response bodies are refused above 8 MiB, `maxMountsPerNode` and
+data. Redirects are never followed, on either transport: a 3xx is refused and
+recorded as a failed poll. A configured `https://` URL therefore stays HTTPS --
+previously the agent could answer 302 with an `http://` Location and silently
+downgrade the connection to cleartext, defeating the operator's choice without
+saying so anywhere. The SSH transport uses `BatchMode=yes` (unknown host keys
+fail closed) and never assembles a local shell command. Because that rewrite is
+in the threat model, the volume a single agent can impose is bounded as well as
+its content: response bodies are refused above 8 MiB, `maxMountsPerNode` and
 `maxAlarmsPerNode` cap how many per-mount queries and alarm writes one node can
 drive, and `nodeBudgetSec` caps the wall-clock time its whole poll may take.
 Hitting any of those marks the node degraded and preserves its existing records
-rather than pruning them. Written data: node URL, hostname, OS, Netdata version,
-alarm names/values, mount paths and capacity, plus a free-text `error` field on
-unreachable nodes (a classified failure message, `user@host` and stderr stay in
-the log, not the resource).
+rather than pruning them. Every individual string the agent supplies -- alarm
+name, chart, status, units, the free-text `info`, mount path, hostname, OS and
+version -- is capped at 512 characters and has control characters replaced
+before it is stored or hashed into a record name, so no single field can be
+arbitrarily large and none can carry a raw escape sequence into a terminal or
+forge a colliding record name. Written data: node URL, hostname, OS, Netdata
+version, alarm names/values, mount paths and capacity, plus a free-text `error`
+field on unreachable nodes (a classified failure message, `user@host` and stderr
+stay in the log, not the resource).
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

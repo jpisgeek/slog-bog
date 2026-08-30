@@ -240,6 +240,80 @@ function slug(v: string): string {
 }
 
 /**
+ * Cap on ONE agent-supplied string, whether it is hashed into an instance name
+ * or written into a resource field.
+ *
+ * MAX_RESPONSE_BYTES bounds a whole payload; it does not bound a field. A
+ * single alarm carrying a multi-megabyte `info` string fits inside the 8 MiB
+ * ceiling perfectly well and used to land in the datastore whole, as one
+ * free-text value chosen end to end by an unauthenticated remote. 512
+ * characters is an order of magnitude above any real Netdata alarm name, chart
+ * id, status word, unit or info line.
+ */
+const MAX_AGENT_TEXT = 512;
+
+/**
+ * Normalise one agent-supplied string before it is hashed into an instance
+ * name or written to a resource. Two jobs, one class of problem: an
+ * unauthenticated remote (see the threat model in the GlobalArgsSchema cap
+ * comments) choosing the exact bytes swamp stores.
+ *
+ * 1. C0 controls and DEL become U+FFFD. The load-bearing one is U+001F, the
+ *    separator instanceName() joins identity fields with. That separator's
+ *    entire job is to be a character that cannot occur INSIDE a field, so that
+ *    ["a", "b c"] and ["a b", "c"] cannot hash to the same name. Nothing
+ *    enforced that: an agent that put a literal U+001F in an alarm name could
+ *    craft two distinct alarms that produced one instance name, and the second
+ *    write silently overwrote the first -- a firing CRITICAL could be erased
+ *    by a benign alarm named to collide with it. The rest of the C0 range goes
+ *    with it because a stored field holding a raw NUL, CR or ESC is a
+ *    terminal-escape and reads-as-binary problem for every consumer of this
+ *    data, not only for us.
+ * 2. Length is bounded. See MAX_AGENT_TEXT.
+ *
+ * Idempotent by construction: the truncation marker REPLACES the last kept
+ * character instead of being appended, so the result is exactly
+ * MAX_AGENT_TEXT characters and a second pass changes nothing. That matters
+ * because instanceName() normalises its identity arguments and the write sites
+ * normalise the same values -- if the two disagreed by even one character, a
+ * record's name and its contents would describe different alarms.
+ *
+ * Deliberate trade: two alarms whose names agree in their first 511 characters
+ * now collide. Real Netdata alarm names are tens of characters. An agent able
+ * to mint 512-character alarm names is already choosing the entire alarm
+ * payload wholesale, so the collision hands it nothing it did not already
+ * have -- whereas leaving the field unbounded hands it the datastore.
+ */
+function agentText(v: unknown): string {
+  const s = typeof v === "string"
+    ? v
+    : v === null || v === undefined
+    ? ""
+    : String(v);
+  // deno-lint-ignore no-control-regex
+  const clean = s.replace(/[\u0000-\u001f\u007f]/g, "\uFFFD");
+  return clean.length > MAX_AGENT_TEXT
+    ? clean.slice(0, MAX_AGENT_TEXT - 1) + "\u2026"
+    : clean;
+}
+
+/**
+ * Narrow an unvalidated API field to a plain object, or null if it is anything
+ * else. `(al.alarms ?? {}) as Record<string, unknown>` typechecked but checked
+ * nothing: an agent answering `{"alarms": "xxxxx"}` made Object.entries()
+ * enumerate a STRING, yielding one entry per character -- ["0","x"], ["1","x"]
+ * -- and each of those became a real writeResource call under a real-looking
+ * instance name. An array did the same thing with its indices. A payload whose
+ * shape is not what the endpoint promises is a failed sub-fetch, which this
+ * model already knows how to represent; it is not a reading.
+ */
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === "object" && v !== null && !Array.isArray(v)
+    ? v as Record<string, unknown>
+    : null;
+}
+
+/**
  * Build a collision-safe, filesystem-safe instance name. `slug()` alone is
  * not injective (`db 1` and `db-1` both slug to `db-1`), so every name here
  * also carries a short hash of the *raw*, pre-slug identity fields -- node
@@ -248,13 +322,21 @@ function slug(v: string): string {
  * per node are not, and are exactly the kind of operator-chosen strings
  * that can collide after slugging.
  */
-function instanceName(prefix: string, ...identity: string[]): string {
+function instanceName(prefix: string, ...identity: unknown[]): string {
+  // Normalisation happens HERE and ONLY here, and the parameter is `unknown`
+  // so a caller cannot route around it with a String() of its own. The
+  // separator below only makes the join unambiguous if it cannot occur INSIDE
+  // a field; that guarantee has to hold for every caller that exists now or is
+  // added later, and a call site that forgot would reintroduce the collision
+  // with no type error and no failing parse. agentText() also bounds each
+  // field, so an agent cannot make `raw` arbitrarily large by naming an alarm.
+  const fields = identity.map(agentText);
   // Unit Separator, written as an escape rather than a raw control byte.
   // The join separator must be a character that cannot occur inside an
   // identifier, or ["a","b c"] and ["a b","c"] hash identically. truenas
   // previously used a RAW NUL here, which achieved that but made the file
   // read as binary to grep and to any tool doing exact-text matching.
-  const raw = identity.join("\u001f");
+  const raw = fields.join("\u001f");
   // Build the readable label from EVERY non-empty identity field, not just the
   // first. Taking only the first made the visible part non-discriminating
   // wherever the caller passes a shared scope first: netdata's alarms pass the
@@ -263,9 +345,11 @@ function instanceName(prefix: string, ...identity: string[]): string {
   // unique, but `swamp data list` became unreadable -- which is the entire
   // reason for having a readable part at all.
   // Capped so an unusually long identity cannot produce an unbounded name.
-  // The hash still covers the full raw identity, so uniqueness never depends on
-  // what survives truncation.
-  const parts = identity.filter((s) => s !== "").map(slug).filter((s) =>
+  // The hash covers the whole normalised identity, not just the part that
+  // survives THIS cap, so uniqueness never depends on the readable label.
+  // (agentText() applies its own, far looser, per-field cap upstream; see the
+  // trade recorded there.)
+  const parts = fields.filter((s) => s !== "").map(slug).filter((s) =>
     s !== ""
   );
   const label = parts.length ? parts.join("-").slice(0, LABEL_MAX) : "unnamed";
@@ -563,6 +647,19 @@ async function pollNode(
     if (!Number.isFinite(status) || status === 0) {
       throw new Error(`no HTTP response (connection failure) for ${path}`);
     }
+    // Refuse a redirect explicitly rather than letting it fall through as
+    // "empty response". curl runs without -L so it never FOLLOWS one, but a
+    // 3xx used to land here with an empty body and be reported as
+    // `empty response over ssh`, which is the wrong class entirely -- it says
+    // "the agent answered with nothing" when the agent actually said "go
+    // somewhere else". Same refusal, same wording as the direct path below,
+    // so an operator reads one behaviour across both transports.
+    if (status >= 300 && status < 400) {
+      throw new Error(
+        `redirect refused on ${path} (HTTP ${status}); swamp does not ` +
+          "follow redirects",
+      );
+    }
     if (status >= 400) {
       throw new Error(
         `HTTP ${status} (${classifyStatus(status)}) on ${path}${
@@ -577,12 +674,54 @@ async function pollNode(
   const getDirect = async (path: string): Promise<unknown> => {
     const res = await fetch(`${base}${path}`, {
       headers: { Accept: "application/json" },
+      // Do not let the remote relocate our request. fetch defaults to
+      // redirect: "follow", which silently honoured an `https:` -> `http:`
+      // Location: an operator who deliberately configured HTTPS had the
+      // connection downgraded to cleartext by the server itself, and nothing
+      // in the stored record or the log said so. No credential is ever sent,
+      // but the whole point of the operator choosing https is that the
+      // hostnames, OS/version, alarm text and mount paths in the answer are
+      // not readable on-path -- and a followed redirect gives that away
+      // without asking. "follow" also made the direct path behave differently
+      // from the ssh path, where curl runs without -L.
+      // "manual", not "error": "error" collapses every redirect into an
+      // untyped TypeError with no status, which is undiagnosable in the log.
+      redirect: "manual",
       signal: AbortSignal.any([
         signal,
         budget,
         AbortSignal.timeout(timeoutSec * 1000),
       ]),
     });
+    // A 3xx is a refusal, not a response. Runtimes differ on what a manual
+    // redirect looks like -- some hand back the real 3xx status, some an
+    // opaqueredirect whose status reads 0 -- so check both shapes rather
+    // than trusting one. The Location value is remote-supplied text and the
+    // README's threat model has an on-path party choosing it, so it goes to
+    // the log only; the thrown (and therefore persisted) message carries our
+    // own literals, the path and the status, and nothing from the wire.
+    const redirected = res.type === "opaqueredirect" ||
+      (res.status >= 300 && res.status < 400);
+    if (redirected) {
+      await res.body?.cancel().catch(() => {});
+      logger.warning(
+        "netdata {node} refused a redirect on {endpoint}: {status} -> " +
+          "{location} (following it can downgrade https to cleartext)",
+        {
+          node: node.name,
+          endpoint: path,
+          status: res.status,
+          location: (res.headers.get("location") ?? "<not exposed>").slice(
+            0,
+            200,
+          ),
+        },
+      );
+      throw new Error(
+        `redirect refused on ${path} (HTTP ${res.status}); swamp does not ` +
+          "follow redirects",
+      );
+    }
     if (!res.ok) {
       // Swallow a read failure here (including the size cap) so the HTTP
       // status class still surfaces -- that is the useful part of the error,
@@ -618,7 +757,23 @@ async function pollNode(
       if (!info.hostname && typeof al.hostname === "string") {
         result.info = { ...info, hostname: al.hostname };
       }
-      const alarms = (al.alarms ?? {}) as Record<string, unknown>;
+      // An ABSENT `alarms` key is zero alarms -- that has always been the
+      // contract and it stays. A key that is PRESENT but is not an object is
+      // something else: `{"alarms": "xxxx"}` made Object.entries() enumerate
+      // the string's characters, so a four-byte payload minted four alarm
+      // records with real instance names and empty everything. That is not a
+      // reading of zero alarms, it is a payload that is not what the endpoint
+      // promises -- i.e. a failed sub-fetch, which this model already knows
+      // how to carry forward and mark degraded. Throwing lands it in the
+      // catch below, which is exactly that path.
+      const alarms = al.alarms === undefined || al.alarms === null
+        ? {}
+        : asRecord(al.alarms);
+      if (!alarms) {
+        throw new Error(
+          "/api/v1/alarms: 'alarms' is not an object; refusing to enumerate it",
+        );
+      }
       const entries = Object.entries(alarms);
       // Cap the alarm list: every entry becomes a writeResource call, so an
       // agent (or an on-path rewriter) returning 50,000 alarms turned one
@@ -638,7 +793,11 @@ async function pollNode(
       }
       result.alarms = entries.slice(0, limits.maxAlarmsPerNode).map(
         ([name, raw]) => {
-          const a = (raw ?? {}) as Record<string, unknown>;
+          // asRecord, not `(raw ?? {}) as ...`: spreading a string here
+          // splatted its characters in as numeric keys, and spreading an
+          // array did the same. An alarm entry that is not an object has no
+          // fields to read, so read none.
+          const a = asRecord(raw) ?? {};
           return { name, ...a };
         },
       );
@@ -665,7 +824,18 @@ async function pollNode(
 
     try {
       const ch = await getJson("/api/v1/charts") as Record<string, unknown>;
-      const charts = (ch.charts ?? {}) as Record<string, unknown>;
+      // Same narrowing as /api/v1/alarms above, for the same reason: absent
+      // is zero charts, present-but-not-an-object is a failed sub-fetch. Here
+      // it also fed `chartCount` and the `disk_space.` filter, so a string
+      // payload produced a fictional chart count and a fictional mount list.
+      const charts = ch.charts === undefined || ch.charts === null
+        ? {}
+        : asRecord(ch.charts);
+      if (!charts) {
+        throw new Error(
+          "/api/v1/charts: 'charts' is not an object; refusing to enumerate it",
+        );
+      }
       result.chartCount = Object.keys(charts).length;
       result.chartsOk = true;
 
@@ -709,9 +879,17 @@ async function pollNode(
             `/api/v1/data?chart=${encodeURIComponent(chart)}` +
               `&after=-60&points=1&format=json`,
           ) as { labels?: string[]; data?: number[][] };
-          const labels = data.labels ?? [];
-          const row = (data.data ?? [])[0];
-          if (!row) {
+          // Array.isArray, not `?? []`: a non-array `labels` made
+          // labels.indexOf() throw and a non-array `data` made [0] read a
+          // character or a property. Both are the same "cast instead of
+          // check" mistake as the alarms/charts payloads above; a /data
+          // response of the wrong shape is an unreadable mount, which is
+          // already a represented state (failedMounts -> preserved record,
+          // node degraded), not a zero-byte filesystem.
+          const labels = Array.isArray(data.labels) ? data.labels : [];
+          const rows = Array.isArray(data.data) ? data.data : [];
+          const row = rows[0];
+          if (!Array.isArray(row)) {
             result.failedMounts.push(mount);
             continue;
           }
@@ -816,15 +994,42 @@ async function discover(
   // discover() fail before it started.
   const seenNames = new Set<string>();
   const duplicates = new Set<string>();
+  // Uniqueness has to hold on the SLUG, not just on the raw name. The node
+  // record's instance name is `node-${slug(name)}` -- deliberately hash-free,
+  // so it stays typeable in `swamp data get` -- and slug() is not injective:
+  // `NAS` and `nas`, or `db 1` and `db-1`, are distinct raw names that both
+  // become `node-nas` / `node-db-1`. Checking only the raw name let both
+  // through, and the second node's write then silently overwrote the first's
+  // record: one machine's reachability, version and alarm counts stored under
+  // the other's name, with nothing anywhere saying a node had gone missing.
+  // Rejecting the config is the right end to fix this: adding a hash to the
+  // node instance name would rename every existing node record instead.
+  const seenSlugs = new Map<string, string>();
+  const slugClashes: string[] = [];
   for (const n of g.nodes) {
     if (seenNames.has(n.name)) duplicates.add(n.name);
     seenNames.add(n.name);
+    const s = slug(n.name);
+    const first = seenSlugs.get(s);
+    if (first !== undefined && first !== n.name) {
+      slugClashes.push(`'${first}' and '${n.name}' (both -> ${s})`);
+    } else {
+      seenSlugs.set(s, n.name);
+    }
   }
   if (duplicates.size > 0) {
     throw new Error(
       `Duplicate node name(s): ${[...duplicates].join(", ")} -- node names ` +
         "must be unique; they become part of every resource instance name " +
         "this model writes.",
+    );
+  }
+  if (slugClashes.length > 0) {
+    throw new Error(
+      `Node names collide once normalised: ${slugClashes.join("; ")} -- ` +
+        "these produce the same resource instance name, so one node's " +
+        "record would overwrite the other's. Rename one so the names differ " +
+        "by more than case, spacing or punctuation.",
     );
   }
   const targets = args.node
@@ -880,11 +1085,15 @@ async function discover(
 
   for (const r of results) {
     const info = r.info;
+    // agentText, not String(): these counts and the `status` field stored on
+    // each alarm record must be derived from the SAME string, or a node could
+    // report alarmsCritical: 0 while one of its own alarm records reads
+    // CRITICAL.
     const nodeAlarmsCritical = r.alarms.filter((a) =>
-      isCritical(String(a.status ?? ""))
+      isCritical(agentText(a.status))
     ).length;
     const nodeAlarmsWarning =
-      r.alarms.filter((a) => isWarning(String(a.status ?? ""))).length;
+      r.alarms.filter((a) => isWarning(agentText(a.status))).length;
 
     // ---- alarms ---------------------------------------------------------
     if (!r.alarmsOk || r.alarmsTruncated) {
@@ -896,12 +1105,17 @@ async function discover(
       protectedPrefixes.push(instanceNamePrefix("alarm", r.name));
     }
     for (const a of r.alarms) {
-      const an = instanceName(
-        "alarm",
-        r.name,
-        String(a.name ?? ""),
-        String(a.chart ?? ""),
-      );
+      // The stored fields and the instance name are normalised by the SAME
+      // function -- instanceName() does it internally for the values it
+      // hashes, agentText() does it here for the values written. Passing the
+      // raw values to instanceName() rather than pre-normalised ones is
+      // deliberate: it keeps that guarantee in exactly one place instead of
+      // depending on every call site remembering, which is what let an
+      // agent-supplied U+001F reach the join in the first place.
+      const aName = agentText(a.name);
+      const aChart = agentText(a.chart);
+      const aStatus = agentText(a.status);
+      const an = instanceName("alarm", r.name, a.name, a.chart);
       live.add(an);
       // An alarm value we cannot read is null, NOT 0. `Number(a.value ?? 0)`
       // turned Netdata's `"value": null` (a nan calculation -- collector gap,
@@ -930,14 +1144,19 @@ async function discover(
       handles.push(
         await ctx.writeResource("alarm", an, {
           node: r.name,
-          name: String(a.name ?? ""),
-          chart: String(a.chart ?? ""),
-          status: String(a.status ?? ""),
+          name: aName,
+          chart: aChart,
+          status: aStatus,
           value,
-          units: String(a.units ?? ""),
-          info: String(a.info ?? ""),
+          // units and info are free text straight off an unauthenticated
+          // agent. `info` in particular is Netdata's health-engine prose and
+          // the README already flags it as injectable over plain HTTP; the
+          // only thing that ever bounded it was the 8 MiB whole-payload cap,
+          // which one alarm can consume by itself.
+          units: agentText(a.units),
+          info: agentText(a.info),
         }, {
-          tags: { node: r.name, status: String(a.status ?? "") },
+          tags: { node: r.name, status: aStatus },
         }),
       );
     }
@@ -954,12 +1173,16 @@ async function discover(
       const pct = total > 0 ? Math.round((m.used / total) * 1000) / 10 : 0;
       const over = pct >= g.diskWarnPercent;
       if (over) nodeOver++;
+      // Same rule as the alarm write above: the mount path comes out of an
+      // agent-supplied chart id, so it is agent text like any other, and
+      // instanceName() does its own normalising of the raw value.
+      const mPath = agentText(m.mount);
       const mn = instanceName("mount", r.name, m.mount);
       live.add(mn);
       handles.push(
         await ctx.writeResource("mount", mn, {
           node: r.name,
-          mount: m.mount,
+          mount: mPath,
           availGiB: Math.round(m.avail * 10) / 10,
           usedGiB: Math.round(m.used * 10) / 10,
           totalGiB: Math.round(total * 10) / 10,
@@ -990,6 +1213,11 @@ async function discover(
     // and would report 0 whenever the previous sweep had never seen the node.
     let carriedOver = 0;
     for (const failedMount of r.failedMounts) {
+      // Raw, exactly like the fresh-mount write above: this lookup has to
+      // land on the SAME instance name that write produced, so it must go
+      // through the same single normalisation. Normalising here and not there
+      // (or the reverse) would make this miss the preserved record it exists
+      // to find, and the carried-forward over-threshold count would read 0.
       const fn = instanceName("mount", r.name, failedMount);
       live.add(fn);
       const prevMount = await ctx.readResource(fn);
@@ -1011,12 +1239,27 @@ async function discover(
       ? await ctx.readResource(nn)
       : null;
 
+    // The four identity strings come from an unauthenticated /api/v1/info and
+    // one of them (osName) also becomes a resource TAG, so they get the same
+    // bound-and-de-control treatment as alarm text. The `typeof === "string"`
+    // test stays outside agentText() on purpose: a MISSING field must stay
+    // null ("never successfully read"), and agentText() would turn it into an
+    // empty string, which NodeStateSchema accepts and which reads as "this
+    // host reports an empty version".
     const identity = r.reachable
       ? {
-        version: typeof info.version === "string" ? info.version : null,
-        hostname: typeof info.hostname === "string" ? info.hostname : null,
-        osName: typeof info.os_name === "string" ? info.os_name : null,
-        osVersion: typeof info.os_version === "string" ? info.os_version : null,
+        version: typeof info.version === "string"
+          ? agentText(info.version)
+          : null,
+        hostname: typeof info.hostname === "string"
+          ? agentText(info.hostname)
+          : null,
+        osName: typeof info.os_name === "string"
+          ? agentText(info.os_name)
+          : null,
+        osVersion: typeof info.os_version === "string"
+          ? agentText(info.os_version)
+          : null,
         // countOrZero, not Number(x ?? 0): /api/v1/info is unauthenticated,
         // so cores_total is whatever the agent (or an on-path rewriter) says.
         // A non-numeric value made this NaN, and NaN fails NodeStateSchema's
