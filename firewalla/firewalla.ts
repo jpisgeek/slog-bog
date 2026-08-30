@@ -94,18 +94,22 @@ const GlobalArgsSchema = z.object({
     .default([])
     .describe(
       "Firewalla networks that are off limits entirely. Devices on these " +
-        "are skipped before anything is written. Not collected, not " +
-        "counted, not stored. Use for VLANs outside the scope of this " +
-        "automation (a work network, a guest network you do not own).",
+        "are skipped before anything is written, and any record already " +
+        "stored for such a network is deleted on the next sync that can " +
+        "read it, regardless of the prune guards. Use for VLANs outside " +
+        "the scope of this automation (a work network, a guest network you " +
+        "do not own).",
     ),
   exclude: z
     .array(z.string())
     .default([])
     .describe(
-      "Device names that must never be treated as machines, even if their " +
-        "deviceType lands them in the deep tier. Supports a trailing '*'. " +
-        "Thunderbolt docks are the motivating case: they hold a MAC and take " +
-        "an IP, so Firewalla reports them as 'desktop'.",
+      "Device names that are never aggregated into a machine, even if " +
+        "their deviceType lands them in the deep tier. They are still " +
+        "written as device records, flagged excluded, so the skip is " +
+        "visible. Supports a trailing '*'. Thunderbolt docks are the " +
+        "motivating case: they hold a MAC and take an IP, so Firewalla " +
+        "reports them as 'desktop'.",
     ),
   dependencies: z
     .record(z.string(), z.string())
@@ -197,7 +201,17 @@ const DeviceSchema = z.object({
  */
 const MachineSchema = z.object({
   name: z.string(),
-  primaryIp: z.string(),
+  /**
+   * Omitted, not "", when no interface on this machine reported an address.
+   * This used to be `device.ip ?? ""`, backfilled in four places, which is the
+   * defect `DeviceSchema.ip` was already documented as avoiding -- and it is
+   * worse here than on a device, because `primaryIp` is the address the
+   * generated SSH fleet connects to. A machine with `primaryIp: ""` looked
+   * like a machine with a blank-but-present address and produced a fleet entry
+   * pointing at the empty string. Absent means absent: a consumer that needs
+   * an address now has to notice the key is missing.
+   */
+  primaryIp: z.string().optional(),
   deviceType: z.string(),
   macVendor: z.string(),
   tier: z.string(),
@@ -206,7 +220,8 @@ const MachineSchema = z.object({
   networks: z.array(z.string()),
   interfaces: z.array(z.object({
     name: z.string(),
-    ip: z.string(),
+    /** Omitted, not "", when the firewall reports no address for this NIC. */
+    ip: z.string().optional(),
     mac: z.string(),
     network: z.string(),
     online: z.boolean(),
@@ -262,26 +277,78 @@ function mspHost(raw: string): string | null {
 }
 
 /**
- * Deterministic 32-bit FNV-1a hash, rendered as 8 lowercase hex characters.
- * Same input always produces the same output, so a resource name built from
- * it is stable across re-syncs of the same device/machine (required so a
- * repeat sync updates the existing resource rather than creating a
- * duplicate) while still disambiguating inputs that collide after slugging.
+ * Length-prefixed join of an identity tuple. Injective by construction: the
+ * decoder can always tell where each part ends, so no two distinct tuples
+ * render to the same string.
+ *
+ * The previous code joined with `|` (`${gid}|${mac}|${id}`), which is not an
+ * encoding of a tuple at all -- `["a|b", "c"]` and `["a", "b|c"]` both come
+ * out as `a|b|c`. A "hash of the identity tuple" built on that is a hash of
+ * something that is no longer the identity, and `|` is not a character the
+ * MSP is forbidden from putting in an id. This is also the key format for the
+ * machine map, where the old separator problem was worse: the duplicate key
+ * was `${strippedName}-${last4OfMac}`, and `-` is not only permitted in a
+ * device name, it is the single most common character in one. A device the
+ * firewall reports as `purifier-a1b2` and the disambiguated key for a second
+ * `purifier` with MAC ...a1:b2 were the same string, so the two merged and
+ * one host left the SSH fleet and monitoring silently.
  */
-function fnv1a(s: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
+function identityTuple(parts: string[]): string {
+  return parts.map((p) => `${p.length}:${p}`).join("");
+}
+
+const HEX = "0123456789abcdef";
+
+/**
+ * 128 bits of SHA-256 over the length-prefixed identity tuple, as 32 lowercase
+ * hex characters.
+ *
+ * This replaces a 32-bit FNV-1a. FNV-1a is a *hash-table* function, not a
+ * collision-resistant one: 32 bits puts a 50% collision inside ~77k values and
+ * a few hundred devices already at ~1e-5 per sync, forever, because resource
+ * names are permanent. The consequence of one collision is not a warning --
+ * it is one device or machine resource overwriting another, which deletes a
+ * host from the inventory and from every SSH fleet generated off it. That is
+ * the exact failure this whole model exists to prevent, so the identity may
+ * not rest on a probability that a homelab can reach.
+ *
+ * SHA-256 truncated to 128 bits puts the same collision at ~1e-27 for a
+ * million records. Async because that is the only digest the runtime offers
+ * without pulling in a dependency; every call site is already in an async
+ * loop.
+ */
+async function identityDigest(parts: string[]): Promise<string> {
+  const data = new TextEncoder().encode(identityTuple(parts));
+  const buf = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+  let out = "";
+  for (let i = 0; i < 16; i++) {
+    out += HEX[buf[i] >> 4] + HEX[buf[i] & 0x0f];
   }
-  return (h >>> 0).toString(16).padStart(8, "0");
+  return out;
+}
+
+/**
+ * Resource-name slugs are a READABILITY affordance only -- the digest beside
+ * them carries the identity -- so they are bounded. An id or device name from
+ * the MSP is an unbounded string off the network, and interpolating one
+ * straight into a resource name made the name unbounded too. Bounding the
+ * slug is safe precisely because it is not load-bearing for uniqueness.
+ */
+const SLUG_MAX = 40;
+
+function slugify(s: string, sep: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, sep)
+    .slice(0, SLUG_MAX)
+    .replace(/^-+|-+$/g, "");
 }
 
 /**
  * Resource names must be stable and filesystem-safe. `gid` (the Firewalla
  * box group id) is folded in so the same device id reported by two boxes on
  * one MSP account gets two distinct resource names instead of overwriting
- * each other, and the identity tuple is hashed so a device missing both mac
+ * each other, and the identity tuple is digested so a device missing both mac
  * and id (which `syncDevices` otherwise skips, but tags/id come from
  * differently-shaped raw records in tests and future API changes) can't
  * collapse onto every other malformed record's name.
@@ -290,19 +357,61 @@ function deviceResourceName(
   gid: string | undefined,
   mac: string,
   id: string,
-): string {
-  const slug = (mac || id).toLowerCase().replace(/[^a-z0-9]+/g, "");
-  const h = fnv1a(`${gid ?? ""}|${mac}|${id}`);
-  return `device-${slug || "unknown"}-${h}`;
+): Promise<string> {
+  const slug = slugify(mac || id, "");
+  return identityDigest([gid ?? "", mac, id]).then((h) =>
+    `device-${slug || "unknown"}-${h}`
+  );
 }
 
-/** Same collision-safety technique as `deviceResourceName`, for machines. */
-function machineResourceName(name: string): string {
-  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(
-    /^-+|-+$/g,
-    "",
-  );
-  return `machine-${slug || "unnamed"}-${fnv1a(name)}`;
+/**
+ * Same collision-safety technique as `deviceResourceName`, for machines.
+ *
+ * `key` is the machine's internal identity (see `identityTuple`), NOT its
+ * display name: two hosts the firewall reports under one name have the same
+ * display name on purpose, and only the key tells them apart.
+ */
+function machineResourceName(
+  displayName: string,
+  key: string,
+): Promise<string> {
+  const slug = slugify(displayName, "-");
+  return identityDigest([key]).then((h) => `machine-${slug || "unnamed"}-${h}`);
+}
+
+/** True for a resource name this model owns and may prune. */
+function isTrackedRecord(name: string): boolean {
+  return name.startsWith("device-") || name.startsWith("machine-");
+}
+
+/**
+ * True when an ALREADY-STORED record is entirely on networks the operator has
+ * since put off limits, judged from the record's own stored fields:
+ * `network` on a device, `networks` on a machine.
+ *
+ * Every unrecognised shape answers false. This predicate authorises a
+ * deletion, so "I could not tell" has to mean "leave it alone" -- the same
+ * rule the prune guards follow, for the same reason. A machine with even one
+ * interface on an in-scope network is NOT purged: it is a real host that also
+ * happens to touch the guest VLAN, and losing it would be the inventory loss
+ * this model exists to prevent.
+ */
+function onlyOnExcludedNetworks(
+  stored: unknown,
+  excluded: Set<string>,
+): boolean {
+  if (stored === null || typeof stored !== "object") return false;
+  const rec = stored as Record<string, unknown>;
+  if (typeof rec.network === "string") {
+    return excluded.has(fold(rec.network));
+  }
+  if (Array.isArray(rec.networks)) {
+    if (rec.networks.length === 0) return false;
+    return rec.networks.every(
+      (n) => typeof n === "string" && excluded.has(fold(n)),
+    );
+  }
+  return false;
 }
 
 /** Collapse an interface-suffixed device name to its machine name. */
@@ -330,13 +439,15 @@ function machineKey(name: string, suffixes: string[]): string {
  *
  * The same defect was still live in the two matchers that were not audited at
  * the time, so it is now one function rather than one per call site:
- *   - `apiManaged` was an exact `includes()`, so `apiManaged: [nas]` against a
- *     machine the firewall names `NAS` left that host an SSH fleet candidate.
- *     The generated fleet then SSHes a box that is supposed to be reached
- *     through its own API -- the precise outcome the option exists to prevent.
- *   - `dependencies` was an exact object-key lookup, so `{App-Server: nas}`
- *     against machine `app-server` produced no edge, and downstream alerting
- *     lost the suppression it needed to tell a consequence from an incident.
+ *   - `apiManaged` was an exact `includes()`, so `apiManaged: [example-nas]`
+ *     against a machine the firewall names `Example-NAS` left that host an SSH
+ *     fleet candidate. The generated fleet then SSHes a box that is supposed
+ *     to be reached through its own API -- the precise outcome the option
+ *     exists to prevent.
+ *   - `dependencies` was an exact object-key lookup, so
+ *     `{Example-App-Server: example-nas}` against machine `example-app-server`
+ *     produced no edge, and downstream alerting lost the suppression it needed
+ *     to tell a consequence from an incident.
  * A scope control that silently matches nothing is worse than one that errors.
  */
 function fold(s: string): string {
@@ -451,6 +562,87 @@ function networkName(value: unknown): string {
 }
 
 /**
+ * The one place an abort is turned into an Error, shared by every point in the
+ * call where one can fire: the fetch itself, the retry sleep, and -- the gap
+ * this closes -- every read of a response BODY.
+ *
+ * CANCELLED only when the CALLER aborted; a timeout is not a cancellation.
+ * `where` names the point, so "cancelled while reading the body of the HTTP
+ * 502 response" stays distinguishable from "cancelled mid-request".
+ */
+function abortError(
+  url: string,
+  caller: AbortSignal | undefined,
+  where: string,
+): Error {
+  return new Error(
+    caller?.aborted
+      ? `CANCELLED: request to MSP API ${url} was cancelled by the caller ${where}`
+      : `MSP API ${url} timed out ${where}`,
+  );
+}
+
+/**
+ * Read a response body as text, classifying an abort as an abort.
+ *
+ * Every body read went straight to `response.text()` / `response.json()`
+ * before this existed, and both reject when the signal fires mid-stream. The
+ * JSON path reported that as "returned a response that could not be parsed as
+ * JSON" -- so a workflow cancelling the run, or `timeoutSec` firing while a
+ * large body was still arriving, was reported as a malformed MSP response, and
+ * the operator went looking at the vendor. The HTTP-error path was worse: it
+ * swallowed the rejection with `.catch(() => "")` and reported the status with
+ * an empty detail, losing the cancellation entirely. Only the initial fetch
+ * catch told the four cases apart; now one helper does it for all of them.
+ */
+async function readBodyText(
+  response: Response,
+  url: string,
+  signals: { caller?: AbortSignal; effective: AbortSignal },
+  where: string,
+  redact: (text: string) => string,
+): Promise<string> {
+  try {
+    return await response.text();
+  } catch (e) {
+    if (signals.effective.aborted) {
+      throw abortError(url, signals.caller, where);
+    }
+    throw new Error(
+      `MSP API ${url}: the response body could not be read ${where}: ` +
+        redact((e as Error).message).slice(0, 200),
+    );
+  }
+}
+
+/**
+ * `Retry-After` has two standard forms (RFC 9110 10.2.3): delay-seconds, and
+ * an HTTP-date. `Number(header)` is NaN for the date form, so a compliant
+ * server answering `Retry-After: Wed, 21 Oct 2026 07:28:00 GMT` fell silently
+ * through to exponential backoff while the README claimed the header was
+ * honoured -- documentation describing a branch that could not be reached.
+ *
+ * Returns milliseconds, or null for "no usable value, back off instead".
+ * The caller still caps the result; a date far in the future is not a licence
+ * to park the workflow.
+ */
+function retryAfterMs(header: string | null, now: number): number | null {
+  if (header === null) return null;
+  const t = header.trim();
+  if (t === "") return null;
+  // delay-seconds is 1*DIGIT. Checked before Date.parse, which would happily
+  // read a bare "5" as a year.
+  if (/^\d+$/.test(t)) {
+    const s = Number(t);
+    return Number.isFinite(s) ? s * 1000 : null;
+  }
+  const at = Date.parse(t);
+  if (Number.isNaN(at)) return null;
+  // A date already in the past means "retry now", not "retry in the past".
+  return Math.max(0, at - now);
+}
+
+/**
  * Fetch with a small bounded retry for the two transient MSP failure modes
  * (429 rate limit, 503 unavailable), honoring `Retry-After` when the server
  * sends one and falling back to exponential backoff otherwise. Every other
@@ -485,14 +677,6 @@ async function fetchWithRetry(
   const MAX_RETRY_DELAY_MS = 5000;
   const { caller, effective } = signals;
 
-  /** CANCELLED only when the CALLER aborted; a timeout is not a cancellation. */
-  const abortError = (where: string) =>
-    new Error(
-      caller?.aborted
-        ? `CANCELLED: request to MSP API ${url} was cancelled by the caller ${where}`
-        : `MSP API ${url} timed out ${where}`,
-    );
-
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let response: Response;
     try {
@@ -500,7 +684,7 @@ async function fetchWithRetry(
     } catch (e) {
       // The caller pulling the plug is not an outage -- say so, rather than
       // reporting a cancelled run as "failed to reach".
-      if (effective.aborted) throw abortError("mid-request");
+      if (effective.aborted) throw abortError(url, caller, "mid-request");
       // Redacted for the same reason the HTTP-error body is: this message is
       // foreign text, and no foreign text reaches an error unscrubbed.
       throw new Error(
@@ -511,13 +695,8 @@ async function fetchWithRetry(
     const transient = response.status === 429 || response.status === 503;
     if (!transient || attempt >= maxAttempts) return response;
 
-    const retryAfterHeader = response.headers.get("Retry-After");
-    const retryAfterSec = retryAfterHeader === null
-      ? NaN
-      : Number(retryAfterHeader);
-    const wanted = Number.isFinite(retryAfterSec) && retryAfterSec >= 0
-      ? retryAfterSec * 1000
-      : 500 * 2 ** (attempt - 1);
+    const asked = retryAfterMs(response.headers.get("Retry-After"), Date.now());
+    const wanted = asked === null ? 500 * 2 ** (attempt - 1) : asked;
     const delayMs = Math.min(wanted, MAX_RETRY_DELAY_MS);
     // A response we're discarding still holds an open stream until drained.
     await response.body?.cancel().catch(() => {});
@@ -548,7 +727,11 @@ async function fetchWithRetry(
       effective.addEventListener("abort", onAbort, { once: true });
     });
     if (effective.aborted) {
-      throw abortError(`while waiting to retry after HTTP ${response.status}`);
+      throw abortError(
+        url,
+        caller,
+        `while waiting to retry after HTTP ${response.status}`,
+      );
     }
   }
   // Unreachable: the loop always returns on its last iteration.
@@ -580,6 +763,9 @@ async function syncDevices(
   const effectiveSignal = callerSignal
     ? AbortSignal.any([callerSignal, timeout])
     : timeout;
+  // Hoisted: the body reads below need the same pair the fetch does, so a
+  // cancellation or timeout that lands mid-body is classified the same way.
+  const signals = { caller: callerSignal, effective: effectiveSignal };
   const response = await fetchWithRetry(
     url,
     {
@@ -599,7 +785,7 @@ async function syncDevices(
       signal: effectiveSignal,
     },
     ctx,
-    { caller: callerSignal, effective: effectiveSignal },
+    signals,
     redact,
   );
 
@@ -615,16 +801,37 @@ async function syncDevices(
     }
     // Redaction point: a misconfigured proxy's error page could echo request
     // headers. Scrub the token before the body reaches an error message.
-    const detail = await response.text().then((t) => redact(t).slice(0, 200))
-      .catch(() => "");
+    // Read through readBodyText, not `.catch(() => "")`: swallowing the
+    // rejection reported a run the caller had just cancelled as an HTTP
+    // failure with a blank detail, which sends the operator to the vendor.
+    const detail = redact(
+      await readBodyText(
+        response,
+        url,
+        signals,
+        `while reading the body of the HTTP ${response.status} response`,
+        redact,
+      ),
+    ).slice(0, 200);
     throw new Error(
       `MSP API ${url} returned HTTP ${response.status}. ${detail}`,
     );
   }
 
+  // Read and parse as two steps, not `response.json()`, so a body read cut
+  // short by cancellation or by `timeoutSec` is reported as what it is rather
+  // than as a malformed MSP response. `response.json()` merges the two failure
+  // modes into one rejection and there is no way to tell them apart after.
+  const bodyText = await readBodyText(
+    response,
+    url,
+    signals,
+    "while reading the response body",
+    redact,
+  );
   let payload: unknown;
   try {
-    payload = await response.json();
+    payload = JSON.parse(bodyText);
   } catch (e) {
     // V8's SyntaxError quotes a prefix of the offending body verbatim
     // ("Unexpected token 'x', \"<the body>\" is not valid JSON"). A proxy or
@@ -715,10 +922,16 @@ async function syncDevices(
   // otherwise emit one warning line per device.
   let malformed = 0, missingOnline = 0;
 
-  // machineName -> accumulating record, built as devices stream past.
+  // Injective machine key (see `identityTuple`) -> accumulating record, built
+  // as devices stream past. The key is NEVER the display name: two hosts the
+  // firewall reports under one name share a display name on purpose.
   const machines = new Map<string, {
+    /** Display name written to the resource. Not unique by itself. */
     name: string;
-    primaryIp: string;
+    /** Injective identity. Unique, and what the resource name digests. */
+    key: string;
+    /** Absent, not "", when no interface reported an address. */
+    primaryIp: string | undefined;
     deviceType: string;
     macVendor: string;
     tier: string;
@@ -739,7 +952,8 @@ async function syncDevices(
     interfaces: Array<
       {
         name: string;
-        ip: string;
+        /** Absent, not "", when the firewall reports no address for this NIC. */
+        ip: string | undefined;
         mac: string;
         network: string;
         online: boolean;
@@ -841,7 +1055,7 @@ async function syncDevices(
       excluded: dropped,
     };
 
-    const name = deviceResourceName(device.gid, device.mac, device.id);
+    const name = await deviceResourceName(device.gid, device.mac, device.id);
     liveNames.add(name);
 
     typeCounts[device.deviceType] = (typeCounts[device.deviceType] ?? 0) + 1;
@@ -880,75 +1094,108 @@ async function syncDevices(
     // vendors, so requiring agreement would split real hosts. Splitting is
     // the safe direction of error here anyway -- a duplicated SSH target is
     // noise, a merged one is a lost machine.
+    //
+    // Excluded names never reach any of this. `exclude` is documented -- in
+    // its own describe() and in the README -- as naming devices that must
+    // never be treated as machines, and it did not do that: a dock was still
+    // aggregated, still written as a `machine` resource, still counted in
+    // `inventory.machines`, and only had its SSH candidacy switched off. The
+    // roll-up therefore reported a machine count that included the docks the
+    // operator had explicitly said were not machines. They stay as `device`
+    // records flagged `excluded`, which is where a dock belongs.
     const stripped = machineKey(device.name, g.interfaceSuffixes);
-    const hadSuffix = stripped !== device.name;
-    const collision = machines.get(stripped);
-    const nameTaken = Boolean(
-      collision?.interfaces.some((i) => i.name === device.name),
-    );
-    const mKey = nameTaken
-      ? `${stripped}-${device.mac.replace(/[^a-zA-Z0-9]/g, "").slice(-4)}`
-      : stripped;
-    const existingMachine = machines.get(mKey);
-    if (!existingMachine) {
-      machines.set(mKey, {
-        name: mKey,
-        hadSuffix,
-        primaryWired: isWired(device.name, g.wiredSuffixes),
-        primaryOnline: device.online,
-        primaryIp: device.ip ?? "",
-        deviceType: device.deviceType,
-        macVendor: device.macVendor,
-        tier,
-        sshCandidate: device.sshCandidate,
-        online: device.online,
-        networks: new Set([network]),
-        interfaces: [{
+    if (!dropped) {
+      const hadSuffix = stripped !== device.name;
+      // Both the lookup key and the duplicate key are length-prefixed tuples,
+      // never a `-`-joined string. The old duplicate key was
+      // `${stripped}-${last4OfMac}`: four hex characters is a 65536-wide space
+      // shared by every duplicate under one name, and `-` is legal (and
+      // ubiquitous) inside a Firewalla device name, so a real device called
+      // `purifier-a1b2` collided with the disambiguated key for a second
+      // `purifier` whose MAC ended a1:b2 -- two hosts merged into one machine
+      // and one of them left the fleet. The duplicate key now carries the
+      // COMPLETE immutable identity, mac and id both.
+      const primaryKey = identityTuple([stripped]);
+      const collision = machines.get(primaryKey);
+      const nameTaken = Boolean(
+        collision?.interfaces.some((i) => i.name === device.name),
+      );
+      const mKey = nameTaken
+        ? identityTuple([stripped, device.mac, device.id])
+        : primaryKey;
+      // Display name. Full MAC slug, not four characters: two hosts under one
+      // firewall name should be tellable apart by a human reading the
+      // inventory, and a MAC is unique where its last four hex digits are not.
+      const displayName = nameTaken
+        ? `${stripped}-${slugify(device.mac, "")}`
+        : stripped;
+      const existingMachine = machines.get(mKey);
+      if (!existingMachine) {
+        machines.set(mKey, {
+          name: displayName,
+          key: mKey,
+          hadSuffix,
+          primaryWired: isWired(device.name, g.wiredSuffixes),
+          primaryOnline: device.online,
+          primaryIp: device.ip,
+          deviceType: device.deviceType,
+          macVendor: device.macVendor,
+          tier,
+          sshCandidate: device.sshCandidate,
+          online: device.online,
+          networks: new Set([network]),
+          interfaces: [{
+            name: device.name,
+            ip: device.ip,
+            mac: device.mac,
+            network,
+            online: device.online,
+          }],
+        });
+      } else {
+        existingMachine.interfaces.push({
           name: device.name,
-          ip: device.ip ?? "",
+          ip: device.ip,
           mac: device.mac,
           network,
           online: device.online,
-        }],
-      });
-    } else {
-      existingMachine.interfaces.push({
-        name: device.name,
-        ip: device.ip ?? "",
-        mac: device.mac,
-        network,
-        online: device.online,
-      });
-      existingMachine.networks.add(network);
-      existingMachine.hadSuffix = existingMachine.hadSuffix || hadSuffix;
-      // Snapshot the state the primaryIp tiebreak needs BEFORE the roll-up
-      // fields are updated. `existingMachine.online` is the machine-wide OR
-      // across interfaces, but rule 2 below asks a narrower question: was the
-      // interface currently holding primaryIp online? Reading the field after
-      // the OR-assignment made `!existingMachine.online` false whenever this
-      // device was online -- which is precisely when the clause is consulted
-      // -- so the whole "online beats offline" preference was dead code. A
-      // host whose offline `nas-eth` was processed before its online
-      // `nas-lan` kept the stale interface's address as primaryIp, and that
-      // address is what the generated SSH fleet targets.
-      const primaryWasOnline = existingMachine.primaryOnline;
-      existingMachine.online = existingMachine.online || device.online;
-      existingMachine.sshCandidate = existingMachine.sshCandidate ||
-        device.sshCandidate;
-      // Preference order for primaryIp, strongest first:
-      //   1. wired beats wireless   2. online beats offline   3. any address
-      // beats none. A wired address is only displaced by another wired one.
-      const wired = isWired(device.name, g.wiredSuffixes);
-      const better = Boolean(device.ip) && (
-        !existingMachine.primaryIp ||
-        (wired && !existingMachine.primaryWired) ||
-        (wired === existingMachine.primaryWired &&
-          device.online && !primaryWasOnline)
-      );
-      if (better) {
-        existingMachine.primaryIp = device.ip ?? "";
-        existingMachine.primaryWired = wired;
-        existingMachine.primaryOnline = device.online;
+        });
+        existingMachine.networks.add(network);
+        existingMachine.hadSuffix = existingMachine.hadSuffix || hadSuffix;
+        // Snapshot the state the primaryIp tiebreak needs BEFORE the roll-up
+        // fields are updated. `existingMachine.online` is the machine-wide OR
+        // across interfaces, but rule 2 below asks a narrower question: was
+        // the interface currently holding primaryIp online? Reading the field
+        // after the OR-assignment made `!existingMachine.online` false
+        // whenever this device was online -- which is precisely when the
+        // clause is consulted -- so the whole "online beats offline"
+        // preference was dead code. A host whose offline `nas-eth` was
+        // processed before its online `nas-lan` kept the stale interface's
+        // address as primaryIp, and that address is what the generated SSH
+        // fleet targets.
+        const primaryWasOnline = existingMachine.primaryOnline;
+        existingMachine.online = existingMachine.online || device.online;
+        existingMachine.sshCandidate = existingMachine.sshCandidate ||
+          device.sshCandidate;
+        // Preference order for primaryIp, strongest first:
+        //   1. wired beats wireless   2. online beats offline   3. any address
+        // beats none. A wired address is only displaced by another wired one.
+        //
+        // Tested against `undefined`, not falsiness: `primaryIp` is now absent
+        // rather than "" when unknown, and `!existingMachine.primaryIp` would
+        // read a future legitimate falsy value the same as "no address".
+        const wired = isWired(device.name, g.wiredSuffixes);
+        const better = device.ip !== undefined && (
+          existingMachine.primaryIp === undefined ||
+          (wired && !existingMachine.primaryWired) ||
+          (wired === existingMachine.primaryWired &&
+            device.online && !primaryWasOnline)
+        );
+        if (better) {
+          existingMachine.primaryIp = device.ip;
+          existingMachine.primaryWired = wired;
+          existingMachine.primaryOnline = device.online;
+        }
       }
     }
 
@@ -960,7 +1207,11 @@ async function syncDevices(
           deviceType: device.deviceType,
           online: String(device.online),
           sshCandidate: String(device.sshCandidate),
-          machine: machineKey(device.name, g.interfaceSuffixes),
+          // Empty for an excluded device: there is no machine resource to
+          // point at any more, and a tag naming one that was never written is
+          // a dangling reference for any CEL that joins on it.
+          machine: dropped ? "" : stripped,
+          excluded: String(dropped),
         },
       }),
     );
@@ -993,20 +1244,31 @@ async function syncDevices(
   let sshCandidates = 0;
   for (const m of machines.values()) {
     if (m.sshCandidate) sshCandidates++;
-    const mName = machineResourceName(m.name);
+    const mName = await machineResourceName(m.name, m.key);
     liveNames.add(mName);
     const dependsOn = dependencyByMachine.get(fold(m.name));
     handles.push(
       await writeOrThrow("machine", mName, {
         name: m.name,
-        primaryIp: m.primaryIp,
+        // Spread, not assigned, for the same reason the device traffic
+        // counters are: an absent address leaves the key off the record, which
+        // is how MachineSchema encodes "unknown". `primaryIp: ""` read as a
+        // blank-but-present address and produced an SSH fleet entry aimed at
+        // the empty string.
+        ...(m.primaryIp === undefined ? {} : { primaryIp: m.primaryIp }),
         deviceType: m.deviceType,
         macVendor: m.macVendor,
         tier: m.tier,
         sshCandidate: m.sshCandidate,
         online: m.online,
         networks: [...m.networks].sort(),
-        interfaces: m.interfaces,
+        interfaces: m.interfaces.map((i) => ({
+          name: i.name,
+          ...(i.ip === undefined ? {} : { ip: i.ip }),
+          mac: i.mac,
+          network: i.network,
+          online: i.online,
+        })),
         interfaceCount: m.interfaces.length,
         ...(dependsOn ? { dependsOn } : {}),
       }, {
@@ -1021,6 +1283,25 @@ async function syncDevices(
     );
   }
 
+  // The roll-up is written unconditionally, INCLUDING on a run the prune
+  // guards below judge unrepresentative. That is a deliberate trade and the
+  // review classes it operator-decision, so it is recorded here rather than
+  // changed:
+  //
+  //   Cost: a shrunken or empty fetch overwrites `inventory` with reduced
+  //   counts. A consumer reading the resource cannot tell that from a real
+  //   decommission; only the warning in the log says the fetch looked wrong.
+  //
+  //   Why it is still right for this model: `inventory` is a roll-up of THIS
+  //   run, and `syncedAt` dates it. Retaining the previous roll-up would put a
+  //   number in the datastore that describes a sync that did not happen and
+  //   pair it with a fresh timestamp, which is a worse lie than a low count.
+  //   Failing the method would throw away a device list that is usually fine.
+  //
+  // The honest alternative is a `representative` field consumers must check.
+  // That is a schema addition every downstream reader has to adopt, so it is
+  // the operator's call, not this file's -- and the trade is stated in the
+  // README rather than left for a reader to discover from the logs.
   const counted = deviceCount;
   handles.push(
     await writeOrThrow("inventory", "inventory", {
@@ -1041,6 +1322,100 @@ async function syncDevices(
       syncedAt: new Date().toISOString(),
     }, { tags: { total: String(counted), deep: String(deep) } }),
   );
+
+  /**
+   * One listing of this model instance's stored resources, shared by the two
+   * destructive passes below. `findAllForModel` is the only way to enumerate
+   * them (`readResource` takes a single instance name, not a listing), and
+   * asking twice for the same list would be re-fetching state the first call
+   * already holds.
+   */
+  let existingCache: Array<{ name: string }> | null = null;
+  async function listExisting(): Promise<Array<{ name: string }>> {
+    if (existingCache !== null) return existingCache;
+    try {
+      // `?? []` because a reduced harness can answer with nothing at all, and
+      // the memo below treats "already asked" as "not null" -- caching an
+      // undefined would make the second caller iterate undefined and throw.
+      existingCache = await ctx.dataRepository.findAllForModel(
+        ctx.modelType,
+        ctx.modelId,
+      ) ?? [];
+    } catch (e) {
+      throw new Error(
+        `Failed to list existing device/machine records: ${
+          redact((e as Error).message)
+        }`,
+      );
+    }
+    return existingCache!;
+  }
+
+  /** Names already deleted this run, so the prune pass does not retry them. */
+  const removed = new Set<string>();
+
+  // --- excludeNetworks purge -------------------------------------------------
+  //
+  // `excludeNetworks` promised "not collected, not counted, not stored", and
+  // delivered only the first two. Devices on an off-limits network are skipped
+  // before anything is written, so nothing NEW lands -- but a network excluded
+  // after it had already been synced left every one of its records sitting in
+  // the datastore. Ordinary pruning was not going to remove them either: a
+  // `tier`- or `network`-filtered run never prunes at all, and a full run
+  // whose count tripped a shrink guard keeps everything by design. The
+  // operator read a documented guarantee that off-limits VLANs are not stored
+  // and got a datastore holding the guest network indefinitely.
+  //
+  // This pass is deliberately OUTSIDE the prune guards, because it rests on
+  // opposite evidence. Pruning acts on an ABSENCE (the firewall stopped
+  // mentioning this record) and an unrepresentative fetch makes absence
+  // meaningless, which is exactly what the guards defend. This acts on a
+  // PRESENCE: the stored record itself says which network it is on, and the
+  // operator has said that network is off limits. No amount of fetch weirdness
+  // changes either half, so a shrunken response is not a reason to keep
+  // storing a network the operator has forbidden.
+  //
+  // Only records this run did not write are considered, so the read cost is
+  // the number of departure candidates, not the size of the inventory. Any
+  // record that cannot be read, or whose shape is not recognised, is left
+  // alone: the failure direction here must be "kept something we could have
+  // removed", never "deleted something we could not identify".
+  if (
+    excludedNetworkSet.size > 0 &&
+    typeof ctx.readResource === "function" &&
+    typeof ctx.deleteResource === "function"
+  ) {
+    for (const rec of await listExisting()) {
+      if (!isTrackedRecord(rec.name) || liveNames.has(rec.name)) continue;
+      let stored: unknown;
+      try {
+        stored = await ctx.readResource(rec.name);
+      } catch {
+        continue;
+      }
+      if (!onlyOnExcludedNetworks(stored, excludedNetworkSet)) continue;
+      try {
+        await ctx.deleteResource(rec.name);
+      } catch (e) {
+        throw new Error(
+          `Failed to purge record ${rec.name} on an excluded network: ${
+            redact((e as Error).message)
+          }`,
+        );
+      }
+      removed.add(rec.name);
+      ctx.logger.info(
+        "purged stored record {name}: it belongs to an excluded network",
+        { name: rec.name },
+      );
+    }
+    if (removed.size > 0) {
+      ctx.logger.info(
+        "purged {n} stored record(s) on off-limits network(s): {nets}",
+        { n: removed.size, nets: g.excludeNetworks.join(", ") },
+      );
+    }
+  }
 
   // Prune devices the firewall no longer reports. Only safe on a full sync.
   // A filtered sync legitimately sees a subset and must not delete the rest.
@@ -1099,22 +1474,9 @@ async function syncDevices(
       { reason: pruneBlockedBy },
     );
   } else if (args.tier === "all" && !args.network) {
-    let existing: Array<{ name: string }>;
-    try {
-      existing = await ctx.dataRepository.findAllForModel(
-        ctx.modelType,
-        ctx.modelId,
-      );
-    } catch (e) {
-      throw new Error(
-        `Failed to list existing device/machine records for pruning: ${
-          redact((e as Error).message)
-        }`,
-      );
-    }
-    for (const rec of existing) {
-      const tracked = rec.name.startsWith("device-") ||
-        rec.name.startsWith("machine-");
+    for (const rec of await listExisting()) {
+      if (removed.has(rec.name)) continue;
+      const tracked = isTrackedRecord(rec.name);
       if (tracked && !liveNames.has(rec.name)) {
         try {
           await ctx.deleteResource(rec.name);
@@ -1181,6 +1543,24 @@ export const model = {
         "method runs and give it a name that can be skipped " +
         "(--skip-check) when investigating suspected data loss, not to " +
         "gate on the specific args of a given call.",
+      labels: ["policy"],
+      appliesTo: ["syncDevices"],
+      execute: () => Promise.resolve({ pass: true }),
+    },
+    "excluded-networks-are-purged-from-storage": {
+      description:
+        "Any stored device or machine record whose own networks are all " +
+        "listed in excludeNetworks is deleted on every sync that can read " +
+        "it, including tier- or network-filtered runs and runs whose device " +
+        "count tripped a prune guard. This is a SECOND destructive path, " +
+        "separate from departed-record pruning, and it is deliberately not " +
+        "subject to those guards: pruning acts on an absence that an " +
+        "unrepresentative fetch makes meaningless, while this acts on the " +
+        "stored record's own network plus the operator's stated scope, " +
+        "neither of which a bad fetch changes. This check always passes. " +
+        "Its purpose is to make the deletion policy visible before the " +
+        "method runs and give it a name that can be skipped (--skip-check) " +
+        "when investigating suspected data loss.",
       labels: ["policy"],
       appliesTo: ["syncDevices"],
       execute: () => Promise.resolve({ pass: true }),
