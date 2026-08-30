@@ -72,10 +72,24 @@ const RemoteText = (max: number, min = 0) =>
  */
 const MAX_LOADED_MODELS = 512;
 
+/**
+ * `type` and `architecture` are nullable because `lms ps --json` does not
+ * always send them, and the resource description promises that missing
+ * measurements remain explicit.
+ *
+ * They used to be `RemoteText(64)` / `RemoteText(128)` with a min of 0, fed
+ * by a helper that returned `""` for an absent key. An absent field and a
+ * daemon that genuinely reported an empty string were therefore stored
+ * identically, and both read as a measured value -- the exact
+ * absent-versus-measured collapse this package exists to prevent everywhere
+ * else (dimensionKnown, checksCompleted, the nullable token counts). `null`
+ * now means "the daemon did not tell us"; a string is always something the
+ * daemon actually said.
+ */
 const LoadedModelSchema = z.object({
   identifier: RemoteText(256, 1),
-  type: RemoteText(64),
-  architecture: RemoteText(128),
+  type: RemoteText(64, 1).nullable(),
+  architecture: RemoteText(128, 1).nullable(),
 });
 
 const DaemonSchema = z.object({
@@ -109,6 +123,23 @@ interface CommandResult {
   code: number;
   stdout: string;
   stderr: string;
+  /**
+   * True when either stream hit MAX_OUTPUT_BYTES and the answer we hold is a
+   * prefix of what the CLI was sending.
+   *
+   * Overflow used to be expressed only by flipping `success` to false, which
+   * meant observe() could not tell it apart from a non-zero exit: it fell
+   * into the `!success` branch, ran the connect/refused/network keyword scan
+   * over up to two megabytes of remote-controlled text, and recorded
+   * `unreachable` or `command-failed`. Both the README and the resource
+   * description promise an oversized payload is refused as
+   * `invalid-response`. Carried explicitly so that promise is kept by the
+   * code and not just by the docs.
+   *
+   * Optional so the CommandRunner test seam stays source-compatible: a runner
+   * that never truncates simply omits it.
+   */
+  truncated?: boolean;
 }
 
 export type CommandRunner = (
@@ -270,6 +301,7 @@ const defaultRunner: CommandRunner = async (binary, args, signal) => {
       // one behaviour that turns a runaway daemon into a wrong measurement
       // rather than a failed one.
       success: status.success && !out.truncated && !err.truncated,
+      truncated: out.truncated || err.truncated,
       code: status.code,
       stdout: out.text,
       stderr: err.text,
@@ -320,11 +352,26 @@ function safeError(
   }
 }
 
-function strings(record: Record<string, unknown>, ...keys: string[]): string {
+/**
+ * First key that carries a non-empty string, or `null` for "the daemon did
+ * not report this".
+ *
+ * The old version returned `""` for both cases, which is what let an absent
+ * `type` be stored as though it had been measured. An empty string from the
+ * daemon is treated as absent too: it carries no more information than the
+ * missing key, and failing the whole observation over it would turn a
+ * cosmetic gap in one model entry into `invalid-response` for the entire
+ * host.
+ */
+function optionalString(
+  record: Record<string, unknown>,
+  ...keys: string[]
+): string | null {
   for (const key of keys) {
-    if (typeof record[key] === "string") return record[key] as string;
+    const value = record[key];
+    if (typeof value === "string" && value !== "") return value;
   }
-  return "";
+  return null;
 }
 
 function parseModels(payload: unknown): z.infer<typeof LoadedModelSchema>[] {
@@ -345,9 +392,17 @@ function parseModels(payload: unknown): z.infer<typeof LoadedModelSchema>[] {
     if (!entry || typeof entry !== "object") throw new Error("invalid model");
     const record = entry as Record<string, unknown>;
     return LoadedModelSchema.parse({
-      identifier: strings(record, "identifier", "modelKey", "id"),
-      type: strings(record, "type", "modelType"),
-      architecture: strings(record, "architecture", "architectureName"),
+      // `?? ""` keeps identifier failing closed: it is the one field that is
+      // required, and RemoteText(256, 1) rejects the empty string, so an
+      // entry with no usable identifier still becomes invalid-response
+      // rather than a nameless model in the stored list.
+      identifier: optionalString(record, "identifier", "modelKey", "id") ?? "",
+      type: optionalString(record, "type", "modelType"),
+      architecture: optionalString(
+        record,
+        "architecture",
+        "architectureName",
+      ),
     });
   });
 }
@@ -390,6 +445,15 @@ async function observe(
       g.timeoutMs,
       ctx.signal,
     );
+    if (psResult.truncated) {
+      // Checked before the !success branch below, and never handed to the
+      // keyword scan. An overflowing payload is remote-controlled text: the
+      // word "network" appearing anywhere in the megabyte we captured used
+      // to be enough to record the host as `unreachable`, which is a
+      // measurement, and a wrong one. The CLI answered; the answer was too
+      // large to be one, which is what `invalid-response` means.
+      throw new SyntaxError("lms ps output exceeded the supported size");
+    }
     if (!psResult.success) {
       const combined = `${psResult.stderr}\n${psResult.stdout}`;
       const kind = /connect|refused|unreachable|offline|network/i.test(combined)
@@ -462,7 +526,7 @@ export const model = {
   resources: {
     daemon: {
       description:
-        "Sanitized daemon status and models currently loaded in memory; missing measurements remain explicit. Model identifiers are length-bounded and screened for control, bidi, and zero-width characters, and an oversized or unscreenable ps payload is refused as invalid-response rather than stored.",
+        "Sanitized daemon status and models currently loaded in memory; missing measurements remain explicit -- a model type or architecture the daemon did not report is null, never an empty string that reads as a measured value. Model identifiers are length-bounded and screened for control, bidi, and zero-width characters, and an unscreenable, oversized, or output-cap-overflowing ps payload is refused as invalid-response rather than stored or misread as an unreachable host.",
       schema: DaemonSchema,
       lifetime: "30d" as const,
       garbageCollection: 30,

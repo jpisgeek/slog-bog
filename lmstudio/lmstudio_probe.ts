@@ -59,6 +59,57 @@
  */
 import { z } from "npm:zod@4";
 
+/**
+ * A model id is remote-controlled text even when a caller types it: it comes
+ * from whatever `/v1/models` reported, it is written to an
+ * `infinite`-lifetime resource, it is put in a tag, it is logged, and
+ * instanceName() below folds it into a name that maps directly to a storage
+ * path. A bare `z.string().min(1)` accepted a megabyte-long id and accepted
+ * `qwen<ESC>]0;PWNED<BEL>-7b`, and the escape sequence then rewrites the
+ * terminal of whoever runs `swamp data list` afterwards.
+ *
+ * Screened, not redacted. The rejected value is a configuration mistake the
+ * operator needs to see named, so the failure is a zod validation error on
+ * the argument that says which rule it broke -- redacting a caller-supplied
+ * model id would make the probe undiagnosable while protecting nothing.
+ *
+ * Same RemoteText pattern lmstudio_daemon.ts applies to `lms ps --json`
+ * output and lmstudio_endpoint.ts applies to `/v1/models` ids. Kept local
+ * rather than imported: each extension ships only the files in its own
+ * manifest.
+ */
+const RemoteText = (max: number, min = 0) =>
+  z
+    .string()
+    .min(min)
+    .max(max)
+    // deno-lint-ignore no-control-regex
+    .refine((v) => !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(v), {
+      message: "value must not contain control or line-separator characters",
+    })
+    // Bidi and zero-width characters reorder or hide displayed text, so two
+    // distinct model identifiers can render identically to an operator.
+    .refine(
+      (v) => !/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(v),
+      {
+        message:
+          "value must not contain zero-width or direction-formatting characters",
+      },
+    )
+    // Lone surrogates survive JSON.parse as \ud800-style escapes and decode
+    // to the same replacement character, which again makes distinct values
+    // look identical.
+    .refine((v) => {
+      for (const ch of v) {
+        const cp = ch.codePointAt(0)!;
+        if (cp >= 0xd800 && cp <= 0xdfff) return false;
+      }
+      return true;
+    }, { message: "value must not contain unpaired surrogate code units" });
+
+/** Longest model id this extension will probe, store, tag, or log. */
+const MAX_MODEL_ID_CHARS = 256;
+
 const GlobalArgsSchema = z.object({
   baseUrl: z
     .string()
@@ -108,12 +159,13 @@ const GlobalArgsSchema = z.object({
 });
 
 const EmbeddingArgsSchema = z.object({
-  model: z
-    .string()
-    .min(1)
+  model: RemoteText(MAX_MODEL_ID_CHARS, 1)
     .describe(
       "Model id to request embeddings from, as reported by the endpoint's " +
-        "/v1/models list.",
+        "/v1/models list. Bounded to 256 characters and screened for " +
+        "control, bidi, and zero-width characters -- it is stored, tagged, " +
+        "logged, and folded into an instance name that maps to a storage " +
+        "path.",
     ),
   input: z
     .string()
@@ -127,8 +179,11 @@ const EmbeddingArgsSchema = z.object({
 });
 
 const CompletionArgsSchema = z.object({
-  model: z.string().min(1).describe(
-    "Model id to send the chat completion to.",
+  model: RemoteText(MAX_MODEL_ID_CHARS, 1).describe(
+    "Model id to send the chat completion to. Bounded to 256 characters and " +
+      "screened for control, bidi, and zero-width characters -- it is " +
+      "stored, tagged, logged, and folded into an instance name that maps " +
+      "to a storage path.",
   ),
   prompt: z
     .string()
@@ -156,8 +211,11 @@ const CompletionArgsSchema = z.object({
 });
 
 const CapabilitiesArgsSchema = z.object({
-  model: z.string().min(1).describe(
-    "Model id to run the capability battery against.",
+  model: RemoteText(MAX_MODEL_ID_CHARS, 1).describe(
+    "Model id to run the capability battery against. Bounded to 256 " +
+      "characters and screened for control, bidi, and zero-width characters " +
+      "-- it is stored, tagged, logged, and folded into an instance name " +
+      "that maps to a storage path.",
   ),
   maxTokens: z
     .number()
@@ -272,22 +330,238 @@ function slug(value: string): string {
  * id always hashes to the same suffix, so reruns against the same model
  * still overwrite the same instance -- this only separates ids that were
  * never the same to begin with.
+ *
+ * Two bounds the first version of this got wrong, both of which matter
+ * because the returned name IS a storage path component:
+ *
+ *   - The readable slug was unbounded. A 256-character model id produced a
+ *     256-character path component, which is at or past the per-component
+ *     limit on ext4 and APFS, so the write failed at the filesystem rather
+ *     than being refused with a reason. Bounded to MAX_SLUG_CHARS; the slug
+ *     is only there to be readable in `swamp data list`, and truncating it
+ *     costs nothing because the hash below is what carries uniqueness.
+ *   - The hash kept 4 of the 32 digest bytes. 32 bits is a ~50% chance of a
+ *     collision across roughly 77,000 distinct ids and a 1-in-4-billion
+ *     chance for any given pair -- and a collision here means two different
+ *     models silently overwriting each other's `infinite`-lifetime probe
+ *     result, which reads as a measurement rather than as an error.
+ *     Truncating the slug makes the readable half collide far more often,
+ *     so the hash is now 16 bytes / 128 bits, where a collision is not a
+ *     thing that happens.
+ *
+ * Widening the hash changes every instance name, so probe results written by
+ * an earlier version stay under their old names instead of being overwritten
+ * by the next run. They keep their own `checkedAt`, so a stale record is
+ * identifiable rather than silently merged.
  */
+const MAX_SLUG_CHARS = 48;
+
 async function instanceName(prefix: string, modelId: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode(modelId),
   );
-  const hash = Array.from(new Uint8Array(digest).slice(0, 4))
+  const hash = Array.from(new Uint8Array(digest).slice(0, 16))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-  return `${prefix}-${slug(modelId)}-${hash}`;
+  const readable = slug(modelId).slice(0, MAX_SLUG_CHARS).replace(/-+$/, "") ||
+    "unnamed";
+  return `${prefix}-${readable}-${hash}`;
 }
 
 /** Strip the API token from any string before it can land in stored data. */
 function redact(text: string, token: string): string {
   if (!token) return text;
   return text.split(token).join("[REDACTED]");
+}
+
+/**
+ * Screen a remote-controlled string before it reaches a log line, a thrown
+ * error, or a stored resource.
+ *
+ * redact() alone was not enough. It strips the bearer token and nothing else,
+ * so the endpoint's own error body reached `embeddingProbe.error`,
+ * `completionProbe.error`, and `capabilityProbe.error` carrying whatever the
+ * far end chose to put in it: an ESC]0;...BEL sequence that rewrites the
+ * terminal title of whoever runs `swamp data list` afterwards, a bidi
+ * override that makes two different messages render identically, lone
+ * surrogates, and an unbounded length -- in resources whose lifetime is
+ * `infinite`.
+ *
+ * The snippet is screened and bounded rather than dropped. Replacing it with
+ * a canned "HTTP 400" would make this module undiagnosable for the exact
+ * cases it exists to diagnose: classifyHttpError() below reads this same text
+ * to tell model_not_found from a generic http_error, and the whole point of
+ * `no_embedding_capability` is surfacing the endpoint saying "no embedding
+ * model is currently loaded". What is removed is the ability of that text to
+ * be unbounded or to drive a terminal. The residual trade -- an endpoint that
+ * echoes your prompt inside its own error body can put part of it in `error`
+ * -- is stated in the README Security section rather than papered over.
+ */
+function safeRemoteText(text: string, token: string, max: number): string {
+  const screened = redact(text.slice(0, 4096), token)
+    // deno-lint-ignore no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
+    .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "\ufffd")
+    .replace(/(^|[^\ud800-\udbff])([\udc00-\udfff])/g, "$1\ufffd")
+    .replace(/\s+/g, " ")
+    .trim();
+  return screened.length > max ? `${screened.slice(0, max)}...` : screened;
+}
+
+/**
+ * Hard cap on how many bytes of any HTTP response body this model will
+ * buffer. `response.text()` and `response.json()` have no bound at all: the
+ * request timeout limits how long a hostile endpoint may stream, not how much
+ * it may hand over in that time, so a slow multi-gigabyte body fits inside a
+ * 30-second deadline and exhausts memory. Same reasoning, and the same shape,
+ * as MAX_OUTPUT_BYTES in lmstudio_daemon.ts.
+ */
+const MAX_RESPONSE_BYTES = 256 * 1024;
+/** Longest screened endpoint-body snippet that may reach a stored error. */
+const MAX_ERROR_SNIPPET = 160;
+/**
+ * How much screened body text classifyHttpError() may scan for the
+ * model-not-found keywords. Larger than what is stored, because the phrase
+ * can sit past the 200 chars that end up in the message, but still bounded.
+ */
+const MAX_CLASSIFY_SCAN = 2048;
+
+/**
+ * A body read fails for the same three reasons a fetch does, and they must
+ * stay apart for the same reason: the caller cancelled, our deadline fired,
+ * or the connection died mid-body.
+ */
+function classifyBodyError(
+  e: unknown,
+  callerSignal?: AbortSignal,
+): { kind: string; message: string } {
+  const c = classifyFetchError(e, callerSignal);
+  if (c.kind === "cancelled") {
+    return {
+      kind: "cancelled",
+      message:
+        "request was cancelled by the caller while the response body was " +
+        "being read",
+    };
+  }
+  if (c.kind === "timeout") {
+    return {
+      kind: "timeout",
+      message: "request timed out while the response body was being read",
+    };
+  }
+  return {
+    kind: "unreachable",
+    message: "connection failed while the response body was being read",
+  };
+}
+
+/**
+ * Read a response body under a byte cap, keeping a failed read classifiable.
+ *
+ * `await response.text().catch(() => "")` and a bare `await response.json()`
+ * -- the old shapes -- each did two wrong things at once. They let an
+ * unbounded body through, and they turned a cancellation or a timeout that
+ * landed after the response headers into an empty body or an exception in the
+ * JSON catch, which was then recorded as `malformed_response`: a fact about
+ * the endpoint, stored for ever, for a run that the caller aborted. That is
+ * the same ambiguity between "we never looked" and "we looked and this is
+ * what we saw" that the rest of this file exists to prevent.
+ */
+async function readBodyCapped(
+  response: Response,
+  callerSignal?: AbortSignal,
+): Promise<
+  { text: string; truncated: boolean; failed?: undefined } | {
+    text?: undefined;
+    truncated?: undefined;
+    failed: { kind: string; message: string };
+  }
+> {
+  const body = response.body;
+  if (!body) return { text: "", truncated: false };
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done || !value) break;
+      if (total + value.byteLength >= MAX_RESPONSE_BYTES) {
+        chunks.push(value.subarray(0, MAX_RESPONSE_BYTES - total));
+        total = MAX_RESPONSE_BYTES;
+        truncated = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } catch (e) {
+    return { failed: classifyBodyError(e, callerSignal) };
+  } finally {
+    // Cancel rather than drain: draining a runaway body to be polite is the
+    // same unbounded read the cap exists to prevent.
+    await reader.cancel().catch(() => {});
+  }
+  const buf = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) {
+    buf.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return { text: new TextDecoder().decode(buf), truncated };
+}
+
+/** A plain JSON object -- not null, not an array. */
+function validObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Parse a 2xx body that has already been read under the cap.
+ *
+ * `await response.json() as Record<string, unknown>` was a lie to the type
+ * checker: a body of literal `null`, `[]`, or `7` parses fine and then throws
+ * a TypeError on the first property access, which escaped the probe as an
+ * unhandled exception instead of being recorded as the malformed 2xx it is.
+ * An oversized body is refused for a related reason -- its first
+ * MAX_RESPONSE_BYTES may happen to parse, and a prefix stored as a
+ * measurement is a wrong answer rather than a failed one.
+ */
+function parseJsonObject(
+  body: { text: string; truncated: boolean },
+  status: number,
+): { json: Record<string, unknown>; error?: undefined } | {
+  json?: undefined;
+  error: string;
+} {
+  if (body.truncated) {
+    return {
+      error: `endpoint returned HTTP ${status} with a body over the ` +
+        `${MAX_RESPONSE_BYTES}-byte cap this extension reads`,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.text);
+  } catch {
+    // The parser's own message is dropped rather than included: V8 embeds a
+    // snippet of the offending body in it, which would route remote text
+    // around the screening every other body path goes through.
+    return {
+      error: `endpoint returned HTTP ${status} but the body was not valid JSON`,
+    };
+  }
+  if (!validObject(parsed)) {
+    return {
+      error: `endpoint returned HTTP ${status} with a 2xx JSON body that is ` +
+        "not an object",
+    };
+  }
+  return { json: parsed };
 }
 
 /**
@@ -363,8 +637,12 @@ function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * Classify an HTTP-level (response received, but non-2xx) failure. `bodyText`
- * must already be redacted by the caller before it reaches here.
+ * Classify an HTTP-level (response received, but non-2xx) failure.
+ *
+ * `bodyText` must already have been through safeRemoteText() -- token
+ * redacted, control/bidi/zero-width screened, bounded to MAX_CLASSIFY_SCAN.
+ * The messages built here go straight into a stored `error` field, so an
+ * unscreened body reaching this function is the leak, not the storage.
  */
 function classifyHttpError(
   status: number,
@@ -391,13 +669,13 @@ function classifyHttpError(
     return {
       kind: "model_not_found",
       message: `endpoint reports the model id is not recognized: ${
-        bodyText.slice(0, 160)
+        bodyText.slice(0, MAX_ERROR_SNIPPET)
       }`,
     };
   }
   return {
     kind: "http_error",
-    message: `HTTP ${status}: ${bodyText.slice(0, 160)}`,
+    message: `HTTP ${status}: ${bodyText.slice(0, MAX_ERROR_SNIPPET)}`,
   };
 }
 
@@ -548,11 +826,24 @@ async function chatCompletion(
   result.httpStatus = finalResponse.status;
 
   if (!finalResponse.ok) {
-    const bodyText = await finalResponse.text().catch(() => "");
-    // Redaction point: strip the token from any echoed error body -- a
-    // misconfigured proxy's error page could in principle include request
-    // headers -- before it is classified or stored.
-    const safeBody = redact(bodyText, token);
+    const body = await readBodyCapped(finalResponse, signal);
+    if (body.failed) {
+      // A cancellation or a timeout that landed after the response headers
+      // arrived used to be swallowed by `.catch(() => "")` and stored as
+      // "HTTP 500: " with an empty body -- an observation about the endpoint
+      // for a run that never finished looking at it.
+      if (body.failed.kind === "cancelled") {
+        throw new Error(`CANCELLED: ${body.failed.message}`);
+      }
+      result.errorKind = body.failed.kind;
+      result.error = body.failed.message;
+      return result;
+    }
+    // Redaction and screening point: strip the token from any echoed error
+    // body -- a misconfigured proxy's error page could in principle include
+    // request headers -- and bound and screen it before it is classified or
+    // stored.
+    const safeBody = safeRemoteText(body.text, token, MAX_CLASSIFY_SCAN);
     const c = classifyHttpError(finalResponse.status, safeBody);
     if (c.kind === "unauthorized") {
       // A bad token is a configuration fault, not a measurement, so it is
@@ -575,20 +866,30 @@ async function chatCompletion(
     return result;
   }
 
-  let json: Record<string, unknown>;
-  try {
-    json = await finalResponse.json() as Record<string, unknown>;
-  } catch {
-    // A malformed 2xx body used to be swallowed by `.catch(() => ({}))` and
-    // scored as `ok: true` with every field empty -- indistinguishable from
-    // a real completion that happened to say nothing. Recorded as data, not
-    // thrown: an endpoint returning HTTP 200 with a broken body is a fact
-    // about the endpoint, not a configuration fault on our end.
-    result.errorKind = "malformed_response";
-    result.error = `endpoint returned HTTP ${finalResponse.status} but the ` +
-      "body was not valid JSON";
+  const okBody = await readBodyCapped(finalResponse, signal);
+  if (okBody.failed) {
+    // Same distinction as the non-2xx branch: a cancelled run is the caller
+    // pulling the plug, and a read that died mid-body is a transport fact,
+    // neither of which is "the endpoint sent a malformed completion".
+    if (okBody.failed.kind === "cancelled") {
+      throw new Error(`CANCELLED: ${okBody.failed.message}`);
+    }
+    result.errorKind = okBody.failed.kind;
+    result.error = okBody.failed.message;
     return result;
   }
+  // A malformed 2xx body used to be swallowed by `.catch(() => ({}))` and
+  // scored as `ok: true` with every field empty -- indistinguishable from a
+  // real completion that happened to say nothing. Recorded as data, not
+  // thrown: an endpoint returning HTTP 200 with a broken body is a fact
+  // about the endpoint, not a configuration fault on our end.
+  const parsed = parseJsonObject(okBody, finalResponse.status);
+  if (!parsed.json) {
+    result.errorKind = "malformed_response";
+    result.error = parsed.error;
+    return result;
+  }
+  const json = parsed.json;
 
   const choices = Array.isArray(json.choices) ? json.choices : [];
   if (choices.length === 0) {
@@ -608,8 +909,6 @@ async function chatCompletion(
       ? value
       : null;
   const choice = choices[0];
-  const validObject = (value: unknown): value is Record<string, unknown> =>
-    value !== null && typeof value === "object" && !Array.isArray(value);
   const validFinishReasons = new Set([
     "stop",
     "length",
@@ -711,91 +1010,155 @@ async function embedding(
   if (response) {
     httpStatus = response.status;
     if (response.ok) {
-      let json: Record<string, unknown>;
-      try {
-        json = await response.json() as Record<string, unknown>;
-      } catch {
+      const okBody = await readBodyCapped(response, ctx.signal);
+      if (okBody.failed) {
+        if (okBody.failed.kind === "cancelled") {
+          throw new Error(`CANCELLED: ${okBody.failed.message}`);
+        }
+        errorKind = okBody.failed.kind;
+        error = okBody.failed.message;
+      } else {
         // A malformed 2xx body used to be swallowed by `.catch(() => ({}))`
         // and scored identically to "endpoint returned 200 with no vector" --
         // recorded here as its own kind so a broken JSON body isn't
         // misread as a genuine "no embedding capability" finding.
-        errorKind = "malformed_response";
-        error = `endpoint returned HTTP ${response.status} but the body ` +
-          "was not valid JSON";
-        json = {};
-      }
-      const data = Array.isArray(json.data) ? json.data : [];
-      const first = (data[0] ?? {}) as Record<string, unknown>;
-      const vector = Array.isArray(first.embedding) ? first.embedding : [];
-      const numericVector = vector.every((value) =>
-        typeof value === "number" && Number.isFinite(value)
-      );
-      if (vector.length > 0 && !numericVector) {
-        errorKind = "malformed_response";
-        error = "endpoint returned a nonnumeric embedding vector";
-      }
-      // Measured, never assumed: a configured dimension that disagrees with
-      // what the model actually returns corrupts a vector index. This is
-      // read from the real response, not derived from the model's name or
-      // reputation.
-      measuredDimension = numericVector ? vector.length : 0;
-      dimensionKnown = numericVector && vector.length > 0;
-      servesEmbeddings = dimensionKnown;
-      if (!dimensionKnown && !errorKind) {
-        errorKind = "empty_response";
-        error = "endpoint returned HTTP 200 but no embedding vector -- treat " +
-          "dimension as unknown, not zero";
+        const parsed = parseJsonObject(okBody, response.status);
+        if (!parsed.json) {
+          errorKind = "malformed_response";
+          error = parsed.error;
+        } else {
+          // The envelope check and the vector check were one branch, so a
+          // body with no `data` at all -- `{}` is the common case from a
+          // gateway that answered something else entirely -- fell through to
+          // `empty_response`, which claims the endpoint answered the
+          // embedding question with "no vector". It did not answer it. A
+          // missing or non-array `data` is a malformed envelope; only a
+          // well-formed envelope that carries no usable vector is an empty
+          // response.
+          const data = parsed.json.data;
+          if (!Array.isArray(data)) {
+            errorKind = "malformed_response";
+            error = `endpoint returned HTTP ${response.status} with a 2xx ` +
+              "JSON body but no data[] array -- not an embeddings envelope";
+          } else {
+            const first = data[0];
+            if (data.length > 0 && !validObject(first)) {
+              errorKind = "malformed_response";
+              error = "endpoint returned a data[] entry that is not an object";
+            } else {
+              const embedding = validObject(first) ? first.embedding : [];
+              if (
+                validObject(first) && first.embedding !== undefined &&
+                !Array.isArray(first.embedding)
+              ) {
+                errorKind = "malformed_response";
+                error = "endpoint returned an embedding that is not an array";
+              }
+              const vector = Array.isArray(embedding) ? embedding : [];
+              const numericVector = vector.every((value) =>
+                typeof value === "number" && Number.isFinite(value)
+              );
+              if (vector.length > 0 && !numericVector) {
+                errorKind = "malformed_response";
+                error = "endpoint returned a nonnumeric embedding vector";
+              }
+              // Measured, never assumed: a configured dimension that
+              // disagrees with what the model actually returns corrupts a
+              // vector index. This is read from the real response, not
+              // derived from the model's name or reputation.
+              measuredDimension = numericVector ? vector.length : 0;
+              dimensionKnown = numericVector && vector.length > 0;
+              servesEmbeddings = dimensionKnown;
+              if (!dimensionKnown && !errorKind) {
+                errorKind = "empty_response";
+                error =
+                  "endpoint returned HTTP 200 and a well-formed envelope but " +
+                  "no embedding vector -- treat dimension as unknown, not zero";
+              }
+            }
+          }
+        }
       }
     } else {
-      const bodyText = await response.text().catch(() => "");
-      // Redaction point: strip the token before any response body reaches a
-      // classification or a stored error message.
-      const safeBody = redact(bodyText, g.apiToken);
-      const c = classifyHttpError(response.status, safeBody);
-      if (c.kind === "unauthorized") {
-        // A bad token is a configuration fault, not a measurement, so it is
-        // thrown rather than written as data -- same distinction as
-        // endpoint.models(). Left as data, this would be indistinguishable
-        // from a genuine "no embedding model loaded" finding: both leave
-        // measuredDimension absent, but only one of them is a fact about
-        // the endpoint.
-        //
-        // Redaction point: run the message through redact() again even
-        // though safeBody above is already scrubbed -- an exception string
-        // is exactly the kind of thing that ends up in a log.
-        throw new Error(`UNAUTHORIZED: ${redact(c.message, g.apiToken)}`);
-      }
-      // A generic error here -- distinct from an explicit unauthorized or
-      // model-not-found response -- is the classic silent failure this
-      // probe exists to catch: chat still works, but no embedding model is
-      // loaded. Re-labelled so that failure mode is nameable rather than a
-      // bare "http_error".
-      //
-      // But ONLY for a status that actually means "this endpoint refused the
-      // request it understood". The relabel used to swallow every non-2xx,
-      // including 429 and every 5xx, so a gateway rate-limiting the probe --
-      // or LM Studio returning 503 while it swapped models -- was stored for
-      // ever (lifetime: "infinite") as proof the endpoint serves no
-      // embeddings. That is a transient condition recorded as a permanent
-      // capability finding: precisely the misdiagnosis this module exists to
-      // prevent, and it survived the retry above because a persistent 429 is
-      // still a 429. Rate limiting and server faults now keep their own kinds.
-      if (c.kind === "http_error" && response.status === 429) {
-        errorKind = "rate_limited";
-        error = `endpoint is rate limiting this probe, so embedding support ` +
-          `is unmeasured: ${c.message}`;
-      } else if (c.kind === "http_error" && response.status >= 500) {
-        errorKind = "server_error";
-        error = `endpoint failed while serving the request, so embedding ` +
-          `support is unmeasured: ${c.message}`;
-      } else if (c.kind === "http_error") {
-        errorKind = "no_embedding_capability";
-        error = `endpoint likely has no embedding model loaded: ${c.message}`;
+      const body = await readBodyCapped(response, ctx.signal);
+      if (body.failed) {
+        if (body.failed.kind === "cancelled") {
+          throw new Error(`CANCELLED: ${body.failed.message}`);
+        }
+        // Nothing left to classify: without a body there is no evidence for
+        // the no_embedding_capability relabel below, and inventing one from
+        // a failed read is exactly the transient-fault-stored-as-a-permanent-
+        // finding mistake that scoping the relabel already exists to prevent.
+        errorKind = body.failed.kind;
+        error = body.failed.message;
       } else {
-        errorKind = c.kind;
-        error = c.message;
+        // Redaction and screening point: strip the token, bound, and screen
+        // before any response body reaches a classification or a stored error
+        // message.
+        const safeBody = safeRemoteText(
+          body.text,
+          g.apiToken,
+          MAX_CLASSIFY_SCAN,
+        );
+        const c = classifyHttpError(response.status, safeBody);
+        if (c.kind === "unauthorized") {
+          // A bad token is a configuration fault, not a measurement, so it is
+          // thrown rather than written as data -- same distinction as
+          // endpoint.models(). Left as data, this would be indistinguishable
+          // from a genuine "no embedding model loaded" finding: both leave
+          // measuredDimension absent, but only one of them is a fact about
+          // the endpoint.
+          //
+          // Redaction point: run the message through redact() again even
+          // though safeBody above is already scrubbed -- an exception string
+          // is exactly the kind of thing that ends up in a log.
+          throw new Error(`UNAUTHORIZED: ${redact(c.message, g.apiToken)}`);
+        }
+        // A generic error here -- distinct from an explicit unauthorized or
+        // model-not-found response -- is the classic silent failure this
+        // probe exists to catch: chat still works, but no embedding model is
+        // loaded. Re-labelled so that failure mode is nameable rather than a
+        // bare "http_error".
+        //
+        // But ONLY for a status that actually means "this endpoint refused the
+        // request it understood". The relabel used to swallow every non-2xx,
+        // including 429 and every 5xx, so a gateway rate-limiting the probe --
+        // or LM Studio returning 503 while it swapped models -- was stored for
+        // ever (lifetime: "infinite") as proof the endpoint serves no
+        // embeddings. That is a transient condition recorded as a permanent
+        // capability finding: precisely the misdiagnosis this module exists to
+        // prevent, and it survived the retry above because a persistent 429 is
+        // still a 429. Rate limiting and server faults now keep their own kinds.
+        if (c.kind === "http_error" && response.status === 429) {
+          errorKind = "rate_limited";
+          error =
+            `endpoint is rate limiting this probe, so embedding support ` +
+            `is unmeasured: ${c.message}`;
+        } else if (c.kind === "http_error" && response.status >= 500) {
+          errorKind = "server_error";
+          error = `endpoint failed while serving the request, so embedding ` +
+            `support is unmeasured: ${c.message}`;
+        } else if (c.kind === "http_error") {
+          errorKind = "no_embedding_capability";
+          error = `endpoint likely has no embedding model loaded: ${c.message}`;
+        } else {
+          errorKind = c.kind;
+          error = c.message;
+        }
       }
     }
+  }
+
+  // Cancellation that landed after the response arrived is the caller
+  // pulling the plug, not a measurement. Checked before the write so a
+  // cancelled run never leaves an `infinite`-lifetime probe result behind
+  // claiming it observed the endpoint -- the same rule postWithRetry applies
+  // when the cancellation lands earlier.
+  if (ctx.signal?.aborted) {
+    throw new Error(
+      "CANCELLED: request was cancelled by the caller before the embedding " +
+        "probe could be recorded",
+    );
   }
 
   const latencyMs = Math.round(performance.now() - started);
@@ -890,6 +1253,16 @@ async function completion(
   const contextExhausted = hitLength && result.completionTokens !== null
     ? result.completionTokens < a.maxTokens
     : null;
+
+  // Same rule as the embedding probe: cancellation that landed after the
+  // response arrived is the caller pulling the plug, not a measurement, so
+  // it throws rather than leaving an `infinite`-lifetime record behind.
+  if (ctx.signal?.aborted) {
+    throw new Error(
+      "CANCELLED: request was cancelled by the caller before the completion " +
+        "probe could be recorded",
+    );
+  }
 
   const name = await instanceName("completion", a.model);
   const handle = await ctx.writeResource("completionProbe", name, {
@@ -1022,12 +1395,25 @@ async function capabilities(
     } else {
       checksCompleted = 2;
       formatCheckTruncated = formatCheck.finishReason === "length";
+      // A bare `JSON.parse()` that did not throw used to be scored as
+      // honouring the format, which meant `[1,2]`, `"hello"`, `42`, and
+      // `null` all recorded a capability the model never demonstrated --
+      // `null` in particular is what a model emits when it has no idea what
+      // was asked. response_format `{ type: "json_object" }` promises a JSON
+      // OBJECT, so that is the property checked.
+      //
+      // Deliberately NOT an exact match against {"ok": true}: a model that
+      // replies {"ok": true, "note": "..."} has honoured the requested
+      // format and failed only at following the prose instruction, and
+      // collapsing those two would quietly turn honorsResponseFormat into a
+      // measure of instruction-following under a name that says otherwise.
+      let parsedFormat: unknown;
       try {
-        JSON.parse(formatCheck.content.trim());
-        honorsResponseFormat = true;
+        parsedFormat = JSON.parse(formatCheck.content.trim());
       } catch {
-        honorsResponseFormat = false;
+        parsedFormat = undefined;
       }
+      honorsResponseFormat = validObject(parsedFormat);
 
       // Check 3: does it wrap output in markdown code fences even when told
       // not to? A formatting habit, not a content failure -- recorded
@@ -1058,6 +1444,17 @@ async function capabilities(
         wrapsInCodeFences = fenceCheck.content.includes("```");
       }
     }
+  }
+
+  // Same rule as the other two probes: cancellation that landed after a
+  // battery call returned is the caller pulling the plug, not a measurement.
+  // Without this, a run cancelled between checks wrote a partial battery
+  // (checksCompleted 1 or 2) that reads as a real, if incomplete, result.
+  if (ctx.signal?.aborted) {
+    throw new Error(
+      "CANCELLED: request was cancelled by the caller before the capability " +
+        "battery could be recorded",
+    );
   }
 
   const latencyMs = Math.round(performance.now() - started);

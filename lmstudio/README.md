@@ -49,10 +49,10 @@ No arguments.
 
 ### Data written
 
-| resource | lifetime | fields                                                                                  | description                                                                                                                                                                                                                                                                                                                                                                                                      |
-| -------- | -------- | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `models` | infinite | `modelIds`, `modelCount`, `syncedAt`                                                    | Every model id currently served by /v1/models, plus a count. A 401/403 on this call is thrown as a distinct UNAUTHORIZED error rather than written as data -- a bad token is a config problem, not an operational fact worth recording as a normal result.                                                                                                                                                       |
-| `health` | infinite | `reachable`, `authorized`, `httpStatus`, `latencyMs`, `errorKind`, `error`, `checkedAt` | Reachability and auth as two independent booleans, with HTTP status and latency recorded separately, so 'host is down' and 'host is up but rejects the token' never collapse into one generic failure. An unreachable, unauthorized, or slow endpoint is recorded as data, not thrown -- the one exception is caller cancellation, which throws rather than being written as a misleading 'timeout' observation. |
+| resource | lifetime | fields                                                                                  | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------- | -------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `models` | infinite | `modelIds`, `modelCount`, `syncedAt`                                                    | Every model id currently served by /v1/models, plus a count. A 401/403 on this call is thrown as a distinct UNAUTHORIZED error rather than written as data -- a bad token is a config problem, not an operational fact worth recording as a normal result. Model ids are remote-controlled text, so they are length-bounded and screened for control, bidi, and zero-width characters, and an oversized list or an unscreenable id is refused as MALFORMED_RESPONSE rather than stored. |
+| `health` | infinite | `reachable`, `authorized`, `httpStatus`, `latencyMs`, `errorKind`, `error`, `checkedAt` | Reachability and auth as two independent booleans, with HTTP status and latency recorded separately, so 'host is down' and 'host is up but rejects the token' never collapse into one generic failure. An unreachable, unauthorized, or slow endpoint is recorded as data, not thrown -- the one exception is caller cancellation, which throws rather than being written as a misleading 'timeout' observation.                                                                        |
 
 ## `@jpisgeek/lmstudio/probe`
 
@@ -77,10 +77,10 @@ recorded as a timeout. 429/503 responses get one bounded, Retry-After-aware
 retry, and a rate limit or server fault that survives it is recorded as such
 rather than as a missing embedding capability.
 
-| argument | type   | required | default                  | description                                                                                                                                 |
-| -------- | ------ | -------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`  | string | yes      |                          | Model id to request embeddings from, as reported by the endpoint's /v1/models list.                                                         |
-| `input`  | string | no       | `"swamp lmstudio probe"` | Short text sent as the embedding input. The default is enough to measure vector dimension; override only to test content-specific behavior. |
+| argument | type   | required | default                  | description                                                                                                                                                                                                                                                            |
+| -------- | ------ | -------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`  | string | yes      |                          | Model id to request embeddings from, as reported by the endpoint's /v1/models list. Bounded to 256 characters and screened for control, bidi, and zero-width characters -- it is stored, tagged, logged, and folded into an instance name that maps to a storage path. |
+| `input`  | string | no       | `"swamp lmstudio probe"` | Short text sent as the embedding input. The default is enough to measure vector dimension; override only to test content-specific behavior.                                                                                                                            |
 
 #### `completion`
 
@@ -91,12 +91,12 @@ distinct UNAUTHORIZED error rather than being written as data, as does caller
 cancellation. 429/503 responses get one bounded, Retry-After-aware retry before
 being recorded.
 
-| argument      | type    | required | default | description                                                                                                                                                                               |
-| ------------- | ------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`       | string  | yes      |         | Model id to send the chat completion to.                                                                                                                                                  |
-| `prompt`      | string  | yes      |         | Caller-supplied prompt. No default -- the point of this probe is testing a real prompt against a real model, not a canned string.                                                         |
-| `maxTokens`   | integer | no       | `512`   | max_tokens sent with the request. Also used, alongside finish_reason, to distinguish a completion that hit this cap from one that hit the model's context window -- see contextExhausted. |
-| `temperature` | number  | no       | `0`     | Sampling temperature. Defaults to 0 for reproducible probes.                                                                                                                              |
+| argument      | type    | required | default | description                                                                                                                                                                                                                 |
+| ------------- | ------- | -------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`       | string  | yes      |         | Model id to send the chat completion to. Bounded to 256 characters and screened for control, bidi, and zero-width characters -- it is stored, tagged, logged, and folded into an instance name that maps to a storage path. |
+| `prompt`      | string  | yes      |         | Caller-supplied prompt. No default -- the point of this probe is testing a real prompt against a real model, not a canned string.                                                                                           |
+| `maxTokens`   | integer | no       | `512`   | max_tokens sent with the request. Also used, alongside finish_reason, to distinguish a completion that hit this cap from one that hit the model's context window -- see contextExhausted.                                   |
+| `temperature` | number  | no       | `0`     | Sampling temperature. Defaults to 0 for reproducible probes.                                                                                                                                                                |
 
 #### `capabilities`
 
@@ -108,10 +108,10 @@ through records how many of the 3 checks completed (checksCompleted) so a
 partial result is never indistinguishable from a complete one that found the
 remaining capabilities absent.
 
-| argument    | type    | required | default | description                                     |
-| ----------- | ------- | -------- | ------- | ----------------------------------------------- |
-| `model`     | string  | yes      |         | Model id to run the capability battery against. |
-| `maxTokens` | integer | no       | `256`   | max_tokens applied to each battery call.        |
+| argument    | type    | required | default | description                                                                                                                                                                                                                        |
+| ----------- | ------- | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`     | string  | yes      |         | Model id to run the capability battery against. Bounded to 256 characters and screened for control, bidi, and zero-width characters -- it is stored, tagged, logged, and folded into an instance name that maps to a storage path. |
+| `maxTokens` | integer | no       | `256`   | max_tokens applied to each battery call.                                                                                                                                                                                           |
 
 ### Data written
 
@@ -142,9 +142,9 @@ No arguments.
 
 ### Data written
 
-| resource | lifetime | fields                                                                                                            | description                                                                                                                                                                                                                                                                                         |
-| -------- | -------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `daemon` | 30d      | `cliAvailable`, `daemonRunning`, `status`, `loadedModelCount`, `loadedModels`, `observedAt`, `errorKind`, `error` | Sanitized daemon status and models currently loaded in memory; missing measurements remain explicit. Model identifiers are length-bounded and screened for control, bidi, and zero-width characters, and an oversized or unscreenable ps payload is refused as invalid-response rather than stored. |
+| resource | lifetime | fields                                                                                                            | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------- | -------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemon` | 30d      | `cliAvailable`, `daemonRunning`, `status`, `loadedModelCount`, `loadedModels`, `observedAt`, `errorKind`, `error` | Sanitized daemon status and models currently loaded in memory; missing measurements remain explicit -- a model type or architecture the daemon did not report is null, never an empty string that reads as a measured value. Model identifiers are length-bounded and screened for control, bidi, and zero-width characters, and an unscreenable, oversized, or output-cap-overflowing ps payload is refused as invalid-response rather than stored or misread as an unreachable host. |
 
 ## Example
 
@@ -169,21 +169,48 @@ globalArguments:
 
 ## Caveats
 
-No default endpoint, `baseUrl` is required. What throws versus what is written
-as data is deliberate and differs per method: `endpoint.models` throws on every
-failure (UNAUTHORIZED, UNREACHABLE, TIMEOUT, HTTP_ERROR, MALFORMED_RESPONSE,
-CANCELLED); `endpoint.health` writes every endpoint-side outcome and throws only
-on caller cancellation; the three `probe` methods throw only on a bad token and
-cancellation and record everything else with an `errorKind`. `contextExhausted`
-is a heuristic (finish_reason "length" under the requested cap) and remains
-unknown when the endpoint omits valid token usage. Probe instance names are
-`<method>-<slug-of-model-id>-<hash>`, so look them up after a run. All three
-probe methods retry a 429/503 once, Retry-After-aware and capped; on the
-embedding probe a rate limit or a 5xx that survives the retry is recorded as
+No default endpoint, `baseUrl` is required -- and it is accepted for any http(s)
+host. That is deliberate: the extension is generic and has no vendor domain to
+pin to, so nothing here restricts where it connects. A typo or a hostile model
+config sends the bearer token and your prompts to whatever host is named, and
+can reach services on your own network. Treat `baseUrl` as a credential
+destination and set it explicitly per deployment.
+
+What throws versus what is written as data is deliberate and differs per method:
+`endpoint.models` throws on every failure (UNAUTHORIZED, UNREACHABLE, TIMEOUT,
+HTTP_ERROR, MALFORMED_RESPONSE, CANCELLED), and a 2xx body that is not an OpenAI
+envelope is one of the MALFORMED_RESPONSE cases rather than an untagged error;
+`endpoint.health` writes every endpoint-side outcome; the three `probe` methods
+record everything with an `errorKind`. All of them throw on caller cancellation
+rather than writing it, including a cancellation that lands after the response
+headers have already arrived.
+
+`contextExhausted` is a heuristic (finish_reason "length" under the requested
+cap) and remains unknown when the endpoint omits valid token usage.
+`honorsResponseFormat` means the model returned a JSON object, not that it
+returned the exact object asked for.
+
+All three probe methods retry a 429/503 once, Retry-After-aware and capped. On
+the embedding probe a rate limit or a 5xx that survives the retry is recorded as
 `rate_limited` / `server_error`, never as `no_embedding_capability` -- the
 endpoint declined to answer the capability question rather than answering no.
+Every other non-2xx, including 408, 409, 413, and 422, IS labelled
+`no_embedding_capability`, on the assumption that an endpoint which understood
+the request and refused it has no embedding model loaded. That assumption is
+wrong for a malformed or oversized input, so read `httpStatus` alongside the
+label rather than trusting the label on its own.
+
+Probe instance names are `<method>-<slug-of-model-id>-<128-bit hash>`, so look
+them up after a run. The hash widened and the slug became bounded in this
+version, so probe results written by an earlier version keep their old instance
+names instead of being overwritten -- compare `checkedAt` if you find two for
+one model.
+
 The daemon model runs `lms ps --json` beside llmster. Set its optional `host`
 argument only when deliberately using LM Studio's supported remote CLI mode.
+`lmsBinary` names whatever executable you point it at, and the model runs it
+with its own process permissions; leave it at `lms` unless you have a specific
+reason not to.
 
 ## Security
 
@@ -193,16 +220,44 @@ from every response body before it can reach an error, and URLs in logs and
 errors have userinfo, query strings, and fragments stripped. Configured base
 URLs containing any of them are rejected. `http://` is accepted for endpoints
 behind an already-encrypted tunnel, with the caveat that the token then travels
-in cleartext on that hop. Written data: served model ids, latencies, optional
-token counts, boolean findings, and short sanitized endpoint error text. Caller
-prompts are not stored. Daemon observations retain loaded model identifiers,
-type, and architecture but discard model paths and raw command error output.
-`lms` output is read under a per-stream byte cap rather than buffered to
-completion, its identifiers are length-bounded and screened for control, bidi,
-and zero-width characters, and an oversized or unscreenable payload is refused
-as `invalid-response` instead of being stored. The `timeoutMs` argument is a
-hard bound: the CLI is sent SIGTERM, escalated to SIGKILL, and abandoned
-outright if it still has not released its pipes.
+in cleartext on that hop, and any http(s) hostname is accepted at all -- see the
+Caveats above for what that means.
+
+Every HTTP response body is read under a byte cap rather than buffered whole, so
+a hostile endpoint cannot stream an unbounded reply inside the request deadline;
+an oversized body is refused, never parsed from its prefix. Every scrap of
+endpoint-supplied text that reaches a stored `error` or a thrown message is
+token-redacted, screened for control, bidi, zero-width, and surrogate
+characters, and length-bounded first, so a proxy error page cannot drive the
+terminal of whoever reads that data later.
+
+The endpoint's own words are kept rather than replaced with a canned status
+line, because they are what makes a failure diagnosable -- "no embedding model
+is currently loaded" is the whole point of the `no_embedding_capability`
+finding. One consequence, stated plainly: this extension never writes your
+prompt to a resource, but an endpoint that echoes your request back inside its
+own error body can put a screened, bounded fragment of it in the `error` field.
+If your prompts are sensitive and your endpoint is not trusted, do not run the
+completion probe against it.
+
+Model ids are treated as remote text on both sides: bounded to 256 characters
+and screened for control, bidi, and zero-width characters, whether they arrive
+from `/v1/models` or from a caller's argument, because they are stored, tagged,
+logged, and folded into an instance name that maps to a storage path. An
+oversized model list, or an id that fails the screen, is refused as
+`MALFORMED_RESPONSE` rather than stored.
+
+Written data: served model ids, latencies, optional token counts, boolean
+findings, and short screened endpoint error text. Daemon observations retain
+loaded model identifiers, type, and architecture -- null when the daemon did not
+report them, never an empty string that would read as measured -- but discard
+model paths and raw command error output. `lms` output is read under a
+per-stream byte cap rather than buffered to completion, its identifiers are
+length-bounded and screened for control, bidi, and zero-width characters, and an
+unscreenable, oversized, or cap-overflowing payload is refused as
+`invalid-response` instead of being stored or misread as an unreachable host.
+The `timeoutMs` argument is a hard bound: the CLI is sent SIGTERM, escalated to
+SIGKILL, and abandoned outright if it still has not released its pipes.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.
