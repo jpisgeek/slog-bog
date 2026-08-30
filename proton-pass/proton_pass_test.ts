@@ -15,11 +15,26 @@
  * Requires --allow-run --allow-write --allow-read (fake binary in a temp dir).
  */
 import { assertEquals } from "jsr:@std/assert@1";
-import { classifyCliFailure, vault } from "./proton_pass.ts";
+import { parse as parseYaml } from "jsr:@std/yaml@1.0.5";
+import {
+  classifyAbort,
+  classifyCliFailure,
+  CLI_VERDICTS,
+  parseItems,
+  vault,
+} from "./proton_pass.ts";
 
 const SECRET = "SUPER-SECRET-VALUE-must-never-be-logged";
+const HERE = import.meta.dirname!;
 
-/** Write an executable fake pass-cli emitting the given stdout/stderr/exit. */
+/**
+ * Write an executable fake pass-cli emitting the given stdout/stderr/exit.
+ *
+ * It also appends its own argv to `<dir>/argv`, one call per line, so a test
+ * can assert what this provider actually SENT rather than only what came back.
+ * The put() round-trip test needs that: the bug there was in the arguments,
+ * and every assertion about the response was green while it was live.
+ */
 async function fakeCli(
   opts: {
     stdout?: string;
@@ -28,7 +43,13 @@ async function fakeCli(
     listing?: string;
     title?: string;
   },
-): Promise<{ path: string; cleanup: () => Promise<void> }> {
+): Promise<
+  {
+    path: string;
+    argv: () => Promise<string[][]>;
+    cleanup: () => Promise<void>;
+  }
+> {
   const dir = await Deno.makeTempDir();
   const path = `${dir}/pass-cli`;
   // `get` now resolves a title to exactly one LIVE item before viewing it, so
@@ -42,6 +63,8 @@ async function fakeCli(
     "#!/bin/sh",
     // --version probe used by resolveBinary must succeed
     'if [ "$1" = "--version" ]; then echo "fake 1.0"; exit 0; fi',
+    // Record argv (tab-separated, one line per invocation).
+    `printf '%s\\t' "$@" >> ${dir}/argv; printf '\\n' >> ${dir}/argv`,
     `if [ "$2" = "list" ]; then cat <<'LIST_EOF'\n${listing}\nLIST_EOF\nexit 0; fi`,
     opts.stdout ? `cat <<'STDOUT_EOF'\n${opts.stdout}\nSTDOUT_EOF` : "",
     opts.stderr ? `cat >&2 <<'STDERR_EOF'\n${opts.stderr}\nSTDERR_EOF` : "",
@@ -51,16 +74,39 @@ async function fakeCli(
   await Deno.chmod(path, 0o755);
   return {
     path,
+    argv: async () => {
+      let raw = "";
+      try {
+        raw = await Deno.readTextFile(`${dir}/argv`);
+      } catch { /* never invoked */ }
+      return raw.split("\n").filter((l) => l.length > 0).map((l) =>
+        l.split("\t").filter((a) => a.length > 0)
+      );
+    },
     cleanup: () => Deno.remove(dir, { recursive: true }),
   };
 }
 
-const providerFor = (binary: string) =>
+const providerFor = (
+  binary: string,
+  extra: Record<string, unknown> = {},
+) =>
   vault.createProvider("proton", {
     vaultName: "myvault",
     defaultField: "password",
     binary,
+    ...extra,
   });
+
+/** Message of whatever the thunk threw, or "" if it returned. */
+async function thrown(fn: () => Promise<unknown>): Promise<string> {
+  try {
+    await fn();
+    return "";
+  } catch (e) {
+    return String(e);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // the block finding: stdout must never reach an error
@@ -485,5 +531,450 @@ Deno.test("a pass:// URI for an item this vault does not list is passed through"
     );
   } finally {
     await cli.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// the response is read at NAMED LOCATIONS, not searched
+//
+// The old extractValue walked every nested object looking for a key with the
+// requested name and returned the first string it found. Depth-bounding it
+// narrowed the blast radius and left the defect in place: a decoy one level
+// down still won. These tests assert the property -- only documented locations
+// are read -- rather than the depth number.
+// ---------------------------------------------------------------------------
+
+const DECOY = "DECOY-VALUE-FROM-SOMEWHERE-ELSE-IN-THE-RESPONSE";
+
+Deno.test("a shallow decoy sharing the field name is never returned as the secret", async () => {
+  const cli = await fakeCli({
+    stdout: JSON.stringify({
+      // Documented location: the item's field list. It does NOT hold
+      // "password".
+      fields: [{ name: "other", value: "not it" }],
+      // Undocumented location, one level deep -- well inside the old bound.
+      metadata: { password: DECOY },
+    }),
+  });
+  try {
+    const msg = await thrown(() =>
+      providerFor(cli.path).get("Example Service")
+    );
+    assertEquals(msg !== "", true, "expected a refusal, got a value");
+    assertEquals(msg.includes(DECOY), false, `DECOY LEAKED: ${msg}`);
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("a decoy beside a documented location is refused", async () => {
+  const cli = await fakeCli({
+    stdout: JSON.stringify({
+      item: { fields: [{ name: "other", value: "not it" }] },
+      diagnostics: { lastResponse: { password: DECOY } },
+    }),
+  });
+  try {
+    const msg = await thrown(() =>
+      providerFor(cli.path).get("Example Service/password")
+    );
+    assertEquals(msg !== "", true, "expected a refusal, got a value");
+    assertEquals(msg.includes(DECOY), false, `DECOY LEAKED: ${msg}`);
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("an item shape matching no documented location is refused, not mined", async () => {
+  const cli = await fakeCli({
+    // An array whose entries are not {name,...} field entries.
+    stdout: JSON.stringify([{ password: DECOY }]),
+  });
+  try {
+    const msg = await thrown(() =>
+      providerFor(cli.path).get("Example Service")
+    );
+    assertEquals(msg.includes("does not recognise"), true, msg);
+    assertEquals(msg.includes(DECOY), false, `DECOY LEAKED: ${msg}`);
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("the documented locations still resolve", async () => {
+  // The refusals above must not have taken the working shapes with them.
+  const shapes: [string, unknown][] = [
+    ["bare field array", [{ name: "password", value: SECRET }]],
+    ["wrapped fields", {
+      item: { fields: [{ name: "password", content: { Hidden: SECRET } }] },
+    }],
+    ["top-level property", { password: SECRET }],
+    ["login block", { item: { login: { password: SECRET } } }],
+  ];
+  for (const [what, shape] of shapes) {
+    const cli = await fakeCli({ stdout: JSON.stringify(shape) });
+    try {
+      assertEquals(
+        await providerFor(cli.path).get("Example Service"),
+        SECRET,
+        what,
+      );
+    } finally {
+      await cli.cleanup();
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// the item list is parsed strictly
+// ---------------------------------------------------------------------------
+
+/** Message of whatever a synchronous thunk threw, or "" if it returned. */
+function thrownSync(fn: () => unknown): string {
+  try {
+    fn();
+    return "";
+  } catch (e) {
+    return String(e);
+  }
+}
+
+Deno.test("blank item-list output is an error, not an empty vault", () => {
+  // `--output json` answers an empty vault with `[]`, never with nothing.
+  // Returning [] made a broken call and "you have no secrets" the same
+  // answer, and the second is a fact a caller acts on.
+  assertEquals(thrownSync(() => parseItems("")) !== "", true);
+  assertEquals(thrownSync(() => parseItems("   \n  \n")) !== "", true);
+  // The genuinely-empty answers still parse.
+  assertEquals(parseItems("[]"), []);
+  assertEquals(parseItems('{"items":[]}'), []);
+});
+
+Deno.test("list() surfaces a blank listing rather than reporting no secrets", async () => {
+  const cli = await fakeCli({ listing: "" });
+  try {
+    const msg = await thrown(() => providerFor(cli.path).list());
+    assertEquals(msg !== "", true, "expected a refusal, got a listing");
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("a text listing must parse EVERY nonblank row", () => {
+  // Skipping unparsed rows made a partially-read listing indistinguishable
+  // from a complete one -- which is how `get` concludes a key is absent when
+  // it is not, and how the duplicate-title check misses the duplicate.
+  const good = "- [A1]: Alpha (state=Active)\n- [B2]: Beta (state=Trashed)";
+  assertEquals(parseItems(good).length, 2);
+  assertEquals(parseItems(good)[1].active, false);
+  const partial = `${good}\nWARNING: listing truncated by the server`;
+  assertEquals(thrownSync(() => parseItems(partial)) !== "", true);
+});
+
+// ---------------------------------------------------------------------------
+// an item with no id cannot be addressed, so it is refused
+// ---------------------------------------------------------------------------
+
+Deno.test("get() fails closed when the matching row carries no item id", async () => {
+  // The id used to be defaulted to "", which typechecked and then silently
+  // disabled the exact-address step: the falsy id fell through to
+  // `--item-title`, the selector this provider exists to stop trusting.
+  const cli = await fakeCli({
+    listing: JSON.stringify({
+      items: [{ title: "Example Service", state: "Active" }],
+    }),
+    stdout: `{"password":"${SECRET}"}`,
+  });
+  try {
+    const msg = await thrown(() =>
+      providerFor(cli.path).get("Example Service")
+    );
+    assertEquals(msg !== "", true, "expected a refusal, got a value");
+    assertEquals(msg.includes(SECRET), false, `SECRET LEAKED: ${msg}`);
+    assertEquals(msg.includes("--item-title"), true, msg);
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("--item-title is never sent to pass-cli", async () => {
+  // The property, not the message: whatever get() resolves, the selector it
+  // hands the CLI addresses exactly one item by id.
+  const cli = await fakeCli({ stdout: `{"password":"${SECRET}"}` });
+  try {
+    assertEquals(await providerFor(cli.path).get("Example Service"), SECRET);
+    const calls = await cli.argv();
+    for (const call of calls) {
+      assertEquals(
+        call.includes("--item-title"),
+        false,
+        `--item-title sent: ${call.join(" ")}`,
+      );
+    }
+    const view = calls.find((c) => c[1] === "view")!;
+    assertEquals(view.includes("--item-id"), true, view.join(" "));
+    assertEquals(view[view.indexOf("--item-id") + 1], "ID1");
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// a malformed pass:// URI is refused, not passed through
+// ---------------------------------------------------------------------------
+
+Deno.test("a pass:// URI missing a share or item id is refused", async () => {
+  const cli = await fakeCli({ stdout: `{"password":"${SECRET}"}` });
+  try {
+    for (
+      const bad of [
+        "pass://",
+        "pass://SHARE1",
+        "pass://SHARE1/",
+        "pass:///ITEM9",
+      ]
+    ) {
+      const msg = await thrown(() => providerFor(cli.path).get(bad));
+      assertEquals(msg !== "", true, `expected a refusal for ${bad}`);
+      assertEquals(msg.includes(SECRET), false, `SECRET LEAKED for ${bad}`);
+    }
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// put(): accept a key, or round-trip it. Never both wrong.
+// ---------------------------------------------------------------------------
+
+Deno.test("every key put() accepts is stored under that exact key", async () => {
+  // The defect this replaces: put("Item/field") split at the slash and wrote
+  // the value to the PASSWORD of an item titled "Item", while get("Item/field")
+  // asked for a field named "field". The write reported success and the read
+  // could never work. put("pass://S/I") created an item titled "pass:".
+  //
+  // The property is accept-or-round-trip: for any key put() does not reject,
+  // the title it sends to pass-cli must be the key itself.
+  const cli = await fakeCli({});
+  try {
+    const p = providerFor(cli.path);
+    let accepted = 0;
+    for (
+      const key of [
+        "Bare Title",
+        "Item/field",
+        "Item/a/b",
+        "pass://SHARE1/ITEM9",
+        "pass://SHARE1/ITEM9/password",
+      ]
+    ) {
+      const msg = await thrown(() => p.put(key, SECRET));
+      if (msg !== "") {
+        assertEquals(msg.includes(SECRET), false, `SECRET LEAKED: ${msg}`);
+        continue; // rejected outright: honest
+      }
+      accepted++;
+      const create = (await cli.argv()).filter((c) => c[1] === "create").pop()!;
+      assertEquals(
+        create[create.indexOf("--title") + 1],
+        key,
+        `put('${key}') stored under a different title`,
+      );
+    }
+    assertEquals(accepted, 1, "the bare title must still be accepted");
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("put() refuses when defaultField would not read back what it wrote", async () => {
+  // put() can only write the password field; get() with no field reads
+  // defaultField. Configured apart, a put/get pair silently fails to
+  // round-trip -- the same class as the qualified-key defect above.
+  const cli = await fakeCli({});
+  try {
+    const p = providerFor(cli.path, { defaultField: "apiKey" });
+    const msg = await thrown(() => p.put("Bare Title", SECRET));
+    assertEquals(msg.includes("defaultField"), true, msg);
+    assertEquals(msg.includes(SECRET), false, `SECRET LEAKED: ${msg}`);
+    assertEquals((await cli.argv()).length, 0, "nothing should have been sent");
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// cancellation
+// ---------------------------------------------------------------------------
+
+Deno.test("caller cancellation outranks the timeout when both have fired", () => {
+  // The old order asked the deadline first, so the common case -- a caller
+  // giving up on a call that was also slow -- was reported as a Proton
+  // timeout, sending whoever read the log to the wrong system.
+  assertEquals(classifyAbort(true, true), "cancelled");
+  assertEquals(classifyAbort(true, false), "cancelled");
+  assertEquals(classifyAbort(false, true), "timeout");
+  assertEquals(classifyAbort(false, false), "exec-failed");
+});
+
+Deno.test("cancellation is honoured during binary resolution", async () => {
+  // Resolution ran BEFORE the signal was consulted, so a caller that had
+  // already given up still waited out up to four 5s --version probes and was
+  // then told the binary could not be found.
+  const p = providerFor("pass-cli-no-such-program-for-tests");
+  const msg = await thrown(() => p.get("Example Service", AbortSignal.abort()));
+  assertEquals(msg.includes("cancelled"), true, `got: ${msg}`);
+  assertEquals(msg.includes("Could not find"), false, `got: ${msg}`);
+});
+
+Deno.test("a caller signal reaches the pass-cli process", async () => {
+  // Proves the signal is threaded from get()/list()/put() and not merely
+  // accepted by run(): with no threading the fake answers happily and the
+  // secret comes back.
+  const cli = await fakeCli({ stdout: `{"password":"${SECRET}"}` });
+  try {
+    const p = providerFor(cli.path);
+    for (
+      const call of [
+        () => p.get("Example Service", AbortSignal.abort()),
+        () => p.list(AbortSignal.abort()),
+        () => p.put("Bare Title", SECRET, AbortSignal.abort()),
+      ]
+    ) {
+      const msg = await thrown(call);
+      assertEquals(msg.includes("cancelled"), true, `got: ${msg}`);
+      assertEquals(msg.includes(SECRET), false, `SECRET LEAKED: ${msg}`);
+    }
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// every interpolated string in an error is bounded
+// ---------------------------------------------------------------------------
+
+Deno.test("no error message carries an unbounded caller-supplied string", async () => {
+  // Secret keys, item titles, field names and the vault name all land in swamp
+  // run logs. Bounding whichever one was noticed first only moves which string
+  // floods the log, so all of them are bounded at one place.
+  const huge = "X".repeat(20_000);
+  const cli = await fakeCli({
+    listing: JSON.stringify({
+      items: [{ id: "ID1", title: "other", state: "Active" }],
+    }),
+    stdout: `{"password":"${SECRET}"}`,
+  });
+  try {
+    const cases: (() => Promise<unknown>)[] = [
+      () => providerFor(cli.path).get(huge),
+      () => providerFor(cli.path).get(`${huge}/${huge}`),
+      () => providerFor(cli.path).get(`pass://${huge}`),
+      () => providerFor(cli.path).put(`${huge}/f`, SECRET),
+      () => providerFor(cli.path, { vaultName: huge }).get(huge),
+      () => providerFor(cli.path).get(`Example Service/${huge}`),
+    ];
+    for (const [i, c] of cases.entries()) {
+      const msg = await thrown(c);
+      assertEquals(msg !== "", true, `case ${i}: expected a throw`);
+      assertEquals(
+        msg.length < 2000,
+        true,
+        `case ${i}: error carried ${msg.length} chars`,
+      );
+      assertEquals(msg.includes(huge), false, `case ${i}: unbounded string`);
+    }
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// the README describes the code that ships
+// ---------------------------------------------------------------------------
+
+const README = await Deno.readTextFile(`${HERE}/README.md`);
+
+Deno.test("the README's verdict list is exactly the set the code can produce", () => {
+  // The Security section used to open by saying error messages carry pass-cli's
+  // stderr or its `Error:` lines, and close by saying nothing pass-cli wrote is
+  // forwarded. Both cannot be true, and a reader acting on the first would have
+  // assumed remote text is available for debugging when it is not.
+  const listed = new Set(
+    [...README.matchAll(/`([a-z][a-z-]*)`/g)]
+      .map((m) => m[1])
+      .filter((w) => (CLI_VERDICTS as readonly string[]).includes(w)),
+  );
+  assertEquals(
+    [...listed].sort(),
+    [...CLI_VERDICTS].sort(),
+    "the README's verdict list has drifted from CLI_VERDICTS",
+  );
+  // And the contradicting claim must not come back.
+  const sec = README.slice(README.indexOf("## Security"));
+  assertEquals(
+    /carry pass-cli's stderr|stderr or its `Error:` lines only/.test(sec),
+    false,
+    "README claims stderr is forwarded; the code classifies it instead",
+  );
+});
+
+Deno.test("the README example is a configuration that works as written", () => {
+  const fence = /```yaml\n([\s\S]*?)```/.exec(README);
+  assertEquals(fence !== null, true, "no yaml example in the README");
+  const body = fence![1];
+
+  // Every config key must sit UNDER `config:`, including any shown commented
+  // out. `deno fmt` reformats this block on every regeneration and dedents a
+  // trailing comment to column 0 -- which is how `binary` ended up outside
+  // `config`, so uncommenting the documented example produced the wrong shape.
+  const configKeys = Object.keys(
+    (vault.configSchema as unknown as { shape: Record<string, unknown> }).shape,
+  );
+  for (const line of body.split("\n")) {
+    const m = /^(\s*)(?:#\s*)?([A-Za-z][A-Za-z0-9_]*)\s*:/.exec(line);
+    if (!m) continue;
+    if (!configKeys.includes(m[2])) continue;
+    assertEquals(
+      m[1].length > 0,
+      true,
+      `config key '${m[2]}' sits at column 0, outside config: ${line}`,
+    );
+  }
+
+  // And the example as a whole parses to a config this provider accepts.
+  const doc = parseYaml(body) as Record<string, unknown>;
+  assertEquals(Object.keys(doc).sort(), ["config", "name", "type"]);
+  assertEquals(doc.type, vault.type);
+  assertEquals(vault.configSchema.safeParse(doc.config).success, true);
+});
+
+Deno.test("the README states the trades the code makes", () => {
+  // An undocumented trade is a finding next round. Each of these is a
+  // deliberate choice the code makes and refuses to hide.
+  // Wrapped by `deno fmt` at render time, so match on normalised whitespace
+  // rather than on where the line breaks happened to land.
+  const prose = README.slice(README.indexOf("## Caveats")).replace(/\s+/g, " ");
+  for (
+    const [what, re] of [
+      [
+        "binary identity is trusted",
+        /nothing verifies its ownership, signature or digest/i,
+      ],
+      ["put() exposes the value in argv", /visible in the process list/i],
+      [
+        "absent state means live",
+        /`state` field is absent is treated as live/i,
+      ],
+      [
+        "cross-vault URIs are not liveness-checked",
+        /passed through untouched/i,
+      ],
+      ["put() takes bare titles only", /BARE ITEM TITLE only/],
+      ["secret keys appear in errors", /Secret keys appear in errors/],
+      ["responses are read at named locations", /named\s+locations only/i],
+    ] as [string, RegExp][]
+  ) {
+    assertEquals(re.test(prose), true, `README does not state: ${what}`);
   }
 });

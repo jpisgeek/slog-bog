@@ -49,7 +49,6 @@ name: proton
 config:
   vaultName: <your-vault> # the Proton Pass vault to read from
   defaultField: password # field used when a key names none
-# binary: /opt/homebrew/bin/pass-cli   # optional; resolved on PATH + known prefixes otherwise
 
 # Then in any model:
 #   apiKey: ${{ vault.get('proton', 'Example Service/API Key') }}
@@ -65,52 +64,76 @@ Requires the Proton Pass CLI (`brew install proton-pass-cli`) and a usable
 session (`pass-cli login`, or a personal access token for unattended runs). On
 macOS the CLI's database key lives in the login Keychain, so `get()` works from
 a GUI login session or a LaunchAgent in that session, not over plain ssh, from a
-LaunchDaemon, or from cron. Item titles can be edited in the Proton Pass UI;
-item IDs cannot, so prefer `pass://` URIs for anything that must not break when
-someone renames an item. `put()` creates a new login item each call (no
-update-in-place) and passes the value as a CLI argument, which is visible in the
-process list to other local users for the duration of the call. Prefer creating
-items in the Proton Pass UI and reading them with `get()`.
+LaunchDaemon, or from cron. Add the optional `binary` key under `config` — an
+absolute path to `pass-cli` — when the CLI is not on the PATH the swamp process
+sees; left unset it is resolved against PATH and then the usual Homebrew
+prefixes. Item titles can be edited in the Proton Pass UI; item IDs cannot, so
+prefer `pass://` URIs for anything that must not break when someone renames an
+item. `put()` takes a BARE ITEM TITLE only — not `Title/field`, not a `pass://`
+URI, and only when `defaultField` is `password` — because
+`pass-cli item create login` can write the password field and nothing else. It
+creates a new login item each call (no update-in-place) and passes the value as
+a CLI argument, which is visible in the process list to other local users for
+the duration of the call. Prefer creating items in the Proton Pass UI and
+reading them with `get()`.
 
 ## Security
 
 Every `get()` is a live lookup; no value is cached, logged, or persisted.
 pass-cli is invoked with `Deno.Command` (never a shell), so there is no argv
-injection. Error messages carry pass-cli's stderr or its `Error:` lines only.
-Raw stdout (which for `item view` is the whole item, secret included) is never
-placed in an exception. Written data: none. **Secret keys appear in errors;
-remote text does not.** A failed lookup says which key failed —
-`Secret 'x/y' not found in vault 'z'` — and that is deliberate. The key is what
-YOU passed in; it is already in the model definition that asked for it, and an
-error that will not say which lookup failed makes a secrets provider
-undiagnosable. What is NOT forwarded is anything pass-cli or Proton said: stderr
-is reduced to a fixed verdict (`session-not-usable`, `vault-not-found`,
-`item-not-found`, `field-not-found`, `permission-denied`, `network-failure`, or
-`unclassified`), because that text can echo the arguments it was given and
-whatever the server returned. Nothing pass-cli or Proton wrote is forwarded
-verbatim — earlier versions of this document said otherwise and the code no
-longer does. Exception strings from here reach swamp run logs and reports. **A
-key splits at the FIRST `/`.** `Example Service/API Key` means the item
-`Example Service`, field `API Key`. An item title containing `/` therefore
-cannot be addressed this way — use a `pass://SHARE_ID/ITEM_ID/FIELD` URI for
-those. The URI form is checked for liveness too. **Deleted means deleted.**
-Proton Pass moves an item to the trash rather than purging it, and `state` has
-always been in the item list. This provider now reads it: a trashed item is not
-listed and is not resolvable, so deleting a secret actually stops it being
-handed out. Previously it did not — the item stayed visible as an available key
-and `--item-title` would resolve to it. **A title must identify exactly one live
-item.** `put()` creates a NEW item on every call rather than updating in place,
-so real vaults accumulate items sharing a title. `pass-cli --item-title`
-silently picks one of them. A lookup that matches more than one active item is
-now refused by name, and a successful lookup is re-addressed by item ID so the
-value returned is the one that was chosen deliberately. Use a `pass://` URI to
-name a specific item when duplicates are intentional. **What this provider does
-not promise.** An item whose `state` field is absent is treated as live, because
-older pass-cli builds omit it and hiding every secret from them would be worse
-than the bug that reading `state` fixes. A `pass://` URI naming an item this
-vault does not list is passed through untouched, since it may address a
-different vault. And every call is a live lookup with a bounded timeout: nothing
-is cached, so a Proton outage is a failure rather than a stale success.
+injection. Written data: none. **Secret keys appear in errors; remote text does
+not.** A failed lookup says which key failed —
+`Secret 'x/y' not found in vault 'z'` — and that is deliberate. The key and the
+vault name are what YOU passed in; they are already in the model definition that
+asked for the secret, and an error that will not say which lookup failed makes a
+secrets provider undiagnosable. Every such string is length-bounded before it
+enters an exception, so a pathological key cannot flood a run log. What is NOT
+forwarded is anything pass-cli or Proton said. Its stdout is never placed in an
+exception at all — for `item view` that stdout is the whole item, secret
+included. Its stderr and its `Error:` lines are read only to classify, and what
+escapes is one fixed verdict from a closed set: `session-not-usable`,
+`vault-not-found`, `item-not-found`, `field-not-found`, `permission-denied`,
+`network-failure`, or `unclassified`. No CLI or server text is forwarded
+verbatim, in any error path. Exception strings from here reach swamp run logs
+and reports. **A key splits at the FIRST `/`.** `Example Service/API Key` means
+the item `Example Service`, field `API Key`. An item title containing `/`
+therefore cannot be addressed this way — use a `pass://SHARE_ID/ITEM_ID/FIELD`
+URI for those. The URI form is checked for liveness too, and a `pass://` URI
+missing a share id or an item id is refused rather than handed to the CLI
+unchecked. **Deleted means deleted.** Proton Pass moves an item to the trash
+rather than purging it, and `state` has always been in the item list. This
+provider now reads it: a trashed item is not listed and is not resolvable, so
+deleting a secret actually stops it being handed out. Previously it did not —
+the item stayed visible as an available key and `--item-title` would resolve to
+it. **A title must identify exactly one live item, addressed by id.** `put()`
+creates a NEW item on every call rather than updating in place, so real vaults
+accumulate items sharing a title, and `pass-cli --item-title` silently picks one
+of them. A lookup that matches more than one active item is refused by name; a
+lookup that matches one is re-addressed by that item's id. `--item-title` is
+never sent. If the item list gives no id for the matching row, the lookup FAILS
+rather than falling back to title selection. Use a `pass://` URI to name a
+specific item when duplicates are intentional. **Responses are read at named
+locations only.** The value returned by `get()` is taken from a documented place
+in `item view --output json` — a `{name,value}` or `{name,content:{…}}` entry in
+the item's field list, a top-level property of the item, or its `login` block —
+and from nowhere else. A response matching none of those shapes is refused.
+Earlier versions searched every nested object for a key with the requested name,
+which could return an unrelated string as the secret. Item listings are likewise
+parsed strictly: every non-blank row must parse, an unrecognised shape is an
+error, and empty output is an error rather than "this vault has no secrets".
+**What this provider does not promise.** An item whose `state` field is absent
+is treated as live, because older pass-cli builds omit it and hiding every
+secret from them would be worse than the bug that reading `state` fixes. A
+`pass://` URI naming an item this vault does not list is passed through
+untouched, since it may address a different vault. The pass-cli executable
+itself is trusted on identity: whichever binary answers `--version` first — the
+first `pass-cli` on PATH, one of the Homebrew prefixes, or whatever `binary`
+points at — receives your item titles, vault name and any `put()` value, and
+nothing verifies its ownership, signature or digest. Pinning a digest would
+break on every CLI release, so the lever is yours: set `binary` to an absolute
+path in a directory you control if PATH is not trustworthy on that host. And
+every call is a live lookup with a bounded timeout: nothing is cached, so a
+Proton outage is a failure rather than a stale success.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.
