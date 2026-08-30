@@ -480,6 +480,89 @@ const COVERAGE_STATES = new Set([
   "unauthorized",
 ]);
 
+/**
+ * Output bounds.
+ *
+ * The inlined contract deliberately carries no `.max()` on any string or array:
+ * it describes what a producer may legitimately mean, not what one renderer is
+ * willing to paint. Bounding therefore belongs here. Previously only `headline`
+ * and `detail` were cut, so a bundle could carry a 50 MB `subject` or `source`
+ * straight into the published HTML file and into every exception resource, and
+ * nothing limited how many bundles, sections, metrics, facts, or exceptions one
+ * render could emit. Every cut below is reported rather than silent.
+ */
+const MAX_ID = 256;
+const MAX_SUBJECT = 200;
+const MAX_SOURCE = 120;
+const MAX_HEADLINE = 160;
+const MAX_DETAIL = 240;
+const MAX_BUNDLES = 64;
+const MAX_SECTIONS = 64;
+const MAX_TABLE_ROWS = 200;
+const MAX_EXCEPTIONS = 200;
+
+type DashboardSection = z.infer<typeof DashboardSectionSchema>;
+
+/**
+ * Worst state a section's own evidence implies, ignoring its declared state.
+ *
+ * `deriveOverallState` escalates over impact:"required" sections only, and that
+ * is correct: an optional section must not make a required deployment look
+ * unhealthy. But the coverage pass in `collectExceptions` used to read each
+ * section's *declared* state, which let an optional or informational section
+ * say state:"healthy" while its own freshness said stale and its completeness
+ * said partial. That section contributed nothing to bundle.state, then matched
+ * bundle.state exactly and so was filtered out of the coverage pass entirely —
+ * a six-day feed outage rendered as the word "stale" inside a collapsed
+ * <details> under a green "Nothing needs you" banner. Impact governs whether a
+ * section escalates the *bundle*; it must never govern whether the section's
+ * own evidence is allowed to be silent.
+ */
+function sectionEvidenceState(section: DashboardSection): DashboardState {
+  let state: DashboardState = section.state;
+  const evidenceStates: DashboardState[] = [
+    section.freshness.state === "stale"
+      ? "stale"
+      : section.freshness.state === "unknown"
+      ? "unknown"
+      : "healthy",
+    section.completeness.state === "partial"
+      ? "partial"
+      : section.completeness.state === "unknown"
+      ? "unknown"
+      : "healthy",
+    section.coverage.kind === "unknown" ? "unknown" : "healthy",
+  ];
+  for (const evidenceState of evidenceStates) {
+    if (STATE_RANK[evidenceState] > STATE_RANK[state]) state = evidenceState;
+  }
+  return state;
+}
+
+/**
+ * The producer's own explanation of why a section is not fresh/exact.
+ *
+ * The contract *requires* `freshness.reason` whenever state is not "fresh" and
+ * `completeness.reason` whenever state is not "exact", precisely so the page
+ * can say what happened. Both were validated and then dropped: the coverage
+ * line printed the bare state word and the synthetic coverage exception used
+ * the section's generic `summary`, so "collector last succeeded 2026-08-24; 3
+ * retries timed out against 10.0.4.12" became "Freshness: stale".
+ */
+function evidenceReasons(section: DashboardSection): string[] {
+  const reasons: string[] = [];
+  if (section.freshness.state !== "fresh" && section.freshness.reason) {
+    reasons.push(`freshness: ${section.freshness.reason}`);
+  }
+  if (section.completeness.state !== "exact" && section.completeness.reason) {
+    reasons.push(`completeness: ${section.completeness.reason}`);
+  }
+  if (section.coverage.notes) {
+    reasons.push(`coverage: ${section.coverage.notes}`);
+  }
+  return reasons;
+}
+
 function esc(value: unknown): string {
   return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -508,19 +591,46 @@ function syntheticId(family: string, ...parts: string[]): string {
 function scopedExceptionId(bundleId: string, exceptionId: string): string {
   return tupleId(bundleId, exceptionId);
 }
+/**
+ * Bound an exception id without letting two distinct ids become one.
+ *
+ * The id is identity, not prose: the dedup set, the suppression config, and
+ * `resourceName` all key on it, so a bare slice would let two long producer ids
+ * collide into a single row and a single suppression. The cut form therefore
+ * carries a hash of the original. Suppression stays workable because operators
+ * copy the id out of the emitted exception resource, which is this same value.
+ */
+function capId(value: string): string {
+  if (value.length <= MAX_ID) return value;
+  return `${value.slice(0, MAX_ID - 9)}~${fnv1a(value)}`;
+}
 function makeExc(
   input:
     & Omit<Exc, "truncated" | "sensitivity">
     & Partial<Pick<Exc, "sensitivity">>,
 ): Exc {
-  const headCut = input.headline.length > 160;
-  const detailCut = input.detail.length > 240;
+  // Previously only headline and detail were cut and `truncated` was reported
+  // from those two alone, so id, subject, and source rode the `...input` spread
+  // through at whatever length the producer chose — into the published HTML,
+  // into the exception resource, and into its `source` tag — while the record
+  // still claimed truncated:false. All five free-text fields are bounded now
+  // and `truncated` is true if any of them was cut.
+  const id = capId(input.id);
+  const subject = input.subject.slice(0, MAX_SUBJECT);
+  const source = input.source.slice(0, MAX_SOURCE);
+  const headline = input.headline.slice(0, MAX_HEADLINE);
+  const detail = input.detail.slice(0, MAX_DETAIL);
   return {
     ...input,
     sensitivity: input.sensitivity ?? "operational",
-    headline: input.headline.slice(0, 160),
-    detail: input.detail.slice(0, 240),
-    truncated: headCut || detailCut,
+    id,
+    subject,
+    source,
+    headline,
+    detail,
+    truncated: id !== input.id || subject !== input.subject ||
+      source !== input.source || headline !== input.headline ||
+      detail !== input.detail,
   };
 }
 function stateSeverity(state: string): Exc["severity"] {
@@ -547,7 +657,26 @@ function parseInputs(inputs: unknown[]) {
       suppressReason: "",
     }));
   }
-  for (const [index, input] of inputs.entries()) {
+  // Nothing bounded the bundles argument, so one CEL expression fanning out
+  // over a whole datastore could drive an unbounded number of parses, HTML
+  // sections, and exception resources. Render a bounded prefix and say plainly
+  // that the rest was dropped rather than silently rendering everything.
+  const accepted = inputs.slice(0, MAX_BUNDLES);
+  if (inputs.length > accepted.length) {
+    issues.push(makeExc({
+      id: syntheticId("input", "too-many-bundles"),
+      severity: "warning",
+      subject: "Dashboard coverage",
+      headline: `Only the first ${MAX_BUNDLES} bundles were rendered`,
+      detail: `${inputs.length} bundles were supplied; ${
+        inputs.length - accepted.length
+      } were not read and are not represented anywhere on this page.`,
+      source: "renderer",
+      suppressed: false,
+      suppressReason: "",
+    }));
+  }
+  for (const [index, input] of accepted.entries()) {
     try {
       const bundle = parseDashboardBundle(input);
       if (bundleIds.has(bundle.id)) {
@@ -648,15 +777,27 @@ function collectExceptions(
         parts: [bundle.id],
         title: bundle.title,
         state: bundle.state,
+        // A bundle-level coverage state is always caused by some section's
+        // evidence, so carry that producer-written explanation up instead of
+        // falling through to the generic "reports incomplete coverage" line.
+        reasons: bundle.sections
+          .filter((s) => sectionEvidenceState(s) === bundle.state)
+          .flatMap(evidenceReasons),
         summary: "",
       },
-      ...bundle.sections.filter((s) => s.state !== bundle.state).map((s) => ({
+      // Filter on the section's *evidence* state, not its declared state. The
+      // old `s.state !== bundle.state` filter dropped any section whose
+      // declared state happened to equal the bundle's, which is exactly the
+      // case a section lying about itself produces: declared "healthy" on a
+      // healthy bundle, with stale freshness and partial completeness beneath.
+      ...bundle.sections.map((s) => ({
         family: "section",
         parts: [bundle.id, s.id],
         title: s.title,
-        state: s.state,
+        state: sectionEvidenceState(s),
+        reasons: evidenceReasons(s),
         summary: s.summary,
-      })),
+      })).filter((s) => s.state !== bundle.state),
     ];
     for (const item of states) {
       if (!COVERAGE_STATES.has(item.state)) continue;
@@ -667,7 +808,7 @@ function collectExceptions(
         severity: stateSeverity(item.state),
         subject: item.title,
         headline: `Coverage is ${item.state}`,
-        detail: item.summary ||
+        detail: item.reasons.join(" · ") || item.summary ||
           "The normalized bundle reports incomplete coverage.",
         source: bundle.producer.extension,
         suppressed: false,
@@ -684,9 +825,30 @@ function collectExceptions(
       e.suppressReason = reason;
     }
   }
-  return out.sort((a, b) =>
-    SEV_RANK[a.severity] - SEV_RANK[b.severity] || a.id.localeCompare(b.id)
-  );
+  const bySeverity = (a: Exc, b: Exc) =>
+    SEV_RANK[a.severity] - SEV_RANK[b.severity] || a.id.localeCompare(b.id);
+  out.sort(bySeverity);
+  // Every exception becomes a row in the page and a written resource, and
+  // nothing bounded how many one bundle could carry. Cap after sorting so the
+  // most severe survive, and spend one slot saying what was dropped — a silent
+  // cap would be the same failure this renderer exists to prevent.
+  if (out.length > MAX_EXCEPTIONS) {
+    const kept = out.slice(0, MAX_EXCEPTIONS - 1);
+    const dropped = out.length - kept.length;
+    kept.push(makeExc({
+      id: syntheticId("render", "exception-overflow"),
+      severity: "warning",
+      subject: "Dashboard coverage",
+      headline: `${dropped} further exceptions were not rendered`,
+      detail:
+        `This render produced ${out.length} exceptions; the ${dropped} least severe are not on this page and were not written as resources.`,
+      source: "renderer",
+      suppressed: false,
+      suppressReason: "",
+    }));
+    return kept.sort(bySeverity);
+  }
+  return out;
 }
 
 function renderHtml(d: {
@@ -699,6 +861,30 @@ function renderHtml(d: {
   const expected = d.exceptions.filter((e) => e.suppressed);
   const allClear = active.length === 0 && d.bundles.length > 0 &&
     d.bundles.every((bundle) => bundle.state === "healthy");
+  // The headline used to branch on active.length alone once allClear was false,
+  // so suppressing the only exception on a degraded bundle printed the literal
+  // "0 things need you" above a bundle whose state was degraded or critical.
+  // Nothing was hidden — the banner lost its clear styling and the item stayed
+  // under "Expected" — but the sentence contradicted itself. Say what is
+  // actually true instead: quiet, and why quiet is not the same as healthy.
+  const nonHealthy = [
+    ...new Set(
+      d.bundles.filter((bundle) => bundle.state !== "healthy").map((bundle) =>
+        bundle.state
+      ),
+    ),
+  ].sort((a, b) => STATE_RANK[b] - STATE_RANK[a]);
+  const quietReason = nonHealthy.length
+    ? `bundle state ${nonHealthy.join(", ")}`
+    : "no validated bundles";
+  // The only timestamp on the page was the renderer's own clock, so a page
+  // rebuilt from a bundle generated six days ago still read as current. Show
+  // the oldest bundle's own generatedAt next to it.
+  const oldestGeneratedAt = d.bundles.length
+    ? d.bundles.map((bundle) => bundle.generatedAt).reduce((a, b) =>
+      Date.parse(b) < Date.parse(a) ? b : a
+    )
+    : "";
   const excRow = (e: Exc, muted = false) => `
 <li class="exc ${esc(e.severity)}${muted ? " muted" : ""}">
 <span class="sev">${
@@ -713,21 +899,44 @@ function renderHtml(d: {
       : ""
   }</div></div>
 <span class="src">${esc(e.source)}</span></li>`;
-  const details = d.bundles.flatMap((bundle) =>
-    bundle.sections.map((section) => {
-      const metrics = section.metrics.map((metric) => {
+  // Bound the rendered rows per section and sections per bundle, and say how
+  // many were dropped. An unbounded metrics array wrote an unbounded table into
+  // a file that lands in a web root.
+  const overflowRow = (total: number, shown: number, columns: number) =>
+    total > shown
+      ? `<tr><td colspan="${columns}"><em>${
+        total - shown
+      } more rows not shown</em></td></tr>`
+      : "";
+  const details = d.bundles.flatMap((bundle) => {
+    const shownSections = bundle.sections.slice(0, MAX_SECTIONS);
+    const rendered = shownSections.map((section) => {
+      const shownMetrics = section.metrics.slice(0, MAX_TABLE_ROWS);
+      const metrics = shownMetrics.map((metric) => {
         const value = metric.availability === "observed"
           ? `${esc(metric.value)} ${esc(metric.unit)}`
           : `<em>${esc(metric.availability)}: ${esc(metric.reason)}</em>`;
+        // metric.limit was validated and then never rendered, so a metric
+        // sitting at 95000 against a provider limit of 100000 looked identical
+        // to one with no threshold at all.
+        const limit = metric.limit
+          ? `${esc(metric.limit.value)} ${esc(metric.unit)} · ${
+            esc(metric.limit.kind)
+          }${metric.limit.period ? ` / ${esc(metric.limit.period)}` : ""}${
+            metric.limit.authoritative ? "" : " · unconfirmed"
+          }`
+          : "—";
         return `<tr><td>${esc(metric.label)}</td><td>${value}</td><td>${
           esc(metric.confidence)
-        }</td></tr>`;
-      }).join("");
-      const facts = section.facts.map((fact) =>
+        }</td><td>${limit}</td></tr>`;
+      }).join("") + overflowRow(section.metrics.length, shownMetrics.length, 4);
+      const shownFacts = section.facts.slice(0, MAX_TABLE_ROWS);
+      const facts = shownFacts.map((fact) =>
         `<tr><td>${esc(fact.label)}</td><td>${esc(fact.value)}</td><td>${
           esc(fact.confidence)
         }</td></tr>`
-      ).join("");
+      ).join("") + overflowRow(section.facts.length, shownFacts.length, 3);
+      const reasons = evidenceReasons(section);
       return `<details><summary>${esc(section.title)} · ${
         esc(section.state)
       }</summary>
@@ -735,10 +944,14 @@ function renderHtml(d: {
         esc(section.coverage.kind)
       } · ${esc(section.coverage.scope)} · Freshness: ${
         esc(section.freshness.state)
-      } · Completeness: ${esc(section.completeness.state)}</div>
+      } · Completeness: ${
+        esc(section.completeness.state)
+      } · Generated <time datetime="${esc(bundle.generatedAt)}">${
+        esc(bundle.generatedAt)
+      }</time>${reasons.length ? ` · ${esc(reasons.join(" · "))}` : ""}</div>
 ${
         metrics
-          ? `<table><thead><tr><th>Metric</th><th>Value</th><th>Confidence</th></tr></thead><tbody>${metrics}</tbody></table>`
+          ? `<table><thead><tr><th>Metric</th><th>Value</th><th>Confidence</th><th>Limit</th></tr></thead><tbody>${metrics}</tbody></table>`
           : ""
       }
 ${
@@ -746,8 +959,16 @@ ${
           ? `<table><thead><tr><th>Fact</th><th>Value</th><th>Confidence</th></tr></thead><tbody>${facts}</tbody></table>`
           : ""
       }</details>`;
-    })
-  ).join("\n");
+    });
+    if (bundle.sections.length > shownSections.length) {
+      rendered.push(
+        `<details><summary>${esc(bundle.title)} · ${
+          bundle.sections.length - shownSections.length
+        } more sections not shown</summary><p class="summary">This bundle carries ${bundle.sections.length} sections; only the first ${MAX_SECTIONS} are rendered.</p></details>`,
+      );
+    }
+    return rendered;
+  }).join("\n");
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>${
     esc(d.title)
   }</title><style>
@@ -772,9 +993,17 @@ td{padding:7px 18px 7px 0;border-bottom:1px solid var(--line)}footer{margin-top:
     esc(d.title)
   }</h1><div class="ts">rendered <time datetime="${esc(d.now)}">${
     esc(d.now)
-  }</time></div></header><div class="banner${allClear ? " clear" : ""}"><h2>${
+  }</time>${
+    oldestGeneratedAt
+      ? ` · oldest bundle generated <time datetime="${
+        esc(oldestGeneratedAt)
+      }">${esc(oldestGeneratedAt)}</time>`
+      : ""
+  }</div></header><div class="banner${allClear ? " clear" : ""}"><h2>${
     allClear
       ? "Nothing needs you"
+      : active.length === 0
+      ? `Nothing active · ${esc(quietReason)}`
       : `${active.length} thing${active.length === 1 ? "" : "s"} need${
         active.length === 1 ? "s" : ""
       } you`
