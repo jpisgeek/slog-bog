@@ -1040,3 +1040,434 @@ Deno.test("dependencies: two keys folding to one machine are reported, not silen
     "an ambiguous dependency config must not be resolved by iteration order",
   );
 });
+
+// ---------------------------------------------------------------------------
+// resource identity — a name collision is not a warning, it is one record
+// overwriting another, which deletes a host from the inventory for good
+// ---------------------------------------------------------------------------
+
+Deno.test("identity: two devices whose identity tuples differ get different resource names", async () => {
+  // The identity used to be hashed as `${gid}|${mac}|${id}`, which is not an
+  // encoding of a tuple: the separator is a legal character in an MSP id, so
+  // distinct identities render to the same string. These two do --
+  //   ("a",     "m", "b|m|c")  ->  "a|m|b|m|c"
+  //   ("a|m|b", "m", "c")      ->  "a|m|b|m|c"
+  // -- and the slug is "m" for both, so the OLD code gave both devices the
+  // resource name `device-m-<same fnv1a>` and the second silently overwrote
+  // the first. No birthday luck required; this is the encoding being wrong.
+  const m = mockCtx({});
+  const f = stubFetch(() =>
+    jsonResponse({
+      results: [
+        DEV({ gid: "a", mac: "m", id: "b|m|c", name: "one" }),
+        DEV({ gid: "a|m|b", mac: "m", id: "c", name: "two" }),
+      ],
+    })
+  );
+  try {
+    await run(m.ctx);
+  } finally {
+    f.restore();
+  }
+  const names = m.written.filter((w) => w.spec === "device").map((w) => w.name);
+  assertEquals(names.length, 2, "precondition: both devices were written");
+  assertEquals(
+    new Set(names).size,
+    2,
+    `two distinct devices shared one resource name: ${names.join(", ")}`,
+  );
+});
+
+Deno.test("identity: a device named like a disambiguated machine key does not merge into it", async () => {
+  // The duplicate-machine key was `${strippedName}-${last4OfMac}`. `-` is
+  // legal -- and ubiquitous -- in a Firewalla device name, so a real device
+  // the firewall reports as `purifier-ee22` was the same key as the
+  // disambiguated second `purifier` whose MAC ends ee:22. The two collapsed
+  // into a single machine holding both hosts' interfaces, and one host left
+  // the SSH fleet.
+  const m = mockCtx({});
+  const f = stubFetch(() =>
+    jsonResponse({
+      results: [
+        DEV({
+          id: "aa:bb:cc:dd:ee:11",
+          mac: "aa:bb:cc:dd:ee:11",
+          name: "purifier",
+        }),
+        DEV({
+          id: "aa:bb:cc:dd:ee:22",
+          mac: "aa:bb:cc:dd:ee:22",
+          name: "purifier",
+        }),
+        DEV({
+          id: "aa:bb:cc:dd:ee:33",
+          mac: "aa:bb:cc:dd:ee:33",
+          name: "purifier-ee22",
+        }),
+      ],
+    })
+  );
+  try {
+    await run(m.ctx);
+  } finally {
+    f.restore();
+  }
+  const machines = machinesWritten(m.written);
+  assertEquals(machines.length, 3, "three hosts must be three machines");
+  assertEquals(
+    machines.every((x) => x.interfaceCount === 1),
+    true,
+    "no machine may end up holding another host's interface",
+  );
+  const names = m.written.filter((w) => w.spec === "machine").map((w) =>
+    w.name
+  );
+  assertEquals(new Set(names).size, 3, "machine resource names must be unique");
+});
+
+Deno.test("identity: an absurdly long MSP id does not produce an unbounded resource name", async () => {
+  // The slug was interpolated straight from the MSP's id. It is a readability
+  // affordance -- the digest beside it carries the identity -- so it is
+  // bounded now that it no longer has to be unique on its own.
+  const m = mockCtx({});
+  const long = "z".repeat(5000);
+  const f = stubFetch(() =>
+    jsonResponse({ results: [DEV({ id: long, mac: long, name: "big" })] })
+  );
+  try {
+    await run(m.ctx);
+  } finally {
+    f.restore();
+  }
+  const name = m.written.find((w) => w.spec === "device")!.name;
+  assertEquals(
+    name.length < 128,
+    true,
+    `resource name is unbounded (${name.length} chars)`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// machine addresses — absent must stay distinguishable from blank, on the
+// field the generated SSH fleet actually connects to
+// ---------------------------------------------------------------------------
+
+Deno.test("machine schema: primaryIp and interface ip are optional", () => {
+  // The old contract REQUIRED both, which is why the sync backfilled `""`.
+  const machine = {
+    name: "host",
+    deviceType: "desktop",
+    macVendor: "v",
+    tier: "deep",
+    sshCandidate: true,
+    online: false,
+    networks: ["Root"],
+    interfaces: [{
+      name: "host",
+      mac: "aa:bb:cc:dd:ee:ff",
+      network: "Root",
+      online: false,
+    }],
+    interfaceCount: 1,
+  };
+  assertEquals(
+    model.resources.machine.schema.safeParse(machine).success,
+    true,
+    "a machine with no known address must be a valid record",
+  );
+});
+
+Deno.test("machine: an address the firewall never reported is omitted, not blank", async () => {
+  // `primaryIp: device.ip ?? ""` made "the firewall has no address for this
+  // host" indistinguishable from "the address is the empty string", on the one
+  // field a generated SSH fleet dials. A consumer that checks for the key now
+  // gets the truth; one that read `""` got a fleet entry pointing nowhere.
+  const m = mockCtx({});
+  const f = stubFetch(() =>
+    jsonResponse({ results: [DEV({ name: "noaddr", deviceType: "desktop" })] })
+  );
+  try {
+    await run(m.ctx);
+  } finally {
+    f.restore();
+  }
+  const machine = machinesWritten(m.written)[0];
+  assertEquals(
+    "primaryIp" in machine,
+    false,
+    `an unknown address must leave the key off: ${JSON.stringify(machine)}`,
+  );
+  const iface = (machine.interfaces as Array<Record<string, unknown>>)[0];
+  assertEquals("ip" in iface, false, "same rule on the interface list");
+  assertEquals(
+    model.resources.machine.schema.safeParse(machine).success,
+    true,
+    "the record the sync writes must satisfy its own schema",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// exclude — the option says "never treated as machines" and now means it
+// ---------------------------------------------------------------------------
+
+Deno.test("exclude: an excluded device is not aggregated into a machine", async () => {
+  // `exclude` only switched off SSH candidacy. The dock was still collapsed
+  // into a machine, still written as a `machine` resource, and still counted
+  // in `inventory.machines` -- so the roll-up reported machines the operator
+  // had explicitly declared were not machines.
+  const m = mockCtx({ exclude: ["dock-*"] });
+  const f = stubFetch(() =>
+    jsonResponse({
+      results: [
+        DEV({
+          id: "aa:bb:cc:dd:ee:11",
+          mac: "aa:bb:cc:dd:ee:11",
+          name: "dock-desk",
+          deviceType: "desktop",
+          ip: "203.0.113.11",
+        }),
+        DEV({
+          id: "aa:bb:cc:dd:ee:22",
+          mac: "aa:bb:cc:dd:ee:22",
+          name: "workstation",
+          deviceType: "desktop",
+          ip: "203.0.113.22",
+        }),
+      ],
+    })
+  );
+  try {
+    await run(m.ctx);
+  } finally {
+    f.restore();
+  }
+  const machines = machinesWritten(m.written);
+  assertEquals(machines.length, 1, "the dock must not become a machine");
+  assertEquals(machines[0].name, "workstation");
+  const inv = m.written.find((w) => w.spec === "inventory")!.data;
+  assertEquals(inv.machines, 1, "the roll-up must not count excluded devices");
+  assertEquals(inv.excluded, 1);
+  // Still reported as a device, which is the point of the `excluded` flag.
+  const dock = m.written
+    .filter((w) => w.spec === "device")
+    .find((w) => w.data.name === "dock-desk");
+  assertEquals(dock !== undefined, true, "the dock must still be a device");
+  assertEquals(dock!.data.excluded, true);
+});
+
+// ---------------------------------------------------------------------------
+// excludeNetworks — "not stored" has to hold for records stored BEFORE the
+// network was excluded, or it is not a scope control
+// ---------------------------------------------------------------------------
+
+Deno.test("excludeNetworks: previously stored records are purged even on a filtered run", async () => {
+  // Excluding a network stopped new writes and did nothing about what was
+  // already there. Ordinary pruning was never going to reach it either: a
+  // filtered run does not prune at all, and a shrink-guarded full run keeps
+  // everything by design. The operator read "not collected, not counted, not
+  // stored" and kept a guest VLAN in the datastore indefinitely.
+  //
+  // This run is `network`-filtered, so the prune pass is skipped entirely --
+  // every deletion below comes from the purge, which is the point.
+  const m = mockCtx({ excludeNetworks: ["Guest"] }, {
+    stored: {
+      "device-old-11111111": { name: "guest-tv", network: "guest" },
+      "machine-old-22222222": { name: "guest-tv", networks: ["Guest"] },
+      "machine-mixed-33333333": { name: "nas", networks: ["Guest", "Root"] },
+      "device-keep-44444444": { name: "server", network: "Root" },
+      inventory: { total: 4 },
+    },
+  });
+  const f = stubFetch(() =>
+    jsonResponse({ results: [DEV({ name: "server", network: "Root" })] })
+  );
+  try {
+    await run(m.ctx, { network: "Root" });
+  } finally {
+    f.restore();
+  }
+  assertEquals(
+    m.deleted.sort(),
+    ["device-old-11111111", "machine-old-22222222"],
+    "records wholly on an excluded network must go, and nothing else",
+  );
+});
+
+Deno.test("excludeNetworks: the purge does not run when nothing is excluded", async () => {
+  // The purge authorises deletions outside the prune guards, so it must be
+  // inert unless the operator asked for it.
+  const m = mockCtx({}, {
+    stored: {
+      "device-old-11111111": { name: "guest-tv", network: "guest" },
+      inventory: { total: 1 },
+    },
+  });
+  const f = stubFetch(() =>
+    jsonResponse({ results: [DEV({ name: "server", network: "Root" })] })
+  );
+  try {
+    await run(m.ctx, { network: "Root" });
+  } finally {
+    f.restore();
+  }
+  assertEquals(
+    m.deleted,
+    [],
+    "a filtered run with no exclusions deletes nothing",
+  );
+});
+
+Deno.test("the excluded-network purge is a named, skippable check", () => {
+  const check = model.checks?.["excluded-networks-are-purged-from-storage"];
+  assertEquals(
+    typeof check,
+    "object",
+    "the second destructive path must be nameable and skippable too",
+  );
+  assertEquals(check!.appliesTo.includes("syncDevices"), true);
+});
+
+// ---------------------------------------------------------------------------
+// abort classification — a cancelled run must not be reported as a broken MSP
+// ---------------------------------------------------------------------------
+
+/**
+ * A Response whose body rejects mid-read, aborting `controller` as it does so
+ * -- the shape of a caller cancelling, or `timeoutSec` firing, while the body
+ * is still arriving.
+ */
+function abortingBody(controller: AbortController, status = 200): Response {
+  const body = new ReadableStream({
+    pull() {
+      controller.abort();
+      return Promise.reject(new DOMException("aborted", "AbortError"));
+    },
+  });
+  return new Response(body, {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+Deno.test("abort: cancellation while reading the body is not reported as bad JSON", async () => {
+  // Only the initial fetch catch told cancellation from failure. A body read
+  // cut short went to `response.json()`'s catch and came out as "returned a
+  // response that could not be parsed as JSON" -- sending the operator to look
+  // at the vendor for a run their own workflow had cancelled.
+  const m = mockCtx({});
+  const ac = new AbortController();
+  m.ctx.signal = ac.signal;
+  const f = stubFetch(() => Promise.resolve(abortingBody(ac)));
+  let err: Error;
+  try {
+    err = await runExpectingThrow(m.ctx);
+  } finally {
+    f.restore();
+  }
+  assertEquals(
+    err.message.includes("CANCELLED"),
+    true,
+    `a cancelled body read must be reported as cancellation: ${err.message}`,
+  );
+  assertEquals(
+    err.message.includes("could not be parsed as JSON"),
+    false,
+    `cancellation misreported as a parse failure: ${err.message}`,
+  );
+});
+
+Deno.test("abort: cancellation while reading an HTTP error body is not swallowed", async () => {
+  // The error path read the body with `.catch(() => "")`, so a cancellation
+  // here vanished completely and the run was reported as an HTTP failure with
+  // a blank detail. Same class as the JSON path, different call site.
+  const m = mockCtx({});
+  const ac = new AbortController();
+  m.ctx.signal = ac.signal;
+  const f = stubFetch(() => Promise.resolve(abortingBody(ac, 502)));
+  let err: Error;
+  try {
+    err = await runExpectingThrow(m.ctx);
+  } finally {
+    f.restore();
+  }
+  assertEquals(
+    err.message.includes("CANCELLED"),
+    true,
+    `a cancelled error-body read must be reported as such: ${err.message}`,
+  );
+  assertEquals(
+    err.message.includes("502"),
+    true,
+    "the status already observed is still worth reporting",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Retry-After — the README says it is honoured, so both standard forms must be
+// ---------------------------------------------------------------------------
+
+Deno.test("Retry-After: an HTTP-date is honoured, not silently ignored", async () => {
+  // `Number(header)` is NaN for the date form, so the code fell through to
+  // exponential backoff (500ms on the first attempt) while the README claimed
+  // the header was honoured -- documentation describing an unreachable branch.
+  // A date ~2s out must therefore produce a wait well past that 500ms.
+  const m = mockCtx({ timeoutSec: 30 });
+  let attempt = 0;
+  const f = stubFetch(() => {
+    attempt++;
+    if (attempt === 1) {
+      return Promise.resolve(
+        new Response("busy", {
+          status: 503,
+          headers: {
+            "Retry-After": new Date(Date.now() + 2000).toUTCString(),
+          },
+        }),
+      );
+    }
+    return jsonResponse({ results: [DEV()] });
+  });
+  const started = Date.now();
+  try {
+    await run(m.ctx);
+  } finally {
+    f.restore();
+  }
+  const elapsed = Date.now() - started;
+  assertEquals(attempt, 2, "precondition: the 503 was retried");
+  assertEquals(
+    elapsed >= 900,
+    true,
+    `HTTP-date Retry-After ignored; retried after only ${elapsed}ms`,
+  );
+  assertEquals(
+    elapsed < 6000,
+    true,
+    `the 5s cap must still apply, waited ${elapsed}ms`,
+  );
+});
+
+Deno.test("Retry-After: an unparseable value falls back to backoff rather than throwing", async () => {
+  const m = mockCtx({ timeoutSec: 30 });
+  let attempt = 0;
+  const f = stubFetch(() => {
+    attempt++;
+    if (attempt === 1) {
+      return Promise.resolve(
+        new Response("busy", {
+          status: 503,
+          headers: { "Retry-After": "soon-ish" },
+        }),
+      );
+    }
+    return jsonResponse({ results: [DEV()] });
+  });
+  const started = Date.now();
+  try {
+    await run(m.ctx);
+  } finally {
+    f.restore();
+  }
+  assertEquals(attempt, 2);
+  assertEquals(Date.now() - started < 2000, true, "backoff, not a long wait");
+});
