@@ -907,3 +907,582 @@ Deno.test("node: a non-numeric cores_total is stored as 0, never NaN", async () 
     "the written record must satisfy its own schema",
   );
 });
+
+// ---------------------------------------------------------------------------
+// 13. the agent must not be able to relocate our request
+//
+// review finding 2 (2026-08-23): `fetch` defaulted to redirect: "follow", so a
+// server answering 302 with an http:// Location silently downgraded an
+// operator's deliberate https:// configuration to cleartext -- and nothing in
+// the stored record or in the log said it had happened.
+// ---------------------------------------------------------------------------
+
+/**
+ * A fetch stub that HONOURS `init.redirect`, the way a real user agent does.
+ *
+ * The plain `stubFetch` above ignores init entirely, so a redirect test built
+ * on it would pass whether or not the source sets a redirect policy at all --
+ * the "typechecks perfectly, never runs" failure this repo keeps hitting. This
+ * one re-issues the request itself when the policy is "follow", which is the
+ * only way the test can tell a fix that runs from a fix that merely compiles.
+ *
+ * The cleartext side answers with a complete, HEALTHY payload on purpose: if
+ * the redirect is ever followed again the sweep succeeds, so the assertions
+ * below fail loudly rather than the downgrade hiding behind some unrelated
+ * error.
+ */
+function stubRedirectingFetch(seen: string[]) {
+  const original = globalThis.fetch;
+  const serve = (url: string): Response => {
+    if (url.includes("/api/v1/alarms")) return json({ alarms: {} });
+    if (url.includes("/api/v1/charts")) return json({ charts: {} });
+    return json({ version: "9.9", hostname: "downgraded" });
+  };
+  const impl = (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const url = String(input instanceof Request ? input.url : input);
+    seen.push(url);
+    if (url.startsWith("https://")) {
+      const location = url.replace(/^https:/, "http:");
+      const mode = init?.redirect ?? "follow";
+      if (mode === "error") {
+        return Promise.reject(new TypeError("redirect not allowed"));
+      }
+      if (mode === "manual") {
+        return Promise.resolve(
+          new Response(null, { status: 302, headers: { location } }),
+        );
+      }
+      // "follow": a real agent transparently re-issues against the new URL.
+      return impl(location, init);
+    }
+    return Promise.resolve(serve(url));
+  };
+  globalThis.fetch = impl as typeof fetch;
+  return () => {
+    globalThis.fetch = original;
+  };
+}
+
+Deno.test("redirect: an https node is never downgraded to cleartext by a 302", async () => {
+  const seen: string[] = [];
+  const restore = stubRedirectingFetch(seen);
+  try {
+    const m = mockCtx({ nodes: [NODE({ url: "https://agent.example.com" })] });
+    // deno-lint-ignore no-explicit-any
+    await model.methods.discover.execute({}, m.ctx as any);
+
+    assertEquals(
+      seen.some((u) => u.startsWith("http://")),
+      false,
+      `swamp made a cleartext request after being configured for https: ${
+        seen.join(", ")
+      }`,
+    );
+    const node = m.written.find((w) => w.spec === "node")!.data;
+    assertEquals(
+      node.reachable,
+      false,
+      "a refused redirect is a failed poll, not a successful one",
+    );
+    assertEquals(
+      node.version,
+      null,
+      "nothing from the redirect target may reach stored data",
+    );
+    assertEquals(
+      node.hostname,
+      null,
+      "nothing from the redirect target may reach stored data",
+    );
+    assertEquals(
+      String(node.error).toLowerCase().includes("redirect"),
+      true,
+      `the stored error must name the refusal, got: ${node.error}`,
+    );
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("redirect: the stored error names the refusal but not the Location", async () => {
+  // The Location value is remote-supplied text, and the README's threat model
+  // has an on-path party choosing it. It belongs in the log, not in a stored
+  // field an operator reads as fact.
+  const restore = stubRedirectingFetch([]);
+  try {
+    const m = mockCtx({ nodes: [NODE({ url: "https://agent.example.com" })] });
+    // deno-lint-ignore no-explicit-any
+    await model.methods.discover.execute({}, m.ctx as any);
+    const err = String(m.written.find((w) => w.spec === "node")!.data.error);
+    assertEquals(err.includes("http://"), false, `Location persisted: ${err}`);
+    assertEquals(err.includes("agent.example.com"), false, `leaked: ${err}`);
+  } finally {
+    restore();
+  }
+});
+
+/** Replace Deno.Command with a stub returning one fixed ssh stdout. */
+function stubSshCommand(stdout: string) {
+  const original = Deno.Command;
+  // deno-lint-ignore no-explicit-any
+  (Deno as any).Command = class {
+    constructor(_cmd: string, _opts: unknown) {}
+    output() {
+      return Promise.resolve({
+        success: true,
+        code: 0,
+        signal: null,
+        stdout: new TextEncoder().encode(stdout),
+        stderr: new Uint8Array(),
+      });
+    }
+  };
+  return () => {
+    // deno-lint-ignore no-explicit-any
+    (Deno as any).Command = original;
+  };
+}
+
+Deno.test("redirect: the ssh transport refuses a 3xx with the same class", async () => {
+  // curl runs without -L so it never FOLLOWS a redirect, but a 3xx used to
+  // arrive here as an empty body and get reported as "empty response over
+  // ssh" -- the wrong class entirely. Both transports must say the same thing
+  // about the same server behaviour, or an operator cannot compare them.
+  const restore = stubSshCommand("__SWAMP_HTTP_STATUS__:302");
+  try {
+    const m = mockCtx({
+      nodes: [
+        NODE({
+          url: "http://127.0.0.1:19999",
+          ssh: { host: "box.example.com", user: "netdata-reader", port: 22 },
+        }),
+      ],
+    });
+    // deno-lint-ignore no-explicit-any
+    await model.methods.discover.execute({}, m.ctx as any);
+    const node = m.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.reachable, false);
+    assertEquals(
+      String(node.error).toLowerCase().includes("redirect"),
+      true,
+      `the ssh transport misreported a 302 as: ${node.error}`,
+    );
+  } finally {
+    restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 14. agent-supplied text cannot forge an instance name or grow without bound
+//
+// review finding 5 (2026-08-23): the U+001F join separator was written as an
+// escape but never excluded from the values being joined, so an agent could
+// craft two distinct alarms that hashed to one instance name.
+//
+// Control characters are built with String.fromCharCode rather than written as
+// literals, for the same reason the source writes the separator as an escape:
+// a raw control byte makes the file read as binary to grep and to any tool
+// doing exact-text matching.
+// ---------------------------------------------------------------------------
+
+/** U+001F, the separator instanceName() joins identity fields with. */
+const SEP = String.fromCharCode(0x1f);
+
+/** True if the string contains any C0 control character or DEL. */
+function hasControlChar(s: string): boolean {
+  return [...s].some((c) => {
+    const n = c.charCodeAt(0);
+    return n < 32 || n === 127;
+  });
+}
+
+/** Every string value in every written record, flattened. */
+function writtenStrings(written: Array<{ data: Json }>): string[] {
+  return written.flatMap((w) =>
+    Object.values(w.data).filter((v): v is string => typeof v === "string")
+  );
+}
+
+Deno.test("names: two alarms differing only in separator placement stay two records", async () => {
+  // instanceName joins (node, name, chart) with U+001F. These two alarms
+  // produce the SAME join if the separator is not excluded from the inputs:
+  //   nodeA | x       | y<US>z  ->  nodeA<US>x<US>y<US>z
+  //   nodeA | x<US>y  | z       ->  nodeA<US>x<US>y<US>z
+  // Same hash -- and slug() strips the control character, so the readable
+  // label matches too. One instance name, and the second write silently
+  // erases the first. Here the first is a firing CRITICAL.
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      [
+        "/api/v1/alarms",
+        () =>
+          json({
+            alarms: {
+              "x": { chart: `y${SEP}z`, status: "CRITICAL", value: 99 },
+              [`x${SEP}y`]: { chart: "z", status: "WARNING", value: 1 },
+            },
+          }),
+      ],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+
+  const alarms = m.written.filter((w) => w.spec === "alarm");
+  assertEquals(
+    alarms.length,
+    2,
+    "both alarms must be written; the payload describes two distinct alarms",
+  );
+  assertEquals(
+    new Set(alarms.map((a) => a.name)).size,
+    2,
+    `two alarms collided onto one instance name: ${
+      alarms.map((a) => a.name).join(" == ")
+    }`,
+  );
+  assertEquals(
+    alarms.filter((a) => a.data.status === "CRITICAL").length,
+    1,
+    "the firing CRITICAL must not be overwritten by the benign alarm",
+  );
+});
+
+Deno.test("names: no stored field or instance name carries a raw control character", async () => {
+  // The class, not the instance: a raw NUL/CR/ESC in ANY stored field is a
+  // reads-as-binary and terminal-escape problem for every consumer of this
+  // data, and every one of these fields is chosen by an unauthenticated
+  // remote.
+  const NUL = String.fromCharCode(0);
+  const CR = String.fromCharCode(13);
+  const ESC = String.fromCharCode(27);
+  const BEL = String.fromCharCode(7);
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      [
+        "/api/v1/alarms",
+        () =>
+          json({
+            alarms: {
+              [`bad${SEP}name`]: {
+                chart: `disk${NUL}space`,
+                status: `CRIT${CR}ICAL`,
+                value: 1,
+                units: `%${ESC}[31m`,
+                info: `line${NUL}one`,
+              },
+            },
+          }),
+      ],
+      [
+        "/api/v1/charts",
+        () => json({ charts: { [`disk_space./mnt${NUL}x`]: {} } }),
+      ],
+      [
+        "/api/v1/data",
+        () => json({ labels: ["avail", "used"], data: [[10, 90]] }),
+      ],
+      [
+        "/api/v1/info",
+        () =>
+          json({
+            version: `2.1${BEL}`,
+            hostname: `h${ESC}[0m`,
+            os_name: `linux${CR}`,
+            os_version: "1",
+          }),
+      ],
+    ],
+  });
+  for (const s of writtenStrings(m.written)) {
+    assertEquals(
+      hasControlChar(s),
+      false,
+      `a stored field carried a raw control character: ${JSON.stringify(s)}`,
+    );
+  }
+  // And the instance names, which become filenames and CLI arguments.
+  for (const w of m.written) {
+    assertEquals(
+      hasControlChar(w.name),
+      false,
+      `an instance name carried a raw control character: ${
+        JSON.stringify(w.name)
+      }`,
+    );
+  }
+});
+
+Deno.test("names: an alarm's instance name still describes the record it stores", async () => {
+  // Normalising in two places with two different rules is how a record ends
+  // up named after one alarm and filled with another's text. The readable
+  // part of the name must stay derived from the value actually stored.
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      [
+        "/api/v1/alarms",
+        () =>
+          json({
+            alarms: {
+              "disk usage": { chart: "disk_space./", status: "WARNING" },
+            },
+          }),
+      ],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  const alarm = m.written.find((w) => w.spec === "alarm")!;
+  assertEquals(alarm.data.name, "disk usage");
+  assertEquals(
+    alarm.name.startsWith("alarm-nodea-disk-usage-"),
+    true,
+    `the instance name lost its readable part: ${alarm.name}`,
+  );
+});
+
+Deno.test("bounds: one agent-supplied field cannot be arbitrarily long", async () => {
+  // MAX_RESPONSE_BYTES bounds a whole payload, not a field: a single alarm
+  // carrying a 100k-character `info` string fits inside the 8 MiB ceiling and
+  // used to land in the datastore whole.
+  const huge = "A".repeat(100_000);
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      [
+        "/api/v1/alarms",
+        () =>
+          json({
+            alarms: {
+              [huge]: {
+                chart: huge,
+                status: "WARNING",
+                value: 1,
+                units: huge,
+                info: huge,
+              },
+            },
+          }),
+      ],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      ["/api/v1/info", () => json({ version: huge, hostname: huge })],
+    ],
+  });
+  for (const s of writtenStrings(m.written)) {
+    assertEquals(
+      s.length <= 512,
+      true,
+      `an agent-supplied field reached the datastore at ${s.length} chars`,
+    );
+  }
+  const alarm = m.written.find((w) => w.spec === "alarm")!;
+  assertEquals(
+    alarm.name.length < 200,
+    true,
+    `the instance name grew with the input: ${alarm.name.length} chars`,
+  );
+  assertEquals(
+    model.resources.alarm.schema.safeParse(alarm.data).success,
+    true,
+    "the bounded record must still satisfy its own schema",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 15. a payload of the wrong SHAPE is a failed sub-fetch, not a reading
+//
+// review finding 4 (2026-08-23): API responses are blind-cast and then walked.
+// Object.entries on a string enumerates its CHARACTERS.
+// ---------------------------------------------------------------------------
+
+Deno.test("shape: a string 'alarms' payload mints no alarm records", async () => {
+  const prior = {
+    "node-nodea": {
+      name: "nodeA",
+      alarmsActive: 3,
+      alarmsCritical: 1,
+      alarmsWarning: 2,
+      charts: 0,
+      mountsOverThreshold: 0,
+      version: "2.1",
+      hostname: "h",
+      osName: "linux",
+      osVersion: "1",
+      cores: 4,
+      collectors: 2,
+      claimedToCloud: false,
+    } as Json,
+  };
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    stored: prior,
+    routes: [
+      ["/api/v1/alarms", () => json({ alarms: "xxxx" })],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  assertEquals(
+    m.written.filter((w) => w.spec === "alarm").length,
+    0,
+    "enumerating a string minted one bogus alarm record per character",
+  );
+  const summary = m.written.find((w) => w.spec === "summary")!.data;
+  assertEquals(
+    summary.nodesDegraded,
+    1,
+    "an unusable payload is a failed sub-fetch, so the node is degraded",
+  );
+  assertEquals(
+    summary.alarmsActive,
+    3,
+    "and the last known counts carry forward rather than being replaced",
+  );
+});
+
+Deno.test("shape: an array 'charts' payload invents no mounts and no chart count", async () => {
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      noAlarms,
+      ["/api/v1/charts", () => json({ charts: ["disk_space./", "cpu"] })],
+      infoRoute,
+    ],
+  });
+  const node = m.written.find((w) => w.spec === "node")!.data;
+  assertEquals(m.written.filter((w) => w.spec === "mount").length, 0);
+  assertEquals(node.charts, 0, "a fictional chart count must not be stored");
+  assertEquals(
+    m.written.find((w) => w.spec === "summary")!.data.nodesDegraded,
+    1,
+  );
+});
+
+Deno.test("shape: an absent alarms/charts key is still zero, not a failure", async () => {
+  // The counterpart. Tightening the shape check must not turn a legitimately
+  // quiet agent into a permanently degraded node -- absence has always meant
+  // zero, and still does.
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      ["/api/v1/alarms", () => json({ hostname: "h" })],
+      ["/api/v1/charts", () => json({})],
+      infoRoute,
+    ],
+  });
+  const summary = m.written.find((w) => w.spec === "summary")!.data;
+  assertEquals(summary.alarmsActive, 0);
+  assertEquals(
+    summary.nodesDegraded,
+    0,
+    "an empty but well-formed answer is not degradation",
+  );
+});
+
+Deno.test("shape: a /data payload of the wrong shape invents no filesystem", async () => {
+  // Both halves fabricate a real-looking capacity reading out of garbage under
+  // the old blind casts, which is worse than failing:
+  //
+  //  - `data: ["25,75"]` is an array whose first element is a STRING. It is
+  //    truthy, so the old `if (!row)` let it through, and row[0] / row[1] then
+  //    read the CHARACTERS "2" and "5". Number() accepts both, so a 71.4%-used
+  //    filesystem appeared from a string that describes no filesystem at all.
+  //
+  //  - `labels: "usedavail"` is a STRING, and String.prototype.indexOf answers
+  //    happily: indexOf("used") is 0 and indexOf("avail") is 4. The old
+  //    `labels.indexOf(...)` therefore resolved both dimensions to real row
+  //    positions and stored row[0] and row[4] as used/avail.
+  //
+  // The property: a payload whose shape is not what /api/v1/data promises is
+  // an unreadable mount -- a state this model already represents -- and never
+  // a reading.
+  for (
+    const bad of [
+      { labels: ["avail", "used"], data: ["25,75"] },
+      { labels: "usedavail", data: [[10, 20, 30, 40, 50]] },
+    ]
+  ) {
+    const m = await sweep({
+      globalArgs: { nodes: [NODE()] },
+      routes: [
+        noAlarms,
+        ["/api/v1/charts", () => json({ charts: { "disk_space./": {} } })],
+        ["/api/v1/data", () => json(bad)],
+        infoRoute,
+      ],
+    });
+    assertEquals(
+      m.written.filter((w) => w.spec === "mount").length,
+      0,
+      `a fabricated mount was written from ${JSON.stringify(bad)}`,
+    );
+    assertEquals(
+      m.written.find((w) => w.spec === "summary")!.data.nodesDegraded,
+      1,
+      "an unreadable mount makes the node degraded",
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 16. node names that normalise to one instance name are rejected
+// ---------------------------------------------------------------------------
+
+Deno.test("nodes: names colliding after slugging are rejected, not silently merged", async () => {
+  // The node record's instance name is `node-${slug(name)}` with no hash, and
+  // slug() is not injective. Both members of each pair become one instance
+  // name, so the second node's write used to overwrite the first's record --
+  // one machine's reachability and alarm counts stored under the other's name,
+  // with nothing anywhere saying a node had gone missing.
+  for (const pair of [["NAS", "nas"], ["db 1", "db-1"]]) {
+    const m = mockCtx({
+      nodes: pair.map((name) => ({ name, url: "http://a.example.com:19999" })),
+    });
+    let threw = false;
+    try {
+      // deno-lint-ignore no-explicit-any
+      await model.methods.discover.execute({}, m.ctx as any);
+    } catch (e) {
+      threw = true;
+      assertEquals(
+        String(e).includes("collide"),
+        true,
+        `expected a collision error, got: ${e}`,
+      );
+    }
+    assertEquals(
+      threw,
+      true,
+      `${pair.join(" / ")} share one instance name and must be rejected`,
+    );
+    assertEquals(
+      m.written.length,
+      0,
+      "nothing may be written before the check",
+    );
+  }
+});
+
+Deno.test("nodes: names that merely differ are still accepted", async () => {
+  // The check must reject collisions, not near-misses.
+  const m = await sweep({
+    globalArgs: {
+      nodes: [
+        { name: "nas", url: "http://a.example.com:19999" },
+        { name: "nas-2", url: "http://b.example.com:19999" },
+      ],
+    },
+    routes: [
+      noAlarms,
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  assertEquals(m.written.filter((w) => w.spec === "node").length, 2);
+});
