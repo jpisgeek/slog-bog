@@ -16,3 +16,4 @@ reviews/**/*.tmp
 # END swamp managed section
 # deno.lock does not govern extension deps (swamp bundles them); keep it out of the repo
 deno.lock
+.worktrees/
