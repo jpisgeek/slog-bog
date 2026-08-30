@@ -54,6 +54,17 @@ const GlobalArgsSchema = z.object({
         "by default; only set this for a trusted loopback/VPN path where " +
         "TLS genuinely cannot be terminated on the TrueNAS host.",
     ),
+  allowedHosts: z
+    .array(z.string().min(1))
+    .default([])
+    .describe(
+      "Optional pin: exact hosts the API key may be sent to, e.g. " +
+        "['nas.example.com', 'nas.example.com:8443']. When non-empty the " +
+        "host derived from baseUrl must match one entry exactly or the run " +
+        "fails before a socket is opened. Entries are bare hosts or " +
+        "host:port; no scheme, path or wildcard. Set this whenever baseUrl " +
+        "comes from anywhere but a literal in your workflow file.",
+    ),
   timeoutSec: z.number().int().positive().default(20),
   certWarnDays: z
     .number()
@@ -63,23 +74,90 @@ const GlobalArgsSchema = z.object({
     .describe("Certificates expiring within this many days are flagged"),
 });
 
+/** Longest remote string that may reach a log line or an error message. */
+const MAX_REMOTE_CHARS = 200;
+
 /**
- * Bound a remote-supplied value before it is interpolated into an error
- * message or a log line.
- *
- * Everything on the far side of this socket is remote text: RPC error
- * messages, an unexpected result payload, whatever string a runtime puts on a
- * WebSocket error event. The non-array guard below used to paste a whole
- * `JSON.stringify(raw)` into the thrown error verbatim, which is unbounded and
- * carries whatever hostnames, share paths or alert prose the payload happened
- * to hold straight into swamp's logs.
- *
- * This truncates, it does not redact. The leading text is what makes a failure
- * diagnosable and blanking it would hand an operator an error that says
- * nothing. The defect being fixed is the *unbounded* part, not the presence of
- * remote text.
+ * Longest remote string that may be *stored* in a resource field. Alert
+ * `formatted` is the one field here whose whole value is remote prose, and
+ * these resources have `lifetime: "infinite"`, so an unbounded value is
+ * unbounded forever. TrueNAS alert text runs to a line or two; 4 KB keeps
+ * every real alert intact and refuses a pathological one.
  */
-function preview(value: unknown, max = 200): string {
+const MAX_STORED_REMOTE_CHARS = 4096;
+
+/**
+ * Strip the configured API key out of any remote-supplied text.
+ *
+ * This is defensive, not theoretical: `auth.login_with_api_key` takes the key
+ * as its ONLY argument, and middlewared's own error prose habitually echoes
+ * the argument that failed validation. Nothing in the JSON-RPC contract stops
+ * a host -- a real one with a bad day, or one an operator was misdirected to
+ * -- from putting the key back in `error.message`, which this model then puts
+ * in a thrown Error that swamp logs. The README claims the key is never
+ * logged; before this, that claim depended on the far end's discretion.
+ *
+ * The length floor matters. A one- or two-character `apiKey` (a test fixture,
+ * a misconfigured vault lookup returning a stray char) would otherwise match
+ * everywhere and shred every message into [REDACTED]. A real TrueNAS API key
+ * is 64 characters; anything under 8 cannot be one, and mangling diagnostics
+ * to protect a value that is not a credential is a worse trade.
+ */
+function redactKey(text: string, apiKey: string): string {
+  if (apiKey.length < 8) return text;
+  return text.split(apiKey).join("[REDACTED]");
+}
+
+/**
+ * Neutralise the characters that let remote text act on whatever renders it.
+ *
+ * Remote strings from this socket do not only reach errors and logs; alert
+ * `formatted`, `klass` and `level`, disk models and serials, pool names and
+ * certificate CNs are all written into stored resources and, for several of
+ * them, into resource TAGS -- which are how a workflow selects records. An
+ * ESC]0;...BEL in an alert message rewrites the terminal title of whoever
+ * runs `swamp data list`; a bidi override makes two different pool names
+ * render identically to the person reading the gate output; a lone surrogate
+ * is not valid UTF-8 and can fail a serializer downstream. None of that is
+ * about the *length* of the text, which is why bounding it was not enough.
+ */
+function screenRemote(s: string): string {
+  return s
+    // deno-lint-ignore no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
+    .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "�")
+    .replace(/(^|[^\ud800-\udbff])([\udc00-\udfff])/g, "$1�")
+    .replace(/ {2,}/g, " ")
+    .trim();
+}
+
+/**
+ * The single boundary every remote-supplied value crosses on its way into an
+ * error, a log line, a stored field or a tag.
+ *
+ * Three separate defects lived on this path and they are fixed together
+ * because they are one class, not three sites:
+ *
+ *   - Unbounded. The non-array guard pasted a whole `JSON.stringify(raw)`
+ *     into a thrown error, so a hostile or merely broken host chose how much
+ *     text went into swamp's logs.
+ *   - Unredacted. See redactKey(): the API key could come back to us in the
+ *     server's own error message and go straight out to a log.
+ *   - Unscreened. See screenRemote(): control, bidi and zero-width characters
+ *     reached logs, errors, stored fields and tags verbatim.
+ *
+ * It truncates rather than blanking. The leading text is what makes a failure
+ * diagnosable -- "TrueNAS RPC error 11: pool is busy" is the finding, and a
+ * canned "RPC error" would make this model undiagnosable for exactly the
+ * cases it exists to diagnose. What is removed is the ability of that text to
+ * be unbounded, to carry the key, or to drive a terminal.
+ */
+function safeRemoteText(
+  value: unknown,
+  apiKey: string,
+  max = MAX_REMOTE_CHARS,
+): string {
   let s: string;
   if (typeof value === "string") {
     s = value;
@@ -91,10 +169,16 @@ function preview(value: unknown, max = 200): string {
       s = `[unserialisable ${typeof value}]`;
     }
   }
-  return s.length <= max
-    ? s
-    : `${s.slice(0, max)}… (${s.length} chars, truncated)`;
+  // Cap before the regex work so a multi-megabyte payload cannot turn
+  // screening itself into the denial of service.
+  const screened = screenRemote(redactKey(s.slice(0, 65_536), apiKey));
+  return screened.length <= max
+    ? screened
+    : `${screened.slice(0, max)}… (${screened.length} chars, truncated)`;
 }
+
+/** The `safe()` closure threaded through everything that touches remote text. */
+type Safe = (value: unknown, max?: number) => string;
 
 /**
  * Runtime validation of baseUrl. Deliberately NOT an object-level zod
@@ -105,7 +189,11 @@ function preview(value: unknown, max = 200): string {
  * Returns the parsed URL so the caller builds the WebSocket URL from its
  * components instead of pasting strings onto the raw argument.
  */
-function assertBaseUrl(baseUrl: string, allowInsecureHttp: boolean): URL {
+function assertBaseUrl(
+  baseUrl: string,
+  allowInsecureHttp: boolean,
+  allowedHosts: string[],
+): URL {
   if (!/^https?:\/\//i.test(baseUrl)) {
     throw new Error("baseUrl must start with http:// or https://");
   }
@@ -145,7 +233,68 @@ function assertBaseUrl(baseUrl: string, allowInsecureHttp: boolean): URL {
         "after ? or # corrupts the derived wss:// URL.",
     );
   }
+  assertHostAllowed(u, allowedHosts);
   return u;
+}
+
+/**
+ * Enforce the `allowedHosts` pin: the API key may only be put on a socket to
+ * a host the operator named here, and the check runs before any socket opens.
+ *
+ * WHY THIS IS A PIN AND NOT A MANDATORY ALLOWLIST -- the deliberate trade.
+ *
+ * The security review asked for an allowlist that is always required. When
+ * `baseUrl` is a literal in the workflow file, that allowlist is a second
+ * copy of the same literal, written by the same hand at the same moment, and
+ * a typo goes into both copies -- so it cannot catch the mistake it exists to
+ * catch, while it can and does break every working configuration on upgrade.
+ * That is ceremony, not a control.
+ *
+ * Where it IS a real control is the case the review is actually describing:
+ * `baseUrl` resolved from a vault expression, a datastore value, or a
+ * workflow variable, where the host is not visible in the file at all. There
+ * the pin is an independent literal and the only thing standing between a
+ * changed upstream value and a live API key leaving for a new destination.
+ * So it is offered, enforced without exception once set, and the README says
+ * plainly to set it whenever `baseUrl` is not a literal.
+ *
+ * Entries are validated rather than merely compared. A pin written as
+ * `https://nas.example.com/` or `*.example.com` would never match anything,
+ * so it would silently deny every run -- or worse, in an earlier draft that
+ * skipped unmatched-but-malformed entries, silently allow every run. A pin
+ * that cannot work is a configuration error and says so at parse time.
+ */
+function assertHostAllowed(u: URL, allowedHosts: string[]): void {
+  if (allowedHosts.length === 0) return;
+  const seen = allowedHosts.map((raw, i) => {
+    const entry = raw.trim().toLowerCase();
+    if (
+      !/^[a-z0-9._~\-]+(:\d{1,5})?$|^\[[0-9a-f:.]+\](:\d{1,5})?$/.test(entry)
+    ) {
+      throw new Error(
+        `allowedHosts[${i}] is not a bare host or host:port. Write ` +
+          `"nas.example.com" or "nas.example.com:8443" (IPv6 in brackets); ` +
+          `a scheme, a path, or a wildcard never matches anything and would ` +
+          `silently break every run.`,
+      );
+    }
+    return entry;
+  });
+  // Match host (with port) when the entry names a port, hostname otherwise, so
+  // a pin does not have to guess whether the URL spelled out :443.
+  const host = u.host.toLowerCase();
+  const hostname = u.hostname.toLowerCase();
+  const hasPort = (e: string) =>
+    e.startsWith("[") ? /\]:\d+$/.test(e) : e.includes(":");
+  const ok = seen.some((e) => (hasPort(e) ? e === host : e === hostname));
+  if (!ok) {
+    // The rejected host is operator-supplied config, not remote text, and
+    // naming it is the whole diagnostic value of this error.
+    throw new Error(
+      `baseUrl host "${host}" is not in allowedHosts. The API key is not ` +
+        `sent to a host that was not pinned.`,
+    );
+  }
 }
 
 const DiscoverArgsSchema = z.object({});
@@ -213,6 +362,19 @@ const DiskSchema = z.object({
   pool: z.string(),
   /** False when TrueNAS reported no `size`; `sizeBytes` is UNKNOWN_NUMBER. */
   sizeKnown: z.boolean(),
+  /**
+   * True when TrueNAS actually answered the pool-membership question, whether
+   * the answer was a pool name or "this disk is in no pool".
+   *
+   * `pool` used to be `d.pool ?? ""` with the tag `d.pool ?? "none"`, which
+   * made two completely different facts render identically: a disk genuinely
+   * outside every pool, and a run where the `extra: { pools: true }` join was
+   * not honoured at all. In the second case EVERY disk reads "none", so an
+   * "orphaned disk" gate fires across the whole array while a "which disks
+   * back tank" gate silently returns nothing. When this is false the `pool`
+   * field is "" and the tag reads "unknown", never "none".
+   */
+  poolKnown: z.boolean(),
 });
 
 const AlertSchema = z.object({
@@ -262,18 +424,58 @@ const SummarySchema = z.object({
   certificatesExpiringSoon: z.number(),
   certificatesExpired: z.number(),
   certificatesWithoutExpiry: z.number(),
+  /**
+   * True when `pool.query` came back as a well-formed EMPTY array. A NAS with
+   * no pools is not a steady state; this is what a pool still importing after
+   * a reboot, or failing to import at all, looks like from here.
+   */
+  poolsReportedEmpty: z.boolean(),
+  /** Same, for `disk.query`. A NAS with no disks has no steady state at all. */
+  disksReportedEmpty: z.boolean(),
+  /**
+   * The one field a workflow can gate on to refuse the whole roll-up.
+   *
+   * The summary used to report `pools: 0, poolsUnhealthy: 0` for an empty
+   * response and say nothing else, which reads exactly like a clean bill of
+   * health: zero pools, none of them unhealthy. The prune protection already
+   * kept the underlying records, but it only WARNED when it had stale records
+   * to keep -- so on a first run, where nothing stale exists, the run was
+   * completely silent about having discovered nothing.
+   *
+   * This does not fail the run. Alerts and certificates come off the same
+   * connection and are still valid, and an import window is transient, so
+   * throwing away a good certificate-expiry reading to punish a missing pool
+   * list is the wrong trade. The flag makes the incompleteness explicit and
+   * lets the consumer decide; the run also warns unconditionally now.
+   */
+  discoveryDegraded: z.boolean(),
   syncedAt: z.string(),
 });
 
 /**
  * Raw TrueNAS response shapes for the fields this model actually reads.
- * `.passthrough()` here is correct and intentional. Unlike the resource
- * schemas above (which gate CEL and must be strict), these validate an
- * untrusted third-party payload where extra fields we don't use are
- * expected and harmless. What matters is that the fields we *do* rely on
- * are actually present and typed as expected. If TrueNAS's contract has
- * drifted, `.parse()` throws here instead of the mapping code silently
- * writing placeholder 0/""/[] values as if they were real data.
+ *
+ * These validate an untrusted third-party payload. Unlike the resource
+ * schemas above (which gate CEL and must be exact), a TrueNAS release that
+ * ADDS a field must not break discovery, so `.strict()` is wrong here: a
+ * point release that enriches `disk.query` would take the whole model down.
+ *
+ * They used to carry `.passthrough()`, defended as "extra fields we don't use
+ * are expected and harmless". The first half of that is right and the second
+ * half was the mistake. `.passthrough()` does not merely *accept* undeclared
+ * keys, it RETAINS them on the parsed object -- so every raw record carried
+ * an unbounded, entirely unvalidated blob of remote data through the rest of
+ * discover(), one `...spread` away from being written into an
+ * infinite-lifetime resource by a future edit that looked harmless. Zod's
+ * default `strip` accepts exactly the same payloads and drops the undeclared
+ * keys at the parse boundary, so nothing past this line can reach them by
+ * accident. Forward compatibility was never the thing `.passthrough()` bought;
+ * strip gives that for free and retention was pure downside.
+ *
+ * What each schema still asserts is that the fields the model RELIES on are
+ * present and typed as expected, so contract drift throws here instead of the
+ * mapping code silently writing placeholder 0/""/[] values as if they were
+ * real data.
  */
 const RawSystemSchema = z.object({
   hostname: z.string(),
@@ -282,8 +484,12 @@ const RawSystemSchema = z.object({
   cores: z.number().nullable().optional(),
   physmem: z.number().nullable().optional(),
   uptime_seconds: z.number().nullable().optional(),
+  // `model` stays optional on purpose and is NOT part of the class fixed
+  // below: its backfill is the literal string "unknown", which names itself
+  // as a placeholder. The defect being fixed elsewhere is a backfill that a
+  // consumer cannot tell from data, and "unknown" is not one.
   loadavg: z.array(z.number()).nullable().optional(),
-}).passthrough();
+});
 
 const RawPoolSchema = z.object({
   name: z.string(),
@@ -295,7 +501,25 @@ const RawPoolSchema = z.object({
   // Confirmed against TrueNAS API v25.10: "Percentage of pool fragmentation
   // as a string, or null if not available."
   fragmentation: z.union([z.string(), z.number()]).nullable().optional(),
-}).passthrough();
+}).refine(
+  // Presence, not truthiness -- the same shape as the certificate expiry
+  // check below, for the same reason.
+  //
+  // `status` and `healthy` are core `pool.query` fields, not `extra`-gated
+  // ones, so their KEYS are always present on a host whose contract has not
+  // drifted. While they were merely optional, a rename made `Boolean(
+  // undefined)` false for every pool on the box: `poolsUnhealthy` equalled
+  // `pools` on every run, forever, and `status` read "UNKNOWN" -- which looks
+  // like a real ZFS status string rather than like a parse failure. A
+  // permanent, box-wide false degrade is not a safe failure mode; it trains
+  // an operator to ignore the one signal pools exist to give.
+  (p) => p.status !== undefined && p.healthy !== undefined,
+  {
+    message:
+      "pool.query row is missing `status` and/or `healthy`; the TrueNAS pool " +
+      "contract has changed and pool health can no longer be read",
+  },
+);
 
 /**
  * The refinements on the three schemas below exist because every field in
@@ -313,9 +537,14 @@ const RawDiskSchema = z.object({
   model: z.string().nullable().optional(),
   size: z.number().nullable().optional(),
   type: z.string().nullable().optional(),
-  // Only populated when disk.query is called with extra.pools: true.
+  // Only populated when disk.query is called with extra.pools: true, and the
+  // absent-vs-null distinction is load-bearing -- see `poolKnown` on
+  // DiskSchema. Left optional rather than required precisely BECAUSE the
+  // model can now represent "not answered" honestly: making it required
+  // would take a whole NAS's discovery down over a join that has a correct
+  // non-fatal reading.
   pool: z.string().nullable().optional(),
-}).passthrough().refine(
+}).refine(
   // With neither field, instanceName() falls back to `idx<n>`, so the disk's
   // instance name is its position in the response -- it changes whenever the
   // enumeration order does, and every poll then prunes and re-creates the
@@ -336,7 +565,7 @@ const RawAlertSchema = z.object({
   level: z.string().nullable().optional(),
   formatted: z.string().nullable().optional(),
   dismissed: z.boolean().nullable().optional(),
-}).passthrough().refine(
+}).refine(
   // Same index-fallback churn as disks, and worse here: alert-* records are
   // pruned on absence by design, so unstable names mean every run deletes
   // and re-adds the whole alert set.
@@ -345,6 +574,22 @@ const RawAlertSchema = z.object({
     message:
       "alert.list row has none of `uuid`, `id`, `key`; the TrueNAS alert " +
       "contract has changed and alerts can no longer be identified",
+  },
+).refine(
+  // Presence again. `klass`, `level` and `formatted` are the entire content
+  // of an alert -- the class it belongs to, how bad it is, and what it says.
+  // Backfilled to "" they produce a record that exists, counts toward
+  // `summary.alerts`, and matches no `klass ==` or `level ==` gate anywhere,
+  // so a box full of CRITICAL alerts reports as a box full of alerts nobody
+  // wrote a rule for. Present-and-null is still accepted and still maps to
+  // "": what must not pass silently is the key being gone.
+  (a) =>
+    a.klass !== undefined && a.level !== undefined && a.formatted !== undefined,
+  {
+    message:
+      "alert.list row is missing `klass`, `level` and/or `formatted`; the " +
+      "TrueNAS alert contract has changed and alert severity can no longer " +
+      "be read",
   },
 );
 
@@ -355,7 +600,7 @@ const RawCertificateSchema = z.object({
   common_name: z.string().nullable().optional(),
   until: z.unknown().optional(),
   not_after: z.unknown().optional(),
-}).passthrough().refine(
+}).refine(
   // Presence, not truthiness: `until: null` is a legitimate payload -- a CSR
   // has no expiry, which is exactly what expiryKnown:false exists to record
   // -- so requiring a non-null value here would reject valid data. What must
@@ -374,17 +619,60 @@ const RawCertificateSchema = z.object({
 );
 
 /**
- * Deterministic, non-cryptographic 32-bit FNV-1a hash, hex-encoded. Used
- * only to make instance names collision-safe -- never for anything
- * security sensitive.
+ * Unambiguous encoding of an identity tuple: each field is prefixed with its
+ * own length, so no content inside a field can be mistaken for the boundary
+ * between two fields.
+ *
+ * This replaces `identity.join(U+001F)`. A separator-based encoding is only
+ * injective while the separator cannot occur inside a field, and NOTHING
+ * enforced that: every one of these fields is remote text straight out of a
+ * TrueNAS payload, so a disk `identifier` or an alert `klass` containing a
+ * Unit Separator collapsed two different identity tuples onto one digest --
+ * and a digest collision here means two different objects sharing one
+ * `infinite`-lifetime record, each run overwriting the other's state.
+ * (Screening the fields instead would be worse: mapping U+001F to a space
+ * makes DIFFERENT identities encode identically, which is the same bug.)
+ * Length prefixes need no such assumption; ["a","b c"] and ["a b","c"] encode
+ * as "1:a3:b c" and "3:a b1:c" whatever the fields contain.
  */
-function shortHash(input: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
+function encodeIdentity(identity: string[]): string {
+  return identity.map((s) => `${s.length}:${s}`).join("");
+}
+
+/** Longest readable half of an instance name. The name is a storage path
+ * component, so it is bounded well inside the ext4/APFS 255-byte limit. */
+const MAX_SLUG_CHARS = 48;
+
+/**
+ * SHA-256 over the encoded identity, truncated to 128 bits and hex-encoded.
+ *
+ * This was a 32-bit FNV-1a. 32 bits gives a ~50% chance of some collision
+ * across roughly 77,000 distinct identities, and the readable half of the
+ * name cannot break a tie because it is truncated to MAX_SLUG_CHARS and is
+ * not injective anyway (`foo/bar` and `foo-bar` both slug to `foo-bar`). A
+ * collision means two disks, or two alerts, silently sharing one record.
+ * 128 bits is not a number of buckets anything collides in.
+ *
+ * "Non-cryptographic is fine, this is not security sensitive" was the old
+ * justification and it does not hold: the inputs are attacker-influencable
+ * remote strings, and FNV-1a is trivially invertible to a chosen digest, so
+ * a hostile payload could aim one object's record at another's on purpose.
+ *
+ * Widening the digest RENAMES every stored instance. The run after this
+ * change writes new records and prunes the old ones, exactly as documented in
+ * the README, and history under the old names is lost once. That is a
+ * one-time cost paid deliberately; it is the same trade the `cert-` prefix
+ * comment declines to pay for a cosmetic rename, and is worth paying here
+ * because the alternative is silent record merging.
+ */
+async function shortHash(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(input),
+  );
+  return Array.from(new Uint8Array(digest).slice(0, 16))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 /** Resource instance names must be stable and filesystem-safe. */
@@ -409,13 +697,15 @@ function slug(value: string): string {
  * name would change every time the underlying data changes, breaking
  * garbage collection and history for what is still the same resource.
  */
-function instanceName(prefix: string, ...identity: string[]): string {
-  // Unit Separator, written as an escape rather than a raw control byte.
-  // The join separator must be a character that cannot occur inside an
-  // identifier, or ["a","b c"] and ["a b","c"] hash identically. truenas
-  // previously used a RAW NUL here, which achieved that but made the file
-  // read as binary to grep and to any tool doing exact-text matching.
-  const raw = identity.join("\u001f");
+async function instanceName(
+  prefix: string,
+  ...identity: string[]
+): Promise<string> {
+  // Length-prefixed rather than separator-joined; see encodeIdentity(). The
+  // previous separators (a raw NUL, then U+001F) both assumed that byte could
+  // not occur inside an identifier, and nothing enforced it -- every field
+  // here is remote text off a TrueNAS payload.
+  const raw = encodeIdentity(identity);
   // Build the readable label from EVERY non-empty identity field, not just the
   // first. Taking only the first made the visible part non-discriminating
   // wherever a caller passes a shared scope first: netdata's alarms pass the
@@ -428,19 +718,46 @@ function instanceName(prefix: string, ...identity: string[]): string {
   const parts = identity.filter((s) => s !== "").map(slug).filter((s) =>
     s !== ""
   );
-  const label = parts.length ? parts.join("-").slice(0, 48) : "unnamed";
-  return `${prefix}-${label}-${shortHash(raw)}`;
+  const label =
+    (parts.length ? parts.join("-").slice(0, MAX_SLUG_CHARS) : "").replace(
+      /-+$/,
+      "",
+    ) || "unnamed";
+  return `${prefix}-${label}-${await shortHash(raw)}`;
 }
 
-/** TrueNAS reports pool fragmentation as a nullable percentage, sometimes
- * with a trailing "%". 0 is used when TrueNAS reports none -- a benign
- * "nothing to report" default here, unlike a missing certificate expiry,
- * since 0% fragmentation is never itself an alarming value. */
-function parsePercent(value: string | number | null | undefined): number {
+/**
+ * TrueNAS reports pool fragmentation as a nullable percentage, sometimes with
+ * a trailing "%".
+ *
+ * ABSENT still means 0, and that is argued, not overlooked. Unlike a missing
+ * capacity or a missing certificate expiry, 0% fragmentation is not itself an
+ * alarming value, so no gate can be lulled by it -- the worst a consumer does
+ * is see a healthy fragmentation figure for a pool that reported none.
+ *
+ * MALFORMED is a completely different fact and used to be folded into the
+ * same 0. `Number("busy")` is NaN, `Number.isFinite(NaN)` is false, and the
+ * old line answered 0 -- so `fragmentation: "ERROR"`, or a future release
+ * changing the field to an object, or a value of 4e9, all reported as a
+ * pristine pool. That is contract drift or a hostile payload wearing the
+ * exact disguise this model exists to strip off, so it throws. Bounds too:
+ * a percentage outside 0-100 is not a percentage.
+ */
+function parsePercent(
+  value: string | number | null | undefined,
+  safe: Safe,
+): number {
   if (value === null || value === undefined) return 0;
-  if (typeof value === "number") return value;
-  const n = Number(value.replace(/%\s*$/, "").trim());
-  return Number.isFinite(n) ? n : 0;
+  const n = typeof value === "number"
+    ? value
+    : Number(value.replace(/%\s*$/, "").trim());
+  if (!Number.isFinite(n) || n < 0 || n > 100) {
+    throw new Error(
+      `pool.query returned a fragmentation value that is not a 0-100 ` +
+        `percentage: ${safe(value, 64)}`,
+    );
+  }
+  return n;
 }
 
 function daysUntil(iso: string): number {
@@ -449,16 +766,54 @@ function daysUntil(iso: string): number {
   return Math.floor((then - Date.now()) / 86_400_000);
 }
 
-/** TrueNAS returns dates in several shapes; normalize to an ISO string. */
-function toIso(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (typeof value === "number") return new Date(value).toISOString();
-  if (value && typeof value === "object") {
-    const d = (value as Record<string, unknown>)["$date"];
-    if (typeof d === "number") return new Date(d).toISOString();
-    if (typeof d === "string") return d;
+/**
+ * Normalize a TrueNAS expiry field to an ISO string, or null when the record
+ * legitimately has no expiry.
+ *
+ * The three-way distinction is the whole point, and the old `toIso` collapsed
+ * it to two. It returned "" for anything it could not read -- an unparseable
+ * date string, a `{ $date: ... }` wrapper of an unexpected shape, a boolean,
+ * a number out of Date range -- and the caller turned "" into
+ * `expiryKnown: false`, which is the SAME state a CSR produces. So "we could
+ * not read this certificate's expiry" and "this object has no expiry, by
+ * design" were indistinguishable, on the one field this model was written to
+ * watch (see the module header: a dismissed CertificateIsExpiring alert is
+ * why certificates are collected at all).
+ *
+ *   - absent / null / empty string -> null, a real "no expiry" (a CSR).
+ *   - a value this function can turn into a date -> that date.
+ *   - anything else -> throw. Present but unreadable is drift, not absence.
+ */
+function toIsoOrNull(value: unknown, safe: Safe): string | null {
+  const fail = () =>
+    new Error(
+      `certificate.query returned an expiry this model cannot read: ` +
+        `${safe(value, 64)}. Present-but-unreadable is contract drift; it is ` +
+        `not reported as "no expiry", because a CSR reports that legitimately.`,
+    );
+  const fromEpoch = (ms: number): string => {
+    if (!Number.isFinite(ms)) throw fail();
+    const d = new Date(ms);
+    if (Number.isNaN(d.getTime())) throw fail();
+    return d.toISOString();
+  };
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    if (value.trim() === "") return null;
+    if (Number.isNaN(Date.parse(value))) throw fail();
+    return value;
   }
-  return "";
+  if (typeof value === "number") return fromEpoch(value);
+  if (typeof value === "object") {
+    const d = (value as Record<string, unknown>)["$date"];
+    if (typeof d === "number") return fromEpoch(d);
+    if (typeof d === "string") {
+      if (d.trim() === "") return null;
+      if (Number.isNaN(Date.parse(d))) throw fail();
+      return d;
+    }
+  }
+  throw fail();
 }
 
 /**
@@ -487,6 +842,7 @@ const AUTH_REMOVAL_HINT =
 function warnIfVersionUnsupported(
   version: string,
   logger: { warning: (msg: string, props?: Record<string, unknown>) => void },
+  safe: Safe,
 ): void {
   const m = version.match(/(\d{2,4})\.(\d{1,2})\.(\d{1,2})/);
   if (!m) return;
@@ -499,9 +855,127 @@ function warnIfVersionUnsupported(
         "will break discovery.",
       // Remote free text; bound it like every other remote string that
       // reaches a log line.
-      { version: preview(version, 64) },
+      { version: safe(version, 64) },
     );
   }
+}
+
+/**
+ * A single inbound frame, after validation.
+ *
+ * `notification` covers a well-formed frame with no id: middlewared pushes
+ * `collection_update` events down the same socket, and those correlate to
+ * nothing we sent. They are dropped silently -- flagging them would turn a
+ * normal TrueNAS behaviour into a warning on every run.
+ */
+type RpcFrame =
+  | { kind: "notification" }
+  | { kind: "result"; id: number; result: unknown }
+  | { kind: "error"; id: number; code: string; message: string }
+  | { kind: "invalid"; id?: number; detail: string };
+
+/**
+ * Validate an inbound JSON-RPC frame before anything correlates on it.
+ *
+ * The old code did `msg = JSON.parse(...)` and immediately asserted the
+ * result was a `Record<string, unknown>`, then `const id = msg.id as number`.
+ * Every one of the following was a real outcome of that:
+ *
+ *   - A frame of `null`, or a bare number/string/array. `msg.id` on `null`
+ *     throws a TypeError inside `ws.onmessage`, which is not inside any
+ *     try/catch and not attached to any promise, so it escapes as an
+ *     unhandled error while the pending call sits waiting for its timeout.
+ *   - A STRING id. `#pending` is keyed by number, so `get("3")` misses, the
+ *     reply is dropped on the floor, and the call fails the full timeoutSec
+ *     later reporting "timed out waiting for pool.query" -- a diagnosis
+ *     pointing at the network for what is a protocol mismatch.
+ *   - `error: 0` or `error: ""`. `if (msg.error)` is false for both, so the
+ *     frame took the SUCCESS branch and resolved the call with
+ *     `result: undefined`. For `auth.login_with_api_key` that lands on
+ *     `authed !== true` and reports a revoked API key; for `pool.query` it
+ *     lands on the non-array guard. Both blame the wrong thing.
+ *   - `error` present as a string or array. `e.code`/`e.message` are then
+ *     undefined and the error reads "TrueNAS RPC error ?: (no message)",
+ *     which says nothing at all.
+ *   - Neither `result` nor `error`. Silently resolved with undefined.
+ *
+ * Anything that fails validation is reported as such -- rejecting the pending
+ * call immediately when the id is usable, so the caller gets the protocol
+ * fault instead of a timeout that misdescribes it.
+ */
+function classifyFrame(raw: unknown, safe: Safe): RpcFrame {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    const what = raw === null
+      ? "null"
+      : Array.isArray(raw)
+      ? "an array"
+      : `a ${typeof raw}`;
+    return {
+      kind: "invalid",
+      detail: `frame is ${what}, not a JSON-RPC object`,
+    };
+  }
+  const m = raw as Record<string, unknown>;
+  if (m.jsonrpc !== undefined && m.jsonrpc !== "2.0") {
+    return {
+      kind: "invalid",
+      detail: `frame declares jsonrpc ${safe(m.jsonrpc, 32)}, not "2.0"`,
+    };
+  }
+  // No id (or a null id) and nothing to correlate: a notification.
+  if (m.id === undefined || m.id === null) return { kind: "notification" };
+  if (typeof m.id !== "number" || !Number.isSafeInteger(m.id)) {
+    return {
+      kind: "invalid",
+      detail: `frame id is ${safe(m.id, 32)} (${typeof m.id}), not the ` +
+        `integer this client sends; the reply cannot be matched to a call`,
+    };
+  }
+  const id = m.id;
+  const hasResult = "result" in m;
+  // Presence, not truthiness. `error: 0` used to read as success.
+  const hasError = "error" in m && m.error !== null && m.error !== undefined;
+  if (hasError && hasResult) {
+    return {
+      kind: "invalid",
+      id,
+      detail: "frame carries both result and error",
+    };
+  }
+  if (hasError) {
+    const e = m.error;
+    if (e === null || typeof e !== "object" || Array.isArray(e)) {
+      return {
+        kind: "invalid",
+        id,
+        detail: `error member is ${safe(e, 32)} (${typeof e}), not an object`,
+      };
+    }
+    const eo = e as Record<string, unknown>;
+    if (typeof eo.code !== "number") {
+      return {
+        kind: "invalid",
+        id,
+        detail: `error.code is ${safe(eo.code, 32)}, not a number`,
+      };
+    }
+    if (typeof eo.message !== "string") {
+      return {
+        kind: "invalid",
+        id,
+        detail: `error.message is ${typeof eo.message}, not a string`,
+      };
+    }
+    return { kind: "error", id, code: String(eo.code), message: eo.message };
+  }
+  if (!hasResult) {
+    return {
+      kind: "invalid",
+      id,
+      detail: "frame carries neither a result nor an error member",
+    };
+  }
+  return { kind: "result", id, result: m.result };
 }
 
 /**
@@ -513,6 +987,7 @@ class TrueNasRpc {
   #ws: WebSocket;
   #signal: AbortSignal;
   #onProtocolError: (detail: string) => void;
+  #safe: Safe;
   #id = 0;
   #pending = new Map<
     number,
@@ -524,30 +999,49 @@ class TrueNasRpc {
     ws: WebSocket,
     signal: AbortSignal,
     onProtocolError: (detail: string) => void,
+    safe: Safe,
   ) {
     this.#ws = ws;
     this.#signal = signal;
     this.#onProtocolError = onProtocolError;
+    this.#safe = safe;
     ws.onmessage = (ev) => {
-      let msg: Record<string, unknown>;
+      let parsed: unknown;
       try {
-        msg = JSON.parse(ev.data as string);
+        parsed = JSON.parse(ev.data as string);
       } catch (e) {
         // Previously silently ignored until the pending call timed out.
         // Surface it so a persistently malformed stream is diagnosable.
         this.#onProtocolError(
-          `malformed frame: ${preview((e as Error).message)}`,
+          `malformed frame: ${this.#safe((e as Error).message)}`,
         );
         return;
       }
-      const id = msg.id as number | undefined;
-      if (id === undefined) return;
-      const waiter = this.#pending.get(id);
+      const frame = classifyFrame(parsed, this.#safe);
+      if (frame.kind === "notification") return;
+      if (frame.kind === "invalid") {
+        // Fail the waiting call rather than letting it run out its timeout
+        // and report a network problem for a protocol one. With no usable
+        // id there is nothing to fail, so it is logged and dropped.
+        const waiter = frame.id !== undefined
+          ? this.#pending.get(frame.id)
+          : undefined;
+        if (waiter && frame.id !== undefined) {
+          this.#pending.delete(frame.id);
+          waiter.reject(
+            new Error(
+              `TrueNAS sent an invalid JSON-RPC frame: ${frame.detail}`,
+            ),
+          );
+        } else {
+          this.#onProtocolError(frame.detail);
+        }
+        return;
+      }
+      const waiter = this.#pending.get(frame.id);
       if (!waiter) return;
-      this.#pending.delete(id);
-      if (msg.error) {
-        const e = msg.error as Record<string, unknown>;
-        const code = e.code !== undefined ? String(e.code) : "?";
+      this.#pending.delete(frame.id);
+      if (frame.kind === "error") {
         // Only the human `message` is surfaced. The `data` object is a
         // middlewared traceback (frames with locals, `formatted`) whose
         // contents are not guaranteed to redact call arguments -- and one
@@ -557,16 +1051,15 @@ class TrueNasRpc {
         // is still identified by its RPC error code + message.
         waiter.reject(
           new Error(
-            // `message` is remote free text of unbounded length, so it goes
-            // through preview() like every other remote string that ends up
-            // in an error a caller may log.
-            `TrueNAS RPC error ${code}: ${
-              preview(String(e.message ?? "(no message)"))
-            }`,
+            // `message` is remote free text of unbounded length, and it is
+            // the reply to a call that took the API key as its argument, so
+            // it is bounded, key-redacted and screened like every other
+            // remote string that ends up in an error a caller may log.
+            `TrueNAS RPC error ${frame.code}: ${this.#safe(frame.message)}`,
           ),
         );
       } else {
-        waiter.resolve(msg.result);
+        waiter.resolve(frame.result);
       }
     };
     ws.onclose = () => {
@@ -582,6 +1075,7 @@ class TrueNasRpc {
     wsUrl: string,
     timeoutMs: number,
     signal: AbortSignal,
+    safe: Safe,
     onProtocolError: (detail: string) => void = () => {},
   ): Promise<TrueNasRpc> {
     return new Promise((resolve, reject) => {
@@ -638,7 +1132,7 @@ class TrueNasRpc {
         }
         settled = true;
         cleanup();
-        resolve(new TrueNasRpc(ws, signal, onProtocolError));
+        resolve(new TrueNasRpc(ws, signal, onProtocolError, safe));
       };
       ws.onerror = (ev) => {
         // Surface whatever the runtime actually said. Swallowing it turns
@@ -648,7 +1142,7 @@ class TrueNasRpc {
           ((ev as unknown as { error?: Error })?.error?.message) ??
           "(runtime gave no detail)";
         failOnce(
-          new Error(`WebSocket error against ${wsUrl}: ${preview(detail)}`),
+          new Error(`WebSocket error against ${wsUrl}: ${safe(detail)}`),
         );
       };
     });
@@ -724,7 +1218,11 @@ async function discover(_args: unknown, ctx: {
   };
 }) {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
-  const base = assertBaseUrl(g.baseUrl, g.allowInsecureHttp);
+  // One boundary for every remote-supplied string in this run: bounded,
+  // key-redacted, control/bidi screened. Built here because it needs the key,
+  // and threaded rather than duplicated so no site can be missed.
+  const safe: Safe = (value, max) => safeRemoteText(value, g.apiKey, max);
+  const base = assertBaseUrl(g.baseUrl, g.allowInsecureHttp, g.allowedHosts);
   // Built from the parsed URL's components, not by pasting "/api/current"
   // onto the raw argument. The old concatenation swapped the scheme with a
   // regex and appended blindly, so anything after the host that was not a
@@ -738,12 +1236,18 @@ async function discover(_args: unknown, ctx: {
   const wsUrl = `${wsScheme}//${base.host}${basePath}/api/current`;
   const timeoutMs = g.timeoutSec * 1000;
 
-  ctx.logger.info("connecting to {url}", { url: wsUrl });
+  // wsUrl is built entirely from operator-supplied config that assertBaseUrl
+  // has already stripped of userinfo, query and fragment, so what is logged is
+  // scheme + host + path and nothing else. Screened anyway: it costs nothing
+  // and keeps "everything that reaches a log line goes through one function"
+  // true without exception.
+  ctx.logger.info("connecting to {url}", { url: screenRemote(wsUrl) });
 
   const rpc = await TrueNasRpc.connect(
     wsUrl,
     timeoutMs,
     ctx.signal,
+    safe,
     (detail) =>
       ctx.logger.warning("TrueNAS RPC protocol issue: {detail}", { detail }),
   );
@@ -810,7 +1314,7 @@ async function discover(_args: unknown, ctx: {
       // share paths, alert prose -- into whatever log caught the throw.
       throw new Error(
         `TrueNAS ${label} returned a non-array result (${typeof raw}): ${
-          preview(raw)
+          safe(raw)
         }`,
       );
     }
@@ -822,7 +1326,7 @@ async function discover(_args: unknown, ctx: {
   const alerts = z.array(RawAlertSchema).parse(alertsRaw);
   const certs = z.array(RawCertificateSchema).parse(certsRaw);
 
-  warnIfVersionUnsupported(sys.version, ctx.logger);
+  warnIfVersionUnsupported(sys.version, ctx.logger, safe);
 
   const handles = [];
   const live = new Set<string>();
@@ -836,9 +1340,9 @@ async function discover(_args: unknown, ctx: {
     sys.uptime_seconds != null;
   handles.push(
     await ctx.writeResource("system", "system", {
-      hostname: sys.hostname,
-      version: sys.version,
-      model: sys.model ?? "unknown",
+      hostname: safe(sys.hostname, 128),
+      version: safe(sys.version, 64),
+      model: sys.model == null ? "unknown" : safe(sys.model, 128),
       cores: sys.cores ?? UNKNOWN_NUMBER,
       physmemBytes: sys.physmem ?? UNKNOWN_NUMBER,
       uptimeSeconds: sys.uptime_seconds ?? UNKNOWN_NUMBER,
@@ -848,7 +1352,10 @@ async function discover(_args: unknown, ctx: {
       metricsKnown,
     }, {
       tags: {
-        hostname: sys.hostname,
+        // A tag is a selector, so a bidi override or an ESC sequence in a
+        // hostname is worse here than in a field: it changes what the operator
+        // believes they are selecting.
+        hostname: safe(sys.hostname, 128),
         metricsKnown: String(metricsKnown),
       },
     }),
@@ -869,9 +1376,16 @@ async function discover(_args: unknown, ctx: {
     const allocated = capacityKnown ? p.allocated! : UNKNOWN_NUMBER;
     const free = capacityKnown ? p.free! : UNKNOWN_NUMBER;
     const size = capacityKnown ? allocated + free : UNKNOWN_NUMBER;
-    const healthy = Boolean(p.healthy);
+    // `healthy: null` (the key is present -- RawPoolSchema now requires that
+    // much -- but carries no value) is treated as NOT healthy on purpose. For
+    // capacity, guessing benign is the danger, so an unknown capacity gets a
+    // sentinel; for a HEALTH field the safe direction is inverted. An
+    // unreadable health is not a healthy pool, and erring toward "unhealthy"
+    // produces a visible alert an operator resolves, where erring toward
+    // "healthy" produces silence over a degraded array.
+    const healthy = p.healthy === true;
     if (!healthy) poolsUnhealthy++;
-    const name = instanceName(
+    const name = await instanceName(
       "pool",
       p.name,
       String(p.id ?? ""),
@@ -880,8 +1394,8 @@ async function discover(_args: unknown, ctx: {
     live.add(name);
     handles.push(
       await ctx.writeResource("pool", name, {
-        name: p.name,
-        status: p.status ?? "UNKNOWN",
+        name: safe(p.name, 128),
+        status: p.status == null ? "UNKNOWN" : safe(p.status, 64),
         healthy,
         allocatedBytes: allocated,
         freeBytes: free,
@@ -891,16 +1405,18 @@ async function discover(_args: unknown, ctx: {
           : size > 0
           ? Math.round((allocated / size) * 1000) / 10
           : 0,
-        // parsePercent still defaults an absent fragmentation to 0, and that
+        // parsePercent still defaults an ABSENT fragmentation to 0, and that
         // stays: unlike capacity, 0% fragmentation is not itself an alarming
         // value, so a gate reading it cannot be lulled the way a capacity
         // gate could. Argued rather than swept in with the rest of the class.
-        fragmentationPercent: parsePercent(p.fragmentation ?? null),
+        // A MALFORMED or out-of-range fragmentation is a different fact and
+        // now throws rather than reporting the same reassuring 0.
+        fragmentationPercent: parsePercent(p.fragmentation ?? null, safe),
         capacityKnown,
       }, {
         tags: {
           healthy: String(healthy),
-          status: p.status ?? "",
+          status: p.status == null ? "" : safe(p.status, 64),
           capacityKnown: String(capacityKnown),
         },
       }),
@@ -913,8 +1429,13 @@ async function discover(_args: unknown, ctx: {
     // not report was written sizeBytes: 0, which reads as a real (and absurd)
     // capacity rather than as an absent one.
     const sizeKnown = d.size != null;
+    // Absent key vs. present-and-null, kept apart. `d.pool ?? "none"` said
+    // "this disk belongs to no pool" for both, and only one of them means
+    // that: the other means the extra.pools join did not happen, in which
+    // case EVERY disk on the box claims to be orphaned. See `poolKnown`.
+    const poolKnown = d.pool !== undefined;
     const rawId = d.identifier ?? d.devname ?? "";
-    const name = instanceName(
+    const name = await instanceName(
       "disk",
       rawId,
       d.serial ?? "",
@@ -923,18 +1444,24 @@ async function discover(_args: unknown, ctx: {
     live.add(name);
     handles.push(
       await ctx.writeResource("disk", name, {
-        name: d.devname ?? "",
-        serial: d.serial ?? "",
-        model: d.model ?? "",
+        name: d.devname == null ? "" : safe(d.devname, 128),
+        serial: d.serial == null ? "" : safe(d.serial, 128),
+        model: d.model == null ? "" : safe(d.model, 128),
         sizeBytes: sizeKnown ? d.size! : UNKNOWN_NUMBER,
-        type: d.type ?? "",
-        pool: d.pool ?? "",
+        type: d.type == null ? "" : safe(d.type, 64),
+        pool: d.pool == null ? "" : safe(d.pool, 128),
         sizeKnown,
+        poolKnown,
       }, {
         tags: {
-          pool: d.pool ?? "none",
-          type: d.type ?? "",
+          pool: !poolKnown
+            ? "unknown"
+            : d.pool == null
+            ? "none"
+            : safe(d.pool, 128),
+          type: d.type == null ? "" : safe(d.type, 64),
           sizeKnown: String(sizeKnown),
+          poolKnown: String(poolKnown),
         },
       }),
     );
@@ -947,7 +1474,7 @@ async function discover(_args: unknown, ctx: {
     if (dismissed) silenced++;
     const rawId = a.uuid ?? (a.id !== undefined ? String(a.id) : undefined) ??
       a.key ?? "";
-    const name = instanceName(
+    const name = await instanceName(
       "alert",
       rawId,
       a.klass ?? "",
@@ -956,10 +1483,19 @@ async function discover(_args: unknown, ctx: {
     live.add(name);
     handles.push(
       await ctx.writeResource("alert", name, {
-        id: rawId,
-        klass: a.klass ?? "",
-        level: a.level ?? "",
-        formatted: a.formatted ?? "",
+        id: safe(rawId, 128),
+        klass: a.klass == null ? "" : safe(a.klass, 128),
+        level: a.level == null ? "" : safe(a.level, 64),
+        // The one stored field that is entirely remote prose. Kept in full
+        // (up to 4 KB) rather than dropped or redacted -- an alert you cannot
+        // read is an alert you cannot act on, and the disclosure this carries
+        // is stated in the README Security section rather than papered over.
+        // What is removed is the ability of that prose to be unbounded in an
+        // infinite-lifetime record, to carry the API key back to us, or to
+        // drive the terminal of whoever runs `swamp data list`.
+        formatted: a.formatted == null
+          ? ""
+          : safe(a.formatted, MAX_STORED_REMOTE_CHARS),
         dismissed,
         // A dismissed alert is hidden in the TrueNAS UI but the condition
         // behind it is still true. Surface it rather than inherit the
@@ -967,8 +1503,8 @@ async function discover(_args: unknown, ctx: {
         silenced: dismissed,
       }, {
         tags: {
-          level: a.level ?? "",
-          klass: a.klass ?? "",
+          level: a.level == null ? "" : safe(a.level, 64),
+          klass: a.klass == null ? "" : safe(a.klass, 128),
           silenced: String(dismissed),
         },
       }),
@@ -978,8 +1514,15 @@ async function discover(_args: unknown, ctx: {
   // ---- certificates -------------------------------------------------------
   let expiringSoon = 0, expired = 0, withoutExpiry = 0;
   for (const [i, c] of certs.entries()) {
-    const notAfter = toIso(c.until ?? c.not_after ?? "");
-    const days = notAfter ? daysUntil(notAfter) : Number.NaN;
+    // `c.until ?? c.not_after` rather than `c.until ?? c.not_after ?? ""`:
+    // toIsoOrNull() distinguishes "no expiry" (null) from "present but
+    // unreadable" (throws), and collapsing both to "" here would put the
+    // distinction back.
+    const notAfter = toIsoOrNull(
+      c.until !== undefined ? c.until : c.not_after,
+      safe,
+    );
+    const days = notAfter === null ? Number.NaN : daysUntil(notAfter);
     const isExpired = Number.isFinite(days) && days < 0;
     const soon = Number.isFinite(days) && days >= 0 && days <= g.certWarnDays;
     if (isExpired) expired++;
@@ -993,18 +1536,19 @@ async function discover(_args: unknown, ctx: {
     // buy nothing but a tidier spelling. The prefix is documented in the
     // README instead. (Note the prune protection above keys on `pool-`/`disk-`
     // for the same reason: prefixes here are load-bearing, not cosmetic.)
-    const name = instanceName(
+    const name = await instanceName(
       "cert",
       rawId,
       c.common ?? c.common_name ?? "",
       rawId ? "" : `idx${i}`,
     );
+    const commonName = c.common ?? c.common_name ?? "";
     live.add(name);
     handles.push(
       await ctx.writeResource("certificate", name, {
-        name: c.name ?? "",
-        commonName: c.common ?? c.common_name ?? "",
-        notAfter,
+        name: c.name == null ? "" : safe(c.name, 128),
+        commonName: safe(commonName, 253),
+        notAfter: notAfter ?? "",
         daysRemaining: Number.isFinite(days) ? days : -9999,
         expiryKnown: Number.isFinite(days),
         expiringSoon: soon,
@@ -1020,10 +1564,17 @@ async function discover(_args: unknown, ctx: {
   }
 
   // ---- summary ------------------------------------------------------------
+  // An empty pool.query or disk.query is reported as such, unconditionally,
+  // instead of rolling up as "0 pools, 0 of them unhealthy" -- which is what
+  // a perfectly healthy NAS with nothing wrong also looks like. See
+  // SummarySchema.discoveryDegraded for why this flags rather than throws.
+  const poolsReportedEmpty = pools.length === 0;
+  const disksReportedEmpty = disks.length === 0;
+  const discoveryDegraded = poolsReportedEmpty || disksReportedEmpty;
   handles.push(
     await ctx.writeResource("summary", "summary", {
-      hostname: sys.hostname,
-      version: sys.version,
+      hostname: safe(sys.hostname, 128),
+      version: safe(sys.version, 64),
       pools: pools.length,
       poolsUnhealthy,
       poolsCapacityUnknown,
@@ -1034,12 +1585,16 @@ async function discover(_args: unknown, ctx: {
       certificatesExpiringSoon: expiringSoon,
       certificatesExpired: expired,
       certificatesWithoutExpiry: withoutExpiry,
+      poolsReportedEmpty,
+      disksReportedEmpty,
+      discoveryDegraded,
       syncedAt: new Date().toISOString(),
     }, {
       tags: {
         poolsUnhealthy: String(poolsUnhealthy),
         poolsCapacityUnknown: String(poolsCapacityUnknown),
         certsExpiring: String(expiringSoon),
+        discoveryDegraded: String(discoveryDegraded),
       },
     }),
   );
@@ -1068,8 +1623,8 @@ async function discover(_args: unknown, ctx: {
   // NOT protected: an empty alert list is the normal healthy state and a
   // resolved alert must be pruned or it is reported forever.
   const protectedPrefixes: string[] = [];
-  if (pools.length === 0) protectedPrefixes.push("pool-");
-  if (disks.length === 0) protectedPrefixes.push("disk-");
+  if (poolsReportedEmpty) protectedPrefixes.push("pool-");
+  if (disksReportedEmpty) protectedPrefixes.push("disk-");
 
   const existing = await ctx.dataRepository.findAllForModel(
     ctx.modelType,
@@ -1085,16 +1640,24 @@ async function discover(_args: unknown, ctx: {
     await ctx.dataRepository.delete(ctx.modelType, ctx.modelId, rec.name);
     ctx.logger.info("pruned {name}", { name: rec.name });
   }
-  if (keptStale > 0) {
+  // Warned on the EMPTY RESPONSE, not on having kept something. The old
+  // `if (keptStale > 0)` made the warning conditional on prior state, so the
+  // single run where it matters most -- a first run, or the first run after a
+  // datastore reset, where no stale record exists to keep -- discovered
+  // nothing and said nothing at all, and the summary underneath it read as a
+  // clean bill of health. The kept-record sentence is now the part that is
+  // conditional.
+  if (discoveryDegraded) {
     ctx.logger.warning(
-      "TrueNAS reported zero pools and/or zero disks, which is what a pool " +
-        "still importing (or failing to import) looks like. Kept {kept} " +
-        "existing record(s) rather than deleting them. Note the summary " +
-        "resource still reports what the box actually said this run. Once " +
-        "any object of that kind is reported again, records that really did " +
-        "go away are pruned on that run; if the last pool or disk was " +
-        "genuinely removed, delete the stale record by hand.",
-      { kept: keptStale },
+      "TrueNAS reported {pools} pool(s) and {disks} disk(s). An empty pool " +
+        "or disk list is not a steady state on a NAS: it is what a pool " +
+        "still importing (or failing to import) after a reboot looks like. " +
+        "summary.discoveryDegraded is true for this run, so gate on that " +
+        "rather than on the counts. Kept {kept} existing record(s) rather " +
+        "than deleting them. Once any object of that kind is reported again, " +
+        "records that really did go away are pruned on that run; if the last " +
+        "pool or disk was genuinely removed, delete the stale record by hand.",
+      { pools: pools.length, disks: disks.length, kept: keptStale },
     );
   }
 
@@ -1112,6 +1675,32 @@ async function discover(_args: unknown, ctx: {
 
   return { dataHandles: handles };
 }
+
+/**
+ * Test-only surface. Not part of the model contract, not addressed by any
+ * workflow, and not referenced anywhere inside this file.
+ *
+ * It exists because several of the properties this module now guarantees are
+ * invisible from `model` alone -- that the raw schemas STRIP undeclared keys
+ * instead of retaining them, that two identity tuples differing only by a
+ * control character get different digests, that a malformed JSON-RPC frame is
+ * classified rather than cast. A fix nobody can observe is a fix that ships
+ * dead, which has happened in this repo often enough to be the rule these
+ * exports exist to break.
+ */
+export const __testOnly = {
+  RawSystemSchema,
+  RawPoolSchema,
+  RawDiskSchema,
+  RawAlertSchema,
+  RawCertificateSchema,
+  classifyFrame,
+  encodeIdentity,
+  instanceName,
+  parsePercent,
+  safeRemoteText,
+  toIsoOrNull,
+};
 
 /**
  * The `@jpisgeek/truenas` model definition: a single `discover` method
@@ -1147,7 +1736,10 @@ export const model = {
     disk: {
       description:
         "One record per physical disk and its pool membership. `sizeKnown` " +
-        "is false when TrueNAS reported no size; `sizeBytes` is then -1.",
+        "is false when TrueNAS reported no size; `sizeBytes` is then -1. " +
+        "`poolKnown` is false when TrueNAS did not answer the pool-membership " +
+        "question at all, which is a different fact from a disk that is in " +
+        "no pool; the tag reads `unknown` there, never `none`.",
       schema: DiskSchema,
       lifetime: "infinite" as const,
       garbageCollection: 20,
@@ -1169,7 +1761,11 @@ export const model = {
       garbageCollection: 20,
     },
     summary: {
-      description: "Single roll-up of the most recent discover.",
+      description: "Single roll-up of the most recent discover. Gate on " +
+        "`discoveryDegraded` before trusting the counts: it is true when " +
+        "pool.query or disk.query came back empty, which is what an " +
+        "importing pool looks like and is indistinguishable from a healthy " +
+        "box by the counts alone.",
       schema: SummarySchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
@@ -1181,7 +1777,10 @@ export const model = {
       description:
         "Read-only sweep of system info, pools, disks, alerts, and " +
         "certificates in one pass. Writes one resource per object plus a " +
-        "summary, and prunes objects the box no longer reports.",
+        "summary, and prunes objects the box no longer reports. All or " +
+        "nothing: the five sub-fetches are issued together and any failure " +
+        "or contract violation among them aborts the whole run before " +
+        "anything is written or pruned.",
       arguments: DiscoverArgsSchema,
       execute: discover,
     },

@@ -20,7 +20,7 @@
  * assert on an error message.
  */
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
-import { model } from "./truenas.ts";
+import { __testOnly, model } from "./truenas.ts";
 
 // ---------------------------------------------------------------------------
 // harness
@@ -99,6 +99,19 @@ const rpcError = (code: number, message: string) => ({
   __rpcError: { code, message },
 });
 
+/**
+ * Marker a responder returns to put an ARBITRARY frame on the wire instead of
+ * a well-formed JSON-RPC envelope.
+ *
+ * The fake used to be incapable of producing a malformed frame at all, which
+ * is precisely why the envelope handling went unvalidated for so long: every
+ * test drove it through frames the fake itself had built correctly. `make`
+ * receives the request id so a test can send a reply that is wrong in exactly
+ * one way -- a string id, an `error: 0`, a bare `null` -- while everything
+ * else about the exchange stays realistic.
+ */
+const rawFrame = (make: (id: number) => unknown) => ({ __rawFrame: make });
+
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   static responder: Responder = healthyResponder;
@@ -125,6 +138,16 @@ class FakeWebSocket {
       params: unknown[];
     };
     const result = FakeWebSocket.responder(msg.method, msg.params);
+    const raw = result && typeof result === "object"
+      ? (result as { __rawFrame?: (id: number) => unknown }).__rawFrame
+      : undefined;
+    if (raw) {
+      const frame = JSON.stringify(raw(msg.id));
+      queueMicrotask(() =>
+        this.onmessage?.({ data: frame === undefined ? "undefined" : frame })
+      );
+      return;
+    }
     const err = result && typeof result === "object"
       ? (result as { __rpcError?: { code: number; message: string } })
         .__rpcError
@@ -164,6 +187,10 @@ async function withFakeWs<T>(
 interface Recorder {
   written: Array<{ type: string; name: string; data: Record<string, unknown> }>;
   deleted: string[];
+  /** Every log line the model emitted, so a test can assert on the ones the
+   * operator is meant to see rather than only on thrown errors. */
+  info: Array<{ msg: string; props: Record<string, unknown> }>;
+  warnings: Array<{ msg: string; props: Record<string, unknown> }>;
 }
 
 /** The host-supplied context object; the model types it structurally. */
@@ -179,7 +206,14 @@ const ctxFor = (globalArgs: Record<string, unknown>, opts: {
   globalArgs,
   modelType: "@jpisgeek/truenas",
   modelId: "test",
-  logger: { info: () => {}, warning: () => {} },
+  logger: {
+    info: (msg: string, props: Record<string, unknown> = {}) => {
+      opts.recorder?.info.push({ msg, props });
+    },
+    warning: (msg: string, props: Record<string, unknown> = {}) => {
+      opts.recorder?.warnings.push({ msg, props });
+    },
+  },
   writeResource: (
     type: string,
     name: string,
@@ -198,7 +232,12 @@ const ctxFor = (globalArgs: Record<string, unknown>, opts: {
   },
 });
 
-const recorder = (): Recorder => ({ written: [], deleted: [] });
+const recorder = (): Recorder => ({
+  written: [],
+  deleted: [],
+  info: [],
+  warnings: [],
+});
 
 const OK = { baseUrl: "https://nas.example.com", apiKey: "k" };
 
@@ -312,6 +351,12 @@ Deno.test("summary schema: counts every category the dashboard gates on", () => 
     // had no way to say "capacity is unknown on N pools". A workflow gating on
     // the summary alone could not distinguish that from "capacity is fine".
     poolsCapacityUnknown: 0,
+    // Rewritten again, same reason one level up: the roll-up could not say
+    // "pool.query came back empty", which reads identically to "this box has
+    // no unhealthy pools" in every other field.
+    poolsReportedEmpty: false,
+    disksReportedEmpty: false,
+    discoveryDegraded: false,
     disks: 8,
     alerts: 0,
     alertsSilenced: 0,
@@ -327,6 +372,10 @@ Deno.test("summary schema: counts every category the dashboard gates on", () => 
     model.resources.summary.schema.safeParse(without).success,
     false,
   );
+  // Same guarantee for the degraded flag: a consumer must be able to rely on
+  // it being there, or it is not something a gate can be written against.
+  const { discoveryDegraded: _drop2, ...noFlag } = summary;
+  assertEquals(model.resources.summary.schema.safeParse(noFlag).success, false);
 });
 
 Deno.test("discover is read-only: no method mutates TrueNAS", () => {
@@ -780,4 +829,718 @@ Deno.test("an oversized RPC error message is bounded the same way", async () => 
   assertEquals(err!.message.length < 500, true);
   assertEquals(err!.message.includes("truncated"), true);
   assertEquals(err!.message.startsWith("TrueNAS RPC error 11:"), true);
+});
+
+// ---------------------------------------------------------------------------
+// allowedHosts - the API key does not go to a host that was not pinned
+// (block 2). The pin is optional; when set it is enforced without exception,
+// and the reasoning for it not being mandatory is on assertHostAllowed().
+// ---------------------------------------------------------------------------
+
+Deno.test("allowedHosts: an unpinned host is refused before a socket opens", async () => {
+  const KEY = "an-api-key-long-enough-to-be-real";
+  await withFakeWs(async () => {
+    await assertRejects(
+      () =>
+        model.methods.discover.execute(
+          {},
+          ctxFor({
+            baseUrl: "https://typo.example.com",
+            apiKey: KEY,
+            allowedHosts: ["nas.example.com"],
+          }),
+        ),
+      Error,
+      "not in allowedHosts",
+    );
+    // The property, not the message: nothing was opened, so nothing was
+    // authenticated. A check that ran after connect would still have put the
+    // key on the wire to the wrong host.
+    assertEquals(FakeWebSocket.instances.length, 0);
+  });
+});
+
+Deno.test("allowedHosts: a pinned host still connects", async () => {
+  await withFakeWs(async () => {
+    await model.methods.discover.execute(
+      {},
+      ctxFor({ ...OK, allowedHosts: ["nas.example.com"] }),
+    );
+    assertEquals(
+      FakeWebSocket.instances[0].url,
+      "wss://nas.example.com/api/current",
+    );
+  });
+});
+
+Deno.test("allowedHosts: a port in the pin is matched, and a wrong port is not", async () => {
+  await withFakeWs(async () => {
+    await model.methods.discover.execute(
+      {},
+      ctxFor({
+        ...OK,
+        baseUrl: "https://nas.example.com:8443",
+        allowedHosts: ["nas.example.com:8443"],
+      }),
+    );
+    assertEquals(FakeWebSocket.instances.length, 1);
+  });
+  await withFakeWs(async () => {
+    await assertRejects(
+      () =>
+        model.methods.discover.execute(
+          {},
+          ctxFor({
+            ...OK,
+            baseUrl: "https://nas.example.com:9999",
+            allowedHosts: ["nas.example.com:8443"],
+          }),
+        ),
+      Error,
+      "not in allowedHosts",
+    );
+    assertEquals(FakeWebSocket.instances.length, 0);
+  });
+});
+
+Deno.test("allowedHosts: a pin that could never match is a configuration error, not a silent deny", async () => {
+  for (const bad of ["https://nas.example.com", "*.example.com", "nas/x"]) {
+    await withFakeWs(async () => {
+      const err = await model.methods.discover.execute(
+        {},
+        ctxFor({ ...OK, allowedHosts: [bad] }),
+      ).then(() => null, (e: Error) => e);
+      // A malformed pin must say it is malformed. Reported as an ordinary
+      // "host is not in allowedHosts" it looks like the operator pinned the
+      // wrong host, and they go and edit baseUrl instead of the pin.
+      assertEquals(err !== null, true);
+      assertEquals(err!.message.includes("bare host or host:port"), true);
+      assertEquals(FakeWebSocket.instances.length, 0);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// remote text: bounded was not enough - it must also be key-redacted and
+// screened, everywhere it lands (block 4, and the hardening under the
+// operator-decision on stored alert text)
+// ---------------------------------------------------------------------------
+
+// Built with fromCharCode rather than written literally: this file has to stay
+// free of raw control bytes, which is one of the things the identifier scan
+// and the security review both check.
+const ESC = String.fromCharCode(0x1b);
+const BEL = String.fromCharCode(0x07);
+const NUL = String.fromCharCode(0x00);
+const US = String.fromCharCode(0x1f);
+const RLO = String.fromCharCode(0x202e);
+const POP = String.fromCharCode(0x202c);
+const ZWSP = String.fromCharCode(0x200b);
+// deno-lint-ignore no-control-regex
+const CONTROL_RE = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f]");
+const INVISIBLE_RE = new RegExp(
+  "[\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ufeff]",
+);
+
+Deno.test("an RPC error that echoes the API key does not carry it into the thrown error", async () => {
+  const KEY = "tn-01-abcdefghijklmnopqrstuvwxyz0123456789";
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute(
+        {},
+        ctxFor({ ...OK, apiKey: KEY }),
+      ).then(() => null, (e: Error) => e),
+    {
+      responder: respondWith({
+        "auth.login_with_api_key": rpcError(
+          22,
+          `Invalid API key: ${KEY} rejected by validator`,
+        ),
+      }),
+    },
+  );
+  assertEquals(err !== null, true);
+  // auth.login_with_api_key takes the key as its ONLY argument, and
+  // middlewared error prose echoes the argument that failed validation. This
+  // error is thrown out of discover() and lands in swamp's log, where the
+  // README promises the key never appears.
+  assertEquals(err!.message.includes(KEY), false);
+  assertEquals(err!.message.includes("[REDACTED]"), true);
+  // Still diagnosable: the surrounding words survive.
+  assertEquals(err!.message.includes("Invalid API key"), true);
+});
+
+Deno.test("control and bidi characters in an RPC error never reach the thrown message", async () => {
+  const nasty =
+    `before${ESC}]0;pwned${BEL} ${RLO}middle${POP} after${ZWSP}${NUL}end`;
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(OK)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    { responder: respondWith({ "pool.query": rpcError(11, nasty) }) },
+  );
+  assertEquals(err !== null, true);
+  // The property: nothing in this message can drive a terminal or reorder
+  // what a human reads. Bounding the text addressed neither.
+  assertEquals(CONTROL_RE.test(err!.message), false);
+  assertEquals(INVISIBLE_RE.test(err!.message), false);
+  assertEquals(err!.message.includes("middle"), true);
+});
+
+Deno.test("stored alert text is screened and bounded, not stored as the box wrote it", async () => {
+  const rec = recorder();
+  const huge = "z".repeat(20_000);
+  await withFakeWs(
+    () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+    {
+      responder: respondWith({
+        "alert.list": [{
+          uuid: "u1",
+          klass: `Cert${ZWSP}Class`,
+          level: `WARN${RLO}ING`,
+          formatted: `${ESC}]0;title${BEL}alert body ${huge}`,
+          dismissed: false,
+        }],
+      }),
+    },
+  );
+  const alert = rec.written.find((w) => w.type === "alert")!;
+  const formatted = alert.data.formatted as string;
+  // lifetime is "infinite", so anything unbounded here is unbounded forever.
+  assertEquals(formatted.length < 4300, true);
+  assertEquals(CONTROL_RE.test(formatted), false);
+  assertEquals(formatted.includes("alert body"), true);
+  // klass and level are also TAGS, i.e. selectors: an invisible character in
+  // one changes what the operator believes they selected.
+  assertEquals(INVISIBLE_RE.test(alert.data.klass as string), false);
+  assertEquals(INVISIBLE_RE.test(alert.data.level as string), false);
+});
+
+// ---------------------------------------------------------------------------
+// raw schemas strip undeclared keys instead of retaining them (block 6)
+// ---------------------------------------------------------------------------
+
+Deno.test("raw schemas accept an enriched payload but do not retain the extra fields", () => {
+  const enriched = {
+    name: "tank",
+    id: 1,
+    status: "ONLINE",
+    healthy: true,
+    allocated: 50,
+    free: 50,
+    fragmentation: "3%",
+    // A field a future TrueNAS release adds, or a hostile host invents.
+    topology: { data: ["a".repeat(5000)] },
+  };
+  const parsed = __testOnly.RawPoolSchema.parse(enriched) as Record<
+    string,
+    unknown
+  >;
+  // Forward compatibility is preserved: a point release that enriches
+  // pool.query must not take the whole model down, so `.strict()` is wrong.
+  assertEquals(parsed.name, "tank");
+  // ...but the undeclared blob does not travel any further. Under
+  // `.passthrough()` this key survived onto the object every later line of
+  // discover() handles, one spread away from an infinite-lifetime resource.
+  assertEquals("topology" in parsed, false);
+  const disk = __testOnly.RawDiskSchema.parse({
+    devname: "sda",
+    identifier: "{serial}ABC",
+    pool: null,
+    zfs_guid: "9999",
+  }) as Record<string, unknown>;
+  assertEquals("zfs_guid" in disk, false);
+  const alert = __testOnly.RawAlertSchema.parse({
+    uuid: "u1",
+    klass: "K",
+    level: "WARNING",
+    formatted: "f",
+    node: "leaked",
+  }) as Record<string, unknown>;
+  assertEquals("node" in alert, false);
+});
+
+// ---------------------------------------------------------------------------
+// JSON-RPC envelope validation (block 7)
+// ---------------------------------------------------------------------------
+
+const safeForTest = (v: unknown, max?: number) =>
+  __testOnly.safeRemoteText(v, "k", max);
+
+Deno.test("classifyFrame refuses every frame shape the old cast accepted", () => {
+  const c = (raw: unknown) => __testOnly.classifyFrame(raw, safeForTest);
+  // `msg.id` on null threw a TypeError inside ws.onmessage, which sits in no
+  // try/catch and is attached to no promise.
+  assertEquals(c(null).kind, "invalid");
+  assertEquals(c(42).kind, "invalid");
+  assertEquals(c("hello").kind, "invalid");
+  assertEquals(c([1, 2]).kind, "invalid");
+  // A string id missed the number-keyed pending map entirely and the call
+  // died of a timeout that blamed the network.
+  assertEquals(c({ jsonrpc: "2.0", id: "1", result: [] }).kind, "invalid");
+  // `if (msg.error)` was false for these, so they took the SUCCESS branch.
+  assertEquals(c({ jsonrpc: "2.0", id: 1, error: 0 }).kind, "invalid");
+  assertEquals(c({ jsonrpc: "2.0", id: 1, error: "boom" }).kind, "invalid");
+  // Neither member: silently resolved with undefined.
+  assertEquals(c({ jsonrpc: "2.0", id: 1 }).kind, "invalid");
+  assertEquals(
+    c({ jsonrpc: "2.0", id: 1, result: [], error: { code: 1, message: "x" } })
+      .kind,
+    "invalid",
+  );
+  assertEquals(c({ jsonrpc: "1.0", id: 1, result: [] }).kind, "invalid");
+  // ...and the shapes that must still work, so this cannot pass by refusing
+  // everything. A middlewared collection_update push carries no id and must
+  // be dropped in silence, not warned about on every single run.
+  assertEquals(
+    c({ jsonrpc: "2.0", method: "collection_update" }).kind,
+    "notification",
+  );
+  assertEquals(c({ jsonrpc: "2.0", id: 3, result: null }).kind, "result");
+  assertEquals(c({ jsonrpc: "2.0", id: 3, result: [1] }).kind, "result");
+  assertEquals(
+    c({ jsonrpc: "2.0", id: 3, error: { code: -32601, message: "gone" } }).kind,
+    "error",
+  );
+});
+
+Deno.test("a falsy error member is reported as a protocol fault, not as a revoked API key", async () => {
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(OK)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    {
+      responder: respondWith({
+        "auth.login_with_api_key": rawFrame((id) => ({
+          jsonrpc: "2.0",
+          id,
+          error: 0,
+        })),
+      }),
+    },
+  );
+  assertEquals(err !== null, true);
+  // The consequence being prevented: `if (msg.error)` was false for
+  // `error: 0`, so this resolved as a SUCCESS carrying `result: undefined`,
+  // hit `authed !== true`, and told the operator their API key had been
+  // revoked. They then rotate a perfectly good credential and the fault stays.
+  assertEquals(err!.message.includes("revoked"), false);
+  assertEquals(err!.message.includes("invalid JSON-RPC frame"), true);
+  assertEquals(err!.message.includes("error member"), true);
+});
+
+Deno.test("a reply with a string id is diagnosed rather than left to time out in silence", async () => {
+  const rec = recorder();
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute(
+        {},
+        ctxFor({ ...OK, timeoutSec: 1 }, { recorder: rec }),
+      ).then(() => null, (e: Error) => e),
+    {
+      responder: respondWith({
+        "pool.query": rawFrame((id) => ({
+          jsonrpc: "2.0",
+          id: String(id),
+          result: [],
+        })),
+      }),
+    },
+  );
+  assertEquals(err !== null, true);
+  // The pending map is keyed by number, so this reply was dropped on the
+  // floor and the run reported "timed out waiting for pool.query" - a
+  // diagnosis pointing at the network for a protocol mismatch. It still times
+  // out (there is no correlatable reply), but the operator is now told why.
+  const said = rec.warnings.map((w) => JSON.stringify(w)).join(" ");
+  assertEquals(said.includes("frame id is"), true);
+  assertEquals(said.includes("cannot be matched to a call"), true);
+});
+
+Deno.test("a null frame does not escape as an unhandled TypeError", async () => {
+  const rec = recorder();
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute(
+        {},
+        ctxFor({ ...OK, timeoutSec: 1 }, { recorder: rec }),
+      ).then(() => null, (e: Error) => e),
+    { responder: respondWith({ "pool.query": rawFrame(() => null) }) },
+  );
+  assertEquals(err !== null, true);
+  // `const id = msg.id as number` on a null frame is a TypeError raised
+  // inside ws.onmessage, outside every try/catch and attached to no promise.
+  assertEquals(err!.message.includes("Cannot read properties"), false);
+  assertEquals(
+    rec.warnings.some((w) =>
+      JSON.stringify(w).includes("not a JSON-RPC object")
+    ),
+    true,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// contract drift throws instead of fabricating a value (block 8)
+// ---------------------------------------------------------------------------
+
+Deno.test("pool.query without `healthy` throws instead of marking every pool unhealthy", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () =>
+      assertRejects(
+        () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+        Error,
+        "healthy",
+      ),
+    {
+      responder: respondWith({
+        "pool.query": [{
+          name: "tank",
+          id: 1,
+          status: "ONLINE",
+          allocated: 1,
+          free: 1,
+        }],
+      }),
+    },
+  );
+  // The consequence: `Boolean(undefined)` is false, so a renamed field made
+  // poolsUnhealthy equal pools on every run, forever - a box-wide false
+  // degrade that trains an operator to ignore pool health entirely.
+  assertEquals(rec.written.filter((w) => w.type === "pool"), []);
+  assertEquals(rec.written.filter((w) => w.type === "summary"), []);
+});
+
+Deno.test("pool.query without `status` throws instead of writing the string UNKNOWN", async () => {
+  await withFakeWs(
+    () =>
+      assertRejects(
+        () => model.methods.discover.execute({}, ctxFor(OK)),
+        Error,
+        "status",
+      ),
+    {
+      responder: respondWith({
+        "pool.query": [{
+          name: "tank",
+          id: 1,
+          healthy: true,
+          allocated: 1,
+          free: 1,
+        }],
+      }),
+    },
+  );
+});
+
+Deno.test("alert.list without `level` throws instead of writing an alert no gate matches", async () => {
+  await withFakeWs(
+    () =>
+      assertRejects(
+        () => model.methods.discover.execute({}, ctxFor(OK)),
+        Error,
+        "severity can no longer be read",
+      ),
+    {
+      responder: respondWith({
+        "alert.list": [{ uuid: "u1", klass: "K", formatted: "f" }],
+      }),
+    },
+  );
+});
+
+Deno.test("a pool whose health is present-but-null counts as unhealthy, not as healthy", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+    {
+      responder: respondWith({
+        "pool.query": [{
+          name: "tank",
+          id: 1,
+          status: null,
+          healthy: null,
+          allocated: 50,
+          free: 50,
+        }],
+      }),
+    },
+  );
+  // Capacity errs toward "unknown" because guessing benign is the danger
+  // there. Health is the mirror image: an unreadable health must not read as
+  // a healthy pool, so this direction is deliberately the opposite one.
+  const pool = rec.written.find((w) => w.type === "pool")!;
+  assertEquals(pool.data.healthy, false);
+  assertEquals(
+    rec.written.find((w) => w.type === "summary")!.data.poolsUnhealthy,
+    1,
+  );
+});
+
+Deno.test("a disk whose pool membership was never answered does not claim to be orphaned", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+    {
+      responder: respondWith({
+        // No `pool` key at all: the extra.pools join did not happen.
+        "disk.query": [{
+          devname: "sda",
+          identifier: "{serial}ABC",
+          serial: "ABC",
+          size: 100,
+          type: "HDD",
+        }],
+      }),
+    },
+  );
+  const disk = rec.written.find((w) => w.type === "disk")!;
+  // `d.pool ?? "none"` made this identical to a disk genuinely outside every
+  // pool - and when the join fails it fails for EVERY disk, so an "orphaned
+  // disk" gate fires across the whole array at once.
+  assertEquals(disk.data.poolKnown, false);
+});
+
+Deno.test("a disk that really is in no pool still says so", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+    {
+      responder: respondWith({
+        "disk.query": [{
+          devname: "sdb",
+          identifier: "{serial}XYZ",
+          serial: "XYZ",
+          size: 100,
+          type: "SSD",
+          pool: null,
+        }],
+      }),
+    },
+  );
+  // Guards against over-tightening: present-and-null is a real answer and
+  // must stay distinguishable from the absent case above.
+  const disk = rec.written.find((w) => w.type === "disk")!;
+  assertEquals(disk.data.poolKnown, true);
+  assertEquals(disk.data.pool, "");
+});
+
+// ---------------------------------------------------------------------------
+// malformed is not the same fact as absent (block 9)
+// ---------------------------------------------------------------------------
+
+Deno.test("a malformed fragmentation throws instead of reporting a pristine 0%", async () => {
+  for (const bad of ["not-a-number", "150%", -3, 1e9]) {
+    const rec = recorder();
+    await withFakeWs(
+      () =>
+        assertRejects(
+          () =>
+            model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+          Error,
+          "0-100 percentage",
+        ),
+      {
+        responder: respondWith({
+          "pool.query": [{
+            name: "tank",
+            id: 1,
+            status: "ONLINE",
+            healthy: true,
+            allocated: 50,
+            free: 50,
+            fragmentation: bad,
+          }],
+        }),
+      },
+    );
+    // `Number("not-a-number")` is NaN and the old line answered 0, so drift
+    // and hostility both rendered as a perfectly defragmented pool.
+    assertEquals(rec.written.filter((w) => w.type === "pool"), []);
+  }
+});
+
+Deno.test("an absent fragmentation is still the benign 0", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+    {
+      responder: respondWith({
+        "pool.query": [{
+          name: "tank",
+          id: 1,
+          status: "ONLINE",
+          healthy: true,
+          allocated: 50,
+          free: 50,
+          fragmentation: null,
+        }],
+      }),
+    },
+  );
+  // Argued, not overlooked: 0% fragmentation is never itself an alarming
+  // value, so no gate is lulled by it. Tightening the malformed case must not
+  // drag the absent one along with it.
+  assertEquals(
+    rec.written.find((w) => w.type === "pool")!.data.fragmentationPercent,
+    0,
+  );
+});
+
+Deno.test("an unreadable certificate expiry throws instead of looking like a CSR", async () => {
+  for (
+    const bad of ["not-a-date", true, { weird: 1 }, "2026-13-45T99:99:99Z"]
+  ) {
+    const rec = recorder();
+    await withFakeWs(
+      () =>
+        assertRejects(
+          () =>
+            model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+          Error,
+          "cannot read",
+        ),
+      {
+        responder: respondWith({
+          "certificate.query": [{
+            id: 1,
+            name: "cert",
+            common: "x",
+            until: bad,
+          }],
+        }),
+      },
+    );
+    // The exact trap the module header describes: `expiryKnown: false` is a
+    // CSR's legitimate state, so "we could not read the expiry" wearing that
+    // same state means a cert two days from lapsing reports as one with no
+    // expiry to worry about.
+    assertEquals(rec.written.filter((w) => w.type === "certificate"), []);
+  }
+});
+
+Deno.test("the certificate date shapes TrueNAS actually sends still parse", () => {
+  const t = (v: unknown) => __testOnly.toIsoOrNull(v, safeForTest);
+  assertEquals(t("2099-01-01T00:00:00Z"), "2099-01-01T00:00:00Z");
+  assertEquals(t({ $date: 4070908800000 }), "2099-01-01T00:00:00.000Z");
+  assertEquals(t({ $date: "2099-01-01T00:00:00Z" }), "2099-01-01T00:00:00Z");
+  // A real "no expiry", which must stay distinct from the throws above.
+  assertEquals(t(null), null);
+  assertEquals(t(undefined), null);
+  assertEquals(t(""), null);
+});
+
+// ---------------------------------------------------------------------------
+// instance names are storage paths: a collision merges two records (block 10)
+// ---------------------------------------------------------------------------
+
+Deno.test("identity tuples that differ only by a separator byte get different names", async () => {
+  // Every field fed to instanceName is remote text off a TrueNAS payload, so
+  // nothing stopped a disk identifier from containing the separator itself.
+  // Under `identity.join(US)` these two tuples produced one identical digest,
+  // and two different disks then shared one infinite-lifetime record, each
+  // run overwriting the other's state.
+  // Both tuples flatten to the identical byte sequence "a<US>b<US>c" once a
+  // separator does the joining, so the digests were equal.
+  const a = await __testOnly.instanceName("disk", `a${US}b`, "c");
+  const b = await __testOnly.instanceName("disk", "a", `b${US}c`);
+  assertEquals(a === b, false);
+  assertEquals(
+    __testOnly.encodeIdentity([`a${US}b`, "c"]) ===
+      __testOnly.encodeIdentity(["a", `b${US}c`]),
+    false,
+  );
+  // The same collision exists for a NUL, which was the separator before that
+  // one -- changing which byte is special never fixed the class.
+  assertEquals(
+    await __testOnly.instanceName("disk", `a${NUL}b`, "c") ===
+      await __testOnly.instanceName("disk", "a", `b${NUL}c`),
+    false,
+  );
+});
+
+Deno.test("instance names carry a digest wide enough that collisions are not a thing", async () => {
+  const name = await __testOnly.instanceName("pool", "tank", "1");
+  const digest = name.slice(name.lastIndexOf("-") + 1);
+  // 32 bits of FNV-1a is a coin flip across ~77k identities, and the readable
+  // half cannot break the tie: it is truncated, and slug() is not injective
+  // (`foo/bar` and `foo-bar` both become `foo-bar`).
+  assertEquals(/^[0-9a-f]{32}$/.test(digest), true);
+  // Deterministic, or every run would rename every record it wrote.
+  assertEquals(await __testOnly.instanceName("pool", "tank", "1"), name);
+});
+
+Deno.test("instance names stay bounded and filesystem-safe however long the identity is", async () => {
+  const name = await __testOnly.instanceName(
+    "disk",
+    "x".repeat(4000),
+    "y".repeat(4000),
+  );
+  // The name IS a storage path component; ext4 and APFS cap those at 255.
+  assertEquals(name.length < 128, true);
+  assertEquals(/^[a-z0-9-]+$/.test(name), true);
+});
+
+// ---------------------------------------------------------------------------
+// an empty inventory is reported as empty, on the first run too (block 11)
+// ---------------------------------------------------------------------------
+
+Deno.test("an empty pool.query on a first run is warned about and flagged, not rolled up as healthy", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () =>
+      // `existing: []` is the point: a first run, or the first run after a
+      // datastore reset. There is no stale record to keep, which is exactly
+      // when the old `if (keptStale > 0)` warning stayed silent.
+      model.methods.discover.execute(
+        {},
+        ctxFor(OK, { recorder: rec, existing: [] }),
+      ),
+    { responder: respondWith({ "pool.query": [] }) },
+  );
+  const summary = rec.written.find((w) => w.type === "summary")!;
+  // `pools: 0, poolsUnhealthy: 0` is also what a flawless box looks like.
+  assertEquals(summary.data.pools, 0);
+  assertEquals(summary.data.poolsUnhealthy, 0);
+  assertEquals(summary.data.poolsReportedEmpty, true);
+  assertEquals(summary.data.discoveryDegraded, true);
+  assertEquals(rec.warnings.length > 0, true);
+  assertEquals(
+    rec.warnings.some((w) => w.msg.includes("not a steady state")),
+    true,
+  );
+});
+
+Deno.test("an empty disk.query is flagged the same way", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () =>
+      model.methods.discover.execute(
+        {},
+        ctxFor(OK, { recorder: rec, existing: [] }),
+      ),
+    { responder: respondWith({ "disk.query": [] }) },
+  );
+  const summary = rec.written.find((w) => w.type === "summary")!;
+  assertEquals(summary.data.disksReportedEmpty, true);
+  assertEquals(summary.data.discoveryDegraded, true);
+  assertEquals(rec.warnings.length > 0, true);
+});
+
+Deno.test("a healthy run is not flagged degraded and warns about nothing", async () => {
+  const rec = recorder();
+  await withFakeWs(() =>
+    model.methods.discover.execute({}, ctxFor(OK, { recorder: rec }))
+  );
+  // Guards against the fix over-firing: a flag that is always true is a flag
+  // nobody reads.
+  const summary = rec.written.find((w) => w.type === "summary")!;
+  assertEquals(summary.data.discoveryDegraded, false);
+  assertEquals(summary.data.poolsReportedEmpty, false);
+  assertEquals(summary.data.disksReportedEmpty, false);
+  assertEquals(rec.warnings, []);
 });
