@@ -39,6 +39,12 @@ single-request and aggregateAccounting false. It does not measure requests that
 bypass the probe. contextExhausted is the collector's documented heuristic:
 finish_reason length before the requested output cap. A complete runtime ledger
 requires instrumenting all traffic or a trustworthy aggregate runtime source.
+Model and loaded-model inventories are enumerated as facts only up to 200
+entries: the count metric stays exact, completeness turns partial, and a
+truncation exception names how many entries were cut. Untrusted strings from the
+endpoint are clamped before they reach a fact, summary, or exception, and a
+clamped value ends in [truncated]. A reasoning token count the model never
+reported is reported as unknown for that reason alone, not as a failed request.
 
 ## Security
 

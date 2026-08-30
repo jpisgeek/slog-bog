@@ -409,3 +409,217 @@ Deno.test("malformed source records degrade visibly without echoing payloads", a
   );
   assertEquals(JSON.stringify(bundle).includes("must-not-survive"), false);
 });
+
+// The caps are asserted as properties, not as literal strings, so the tests
+// keep meaning if the limits are retuned. They must stay in step with the
+// MAX_* constants in dashboard_lmstudio.ts.
+const MAX_LISTED_ITEMS = 200;
+const MAX_FACT_TEXT = 256;
+const MAX_FREE_TEXT = 2048;
+const MARKER = " [truncated]";
+
+function reasonOf(bundle: Awaited<ReturnType<typeof normalize>>, id: string) {
+  const metric = bundle.sections[0].metrics.find((m) => m.id === id)!;
+  assertEquals(metric.availability, "unknown");
+  return (metric as { reason: string }).reason;
+}
+
+Deno.test("absent reasoning tokens on a successful completion do not blame a failure", async () => {
+  // A plain non-reasoning chat model returns prompt/completion/total and omits
+  // reasoning_tokens. Before the fix this metric reused the request-failure
+  // reason, so a healthy section claimed the request never completed.
+  const bundle = await normalize(probe(
+    "completion",
+    completion({ reasoningTokens: null }),
+  ));
+  const section = bundle.sections[0];
+
+  // The request plainly succeeded: nothing about it is partial or unavailable.
+  assertEquals(section.state, "healthy");
+  assertEquals(section.completeness.state, "exact");
+  assertEquals(
+    section.exceptions.some((item) =>
+      item.id === "lmstudio:completion:usage-unavailable"
+    ),
+    false,
+  );
+  assertEquals(
+    section.metrics.find((m) => m.id === "prompt-tokens")?.availability,
+    "observed",
+  );
+
+  // The reasoning metric is unknown, but for its own reason: the model did not
+  // report the counter, not that the request failed.
+  const reason = reasonOf(bundle, "reasoning-tokens");
+  assertEquals(reason.includes("did not complete"), false);
+  assertEquals(reason.includes("reasoning"), true);
+});
+
+Deno.test("a failed completion still attributes null reasoning tokens to the failure", async () => {
+  // The failure reason stays reserved for failures: when the request itself
+  // did not complete, every token metric must tell that same story.
+  const bundle = await normalize(probe(
+    "completion",
+    completion({
+      httpStatus: 503,
+      finishReason: "",
+      promptTokens: null,
+      completionTokens: null,
+      totalTokens: null,
+      reasoningTokens: null,
+      errorKind: "http_error",
+      error: "HTTP 503",
+    }),
+  ));
+  assertEquals(
+    reasonOf(bundle, "reasoning-tokens"),
+    reasonOf(bundle, "prompt-tokens"),
+  );
+  assertEquals(reasonOf(bundle, "reasoning-tokens").includes("request"), true);
+});
+
+Deno.test("a huge model inventory is truncated, still counted exactly, and marked partial", async () => {
+  const modelIds = Array.from({ length: 5000 }, (_, i) => `example/chat-${i}`);
+  const bundle = await normalize(endpoint("models", {
+    modelIds,
+    modelCount: modelIds.length,
+    syncedAt: checkedAt,
+  }));
+  const section = bundle.sections[0];
+
+  // Fact fan-out is bounded: without the cap this section emitted one Fact per
+  // id, which the renderer turns into one table row per id.
+  assertEquals(section.facts.length, MAX_LISTED_ITEMS);
+  // The count itself is still exact — only the enumeration was cut.
+  assertEquals(
+    section.metrics.find((m) => m.id === "available-models")?.value,
+    5000,
+  );
+  assertEquals(section.completeness.state, "partial");
+  assertEquals(bundle.state, "partial");
+  assertEquals(
+    section.exceptions.some((item) => item.id === "lmstudio:models:truncated"),
+    true,
+  );
+  // Truncation is never silent: the reason names what was dropped.
+  assertEquals(
+    (section.completeness as { reason: string }).reason.includes("truncated"),
+    true,
+  );
+});
+
+Deno.test("an oversized model id cannot grow a fact without bound", async () => {
+  const bundle = await normalize(endpoint("models", {
+    modelIds: ["x".repeat(100_000)],
+    modelCount: 1,
+    syncedAt: checkedAt,
+  }));
+  const fact = bundle.sections[0].facts[0];
+  assertEquals(typeof fact.value, "string");
+  assertEquals((fact.value as string).length, MAX_FACT_TEXT + MARKER.length);
+  assertEquals((fact.value as string).endsWith(MARKER), true);
+});
+
+Deno.test("a huge loaded-model inventory truncates the same way", async () => {
+  const loadedModels = Array.from({ length: 1000 }, (_, i) => ({
+    identifier: `example/chat-${i}`,
+    type: "llm",
+    architecture: "example",
+  }));
+  const bundle = await normalize(daemon({
+    cliAvailable: true,
+    daemonRunning: true,
+    status: "running",
+    loadedModelCount: loadedModels.length,
+    loadedModels,
+    observedAt: checkedAt,
+    errorKind: "",
+    error: "",
+  }));
+  const section = bundle.sections[0];
+  // One daemon-running fact plus at most the cap of loaded-model facts.
+  assertEquals(section.facts.length, MAX_LISTED_ITEMS + 1);
+  assertEquals(
+    section.metrics.find((m) => m.id === "loaded-models")?.value,
+    1000,
+  );
+  assertEquals(section.completeness.state, "partial");
+  assertEquals(
+    section.exceptions.some((item) => item.id === "lmstudio:daemon:truncated"),
+    true,
+  );
+});
+
+Deno.test("multi-megabyte collector errors cannot reach summaries or details", async () => {
+  const huge = "E".repeat(2_000_000);
+  const bound = MAX_FREE_TEXT + MARKER.length;
+
+  const failedCompletion = await normalize(probe(
+    "completion",
+    completion({
+      httpStatus: 500,
+      finishReason: "",
+      promptTokens: null,
+      completionTokens: null,
+      totalTokens: null,
+      reasoningTokens: null,
+      errorKind: "http_error",
+      error: huge,
+    }),
+  ));
+  assertEquals(failedCompletion.sections[0].summary.length, bound);
+  assertEquals(failedCompletion.sections[0].exceptions[0].detail.length, bound);
+
+  const unhealthy = await normalize(endpoint(
+    "health",
+    health({
+      reachable: false,
+      authorized: false,
+      httpStatus: 0,
+      errorKind: "unreachable",
+      error: huge,
+    }),
+  ));
+  assertEquals(unhealthy.sections[0].exceptions[0].detail.length, bound);
+
+  const brokenDaemon = await normalize(daemon({
+    cliAvailable: true,
+    daemonRunning: false,
+    status: "unknown",
+    loadedModelCount: 0,
+    loadedModels: [],
+    observedAt: checkedAt,
+    errorKind: "command-failed",
+    error: huge,
+  }));
+  assertEquals(brokenDaemon.sections[0].summary.length, bound);
+});
+
+Deno.test("an unbounded errorKind cannot grow an exception id", async () => {
+  // errorKind is a free-form string in HealthSchema; it is spliced into the
+  // exception id, which the contract does not length-check.
+  const bundle = await normalize(endpoint(
+    "health",
+    health({
+      reachable: true,
+      authorized: false,
+      httpStatus: 500,
+      errorKind: "k".repeat(50_000),
+      error: "",
+    }),
+  ));
+  const id = bundle.sections[0].exceptions[0].id;
+  assertEquals(id.startsWith("lmstudio:health:"), true);
+  assertEquals(id.length < 200, true);
+});
+
+Deno.test("an oversized completion model name cannot grow the summary or a fact", async () => {
+  const bundle = await normalize(probe(
+    "completion",
+    completion({ model: "m".repeat(100_000) }),
+  ));
+  const section = bundle.sections[0];
+  assertEquals(section.summary.length < 400, true);
+  const model = section.facts.find((f) => f.id === "model")!;
+  assertEquals((model.value as string).length, MAX_FACT_TEXT + MARKER.length);
+});

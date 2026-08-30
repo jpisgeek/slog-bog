@@ -719,6 +719,88 @@ function unavailableMetric(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Untrusted-record clamps.
+//
+// A report is a trust boundary. Every field clamped below arrives from whatever
+// the configured LM Studio endpoint or `lms` CLI answered, and nothing upstream
+// bounds it: lmstudio_endpoint.ts writes `modelIds: ids` straight from the
+// /v1/models payload and derives `modelCount` from that same array, so the
+// modelCount/length cross-check in ModelsSchema passes trivially at any size.
+//
+// Before these clamps, a hostile or broken endpoint answering with 500,000
+// model ids expanded 1:1 into 500,000 Fact records that passed every schema
+// check, were persisted to the datastore verbatim, and became 500,000 table
+// rows in the renderer, which caps exception headline/detail at 160/240 chars
+// but renders fact.value uncapped. Multi-megabyte `error` strings took the same
+// path into section summaries and exception details.
+//
+// The clamps live here, at expansion time, and deliberately NOT as Zod .max()
+// constraints: a schema cap would reject the whole record and fall through to
+// invalidRecordSection, discarding a large-but-legitimate inventory entirely.
+// Truncating keeps the observation and states plainly that the list was cut,
+// which is exactly what the completeness contract exists to carry.
+// ---------------------------------------------------------------------------
+
+/** List entries expanded 1:1 into facts. Beyond this the enumeration is cut. */
+const MAX_LISTED_ITEMS = 200;
+
+/** Longest untrusted string permitted in a fact value. */
+const MAX_FACT_TEXT = 256;
+
+/** Longest untrusted free text permitted in a summary or exception detail. */
+const MAX_FREE_TEXT = 2048;
+
+/** Longest untrusted fragment spliced into an exception id. */
+const MAX_ID_TEXT = 64;
+
+/** Clamp untrusted text, marking the cut so a reader cannot mistake it. */
+function clampText(value: string, limit = MAX_FACT_TEXT): string {
+  return value.length <= limit ? value : `${value.slice(0, limit)} [truncated]`;
+}
+
+/** Clamp a fragment spliced into an id. Ids carry no truncation marker. */
+function clampId(value: string): string {
+  return value.slice(0, MAX_ID_TEXT);
+}
+
+/** Cut an untrusted list to the fact-expansion cap, reporting what was cut. */
+function clampList<T>(items: readonly T[]): { listed: T[]; dropped: number } {
+  return items.length <= MAX_LISTED_ITEMS
+    ? { listed: [...items], dropped: 0 }
+    : {
+      listed: items.slice(0, MAX_LISTED_ITEMS),
+      dropped: items.length - MAX_LISTED_ITEMS,
+    };
+}
+
+/**
+ * Completeness for a list whose fact expansion was cut at the cap.
+ *
+ * The population was fully observed, so `observed` stays at the real total;
+ * what is partial is the enumeration this section can carry.
+ */
+function truncatedCompleteness(total: number, dropped: number): Json {
+  return {
+    state: "partial",
+    observed: total,
+    expected: total,
+    rejected: 0,
+    reason:
+      `only the first ${MAX_LISTED_ITEMS} of ${total} entries are listed; ${dropped} were truncated`,
+  };
+}
+
+/** Exception recording that a list was cut, so truncation is never silent. */
+function truncationException(id: string, subject: string, total: number) {
+  return exception(
+    id,
+    "warning",
+    `${subject} list truncated`,
+    `The source reported ${total} entries; only the first ${MAX_LISTED_ITEMS} are listed. The count metric remains exact.`,
+  );
+}
+
 function failedSection(ctx: ReportContext) {
   const failure = classifyExecutionFailure(ctx.errorMessage);
   const state = failureState(failure.kind);
@@ -766,7 +848,11 @@ function invalidRecordSection(ctx: ReportContext) {
 }
 
 function healthSection(value: z.infer<typeof HealthSchema>) {
+  // errorKind and error are the collector's classification of an untrusted
+  // endpoint response and are both unbounded strings in HealthSchema. Clamp
+  // before one is spliced into an exception id and the other into a detail.
   const kind = value.errorKind;
+  const errorDetail = clampText(value.error, MAX_FREE_TEXT);
   const state: DashboardState = !value.reachable
     ? "critical"
     : !value.authorized
@@ -776,14 +862,14 @@ function healthSection(value: z.infer<typeof HealthSchema>) {
     : "healthy";
   const exceptions = kind
     ? [exception(
-      `lmstudio:health:${kind}`,
+      `lmstudio:health:${clampId(kind)}`,
       failureSeverity(kind),
       kind === "unauthorized"
         ? "Endpoint reachable but token rejected"
         : !value.reachable
         ? "Endpoint unreachable"
         : "Endpoint health degraded",
-      value.error || `health probe reported ${kind}`,
+      errorDetail || `health probe reported ${clampId(kind)}`,
     )]
     : [];
   return commonSection(
@@ -832,6 +918,7 @@ function healthSection(value: z.infer<typeof HealthSchema>) {
 
 function modelsSection(value: z.infer<typeof ModelsSchema>) {
   const state: DashboardState = value.modelCount > 0 ? "healthy" : "degraded";
+  const { listed, dropped } = clampList(value.modelIds);
   return commonSection(
     "lmstudio-models",
     "Available local models",
@@ -840,21 +927,31 @@ function modelsSection(value: z.infer<typeof ModelsSchema>) {
       ? `${value.modelCount} model(s) available`
       : "Endpoint returned no available models",
     value.syncedAt,
-    { state: "exact", observed: value.modelCount, rejected: 0 },
+    // The count metric stays exact when the fact list is cut: the endpoint's
+    // answer was fully observed, only its enumeration here is partial.
+    dropped > 0
+      ? truncatedCompleteness(value.modelCount, dropped)
+      : { state: "exact", observed: value.modelCount, rejected: 0 },
     [observedMetric(
       "available-models",
       "Available models",
       "count",
       value.modelCount,
     )],
-    value.modelIds.map((model, index) => ({
+    listed.map((model, index) => ({
       id: `model-${index}`,
       label: `Model ${index + 1}`,
-      value: model,
+      value: clampText(model),
       confidence: "exact",
       sensitivity: "operational",
     })),
-    value.modelCount === 0
+    dropped > 0
+      ? [truncationException(
+        "lmstudio:models:truncated",
+        "Available model",
+        value.modelCount,
+      )]
+      : value.modelCount === 0
       ? [
         exception(
           "lmstudio:models:none",
@@ -877,24 +974,36 @@ function daemonSection(value: z.infer<typeof DaemonSchema>) {
     : value.loadedModelCount === 0
     ? "degraded"
     : "healthy";
-  const summary = value.error ||
+  // `error` is unbounded free text from `lms ps` and lands in both the section
+  // summary (min-1 string, otherwise uncapped) and an exception detail.
+  const summary = clampText(value.error, MAX_FREE_TEXT) ||
     (value.loadedModelCount > 0
       ? `${value.loadedModelCount} model(s) loaded in LM Studio memory`
       : "LM Studio is running with no models loaded");
-  const exceptions = state === "healthy" ? [] : [exception(
-    `lmstudio:daemon:${value.errorKind || "no-loaded-models"}`,
-    state === "critical" ? "critical" : "warning",
-    value.errorKind === "cli-unavailable"
-      ? "LM Studio CLI unavailable"
-      : value.errorKind === "unreachable"
-      ? "LM Studio runtime unavailable"
-      : value.errorKind === "timeout"
-      ? "LM Studio runtime timed out"
-      : value.errorKind
-      ? "LM Studio daemon observation incomplete"
-      : "No models loaded",
-    summary,
-  )];
+  const { listed, dropped } = clampList(value.loadedModels);
+  const exceptions: ReturnType<typeof exception>[] = state === "healthy"
+    ? []
+    : [exception(
+      `lmstudio:daemon:${value.errorKind || "no-loaded-models"}`,
+      state === "critical" ? "critical" : "warning",
+      value.errorKind === "cli-unavailable"
+        ? "LM Studio CLI unavailable"
+        : value.errorKind === "unreachable"
+        ? "LM Studio runtime unavailable"
+        : value.errorKind === "timeout"
+        ? "LM Studio runtime timed out"
+        : value.errorKind
+        ? "LM Studio daemon observation incomplete"
+        : "No models loaded",
+      summary,
+    )];
+  if (dropped > 0) {
+    exceptions.push(truncationException(
+      "lmstudio:daemon:truncated",
+      "Loaded model",
+      value.loadedModelCount,
+    ));
+  }
   return commonSection(
     "lmstudio-daemon",
     "LM Studio headless daemon",
@@ -909,6 +1018,8 @@ function daemonSection(value: z.infer<typeof DaemonSchema>) {
         rejected: 1,
         reason: summary,
       }
+      : dropped > 0
+      ? truncatedCompleteness(value.loadedModelCount, dropped)
       : { state: "exact", observed: value.loadedModelCount, rejected: 0 },
     value.errorKind
       ? [unavailableMetric(
@@ -931,10 +1042,10 @@ function daemonSection(value: z.infer<typeof DaemonSchema>) {
         confidence: value.status === "unknown" ? "unknown" : "exact",
         sensitivity: "operational",
       },
-      ...value.loadedModels.map((model, index) => ({
+      ...listed.map((model, index) => ({
         id: `loaded-model-${index}`,
         label: `Loaded model ${index + 1}`,
-        value: model.identifier,
+        value: clampText(model.identifier),
         confidence: "exact",
         sensitivity: "operational",
       })),
@@ -956,13 +1067,17 @@ function embeddingSection(value: z.infer<typeof EmbeddingSchema>) {
     : value.servesEmbeddings && value.dimensionKnown
     ? "healthy"
     : "partial";
-  const reason = value.error || "Embedding dimension was not observed";
+  // model, error, and errorKind are all unbounded strings in EmbeddingSchema
+  // and all three reach the summary, a fact value, or an exception id.
+  const model = clampText(value.model);
+  const reason = clampText(value.error, MAX_FREE_TEXT) ||
+    "Embedding dimension was not observed";
   return commonSection(
     "lmstudio-embedding",
     "Embedding probe",
     state,
     state === "healthy"
-      ? `${value.model} returned a ${value.measuredDimension}-dimension vector`
+      ? `${model} returned a ${value.measuredDimension}-dimension vector`
       : reason,
     value.checkedAt,
     value.dimensionKnown
@@ -993,7 +1108,7 @@ function embeddingSection(value: z.infer<typeof EmbeddingSchema>) {
       {
         id: "model",
         label: "Model",
-        value: value.model,
+        value: model,
         confidence: "exact",
         sensitivity: "operational",
       },
@@ -1006,7 +1121,7 @@ function embeddingSection(value: z.infer<typeof EmbeddingSchema>) {
       },
     ],
     state === "healthy" ? [] : [exception(
-      `lmstudio:embedding:${value.errorKind || "unknown-dimension"}`,
+      `lmstudio:embedding:${clampId(value.errorKind) || "unknown-dimension"}`,
       failureSeverity(value.errorKind),
       value.errorKind === "model_not_found"
         ? "Embedding model not found"
@@ -1017,6 +1132,11 @@ function embeddingSection(value: z.infer<typeof EmbeddingSchema>) {
 }
 
 function completionSection(value: z.infer<typeof CompletionSchema>) {
+  // model, finishReason, error, and errorKind are unbounded strings in
+  // CompletionSchema and reach the summary, fact values, and exception ids.
+  const model = clampText(value.model);
+  const finishReason = clampText(value.finishReason);
+  const errorDetail = clampText(value.error, MAX_FREE_TEXT);
   const successful = value.errorKind === "";
   const usageKnown = value.promptTokens !== null &&
     value.completionTokens !== null && value.totalTokens !== null;
@@ -1052,12 +1172,12 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
   }
   if (!successful) {
     exceptions.push(exception(
-      `lmstudio:completion:${value.errorKind}`,
+      `lmstudio:completion:${clampId(value.errorKind)}`,
       failureSeverity(value.errorKind),
       value.errorKind === "model_not_found"
         ? "Completion model not found"
         : "Completion probe failed",
-      value.error || `completion probe reported ${value.errorKind}`,
+      errorDetail || `completion probe reported ${clampId(value.errorKind)}`,
     ));
   }
   if (successful && !usageKnown) {
@@ -1070,19 +1190,39 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
     ));
   }
   const tokenReason = "the request did not complete with valid usage data";
-  const token = (id: string, label: string, value: number | null) =>
-    successful && value !== null
-      ? observedMetric(id, label, "tokens", value)
-      : unavailableMetric(id, label, "tokens", tokenReason);
+  // Reasoning tokens are an optional part of the OpenAI usage payload: a plain
+  // non-reasoning chat model returns prompt/completion/total and simply omits
+  // reasoning_tokens, which is why usageKnown above deliberately excludes it.
+  // The old code reused tokenReason for every null token metric, so a fully
+  // successful completion — healthy section, three observed token metrics, no
+  // usage-unavailable exception — still rendered "Reasoning tokens: unknown,
+  // the request did not complete with valid usage data", telling the operator
+  // the request failed when it plainly succeeded. An absent optional counter
+  // gets its own reason; the request-failure reason stays reserved for actual
+  // failures, which is why a failed probe below still reports tokenReason.
+  const missingReasoningReason =
+    "the model did not report a reasoning token count";
+  const token = (
+    id: string,
+    label: string,
+    count: number | null,
+    absentReason = tokenReason,
+  ) =>
+    successful && count !== null
+      ? observedMetric(id, label, "tokens", count)
+      : unavailableMetric(
+        id,
+        label,
+        "tokens",
+        successful ? absentReason : tokenReason,
+      );
   return commonSection(
     "lmstudio-completion",
     "Completion probe",
     state,
     successful
-      ? `${value.model} finished with ${
-        value.finishReason || "an unknown reason"
-      }`
-      : value.error || "Completion probe failed",
+      ? `${model} finished with ${finishReason || "an unknown reason"}`
+      : errorDetail || "Completion probe failed",
     value.checkedAt,
     successful && usageKnown
       ? { state: "exact", observed: 1, expected: 1, rejected: 0 }
@@ -1097,7 +1237,12 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
       token("prompt-tokens", "Prompt tokens", value.promptTokens),
       token("completion-tokens", "Completion tokens", value.completionTokens),
       token("total-tokens", "Total tokens", value.totalTokens),
-      token("reasoning-tokens", "Reasoning tokens", value.reasoningTokens),
+      token(
+        "reasoning-tokens",
+        "Reasoning tokens",
+        value.reasoningTokens,
+        missingReasoningReason,
+      ),
       observedMetric(
         "latency",
         "Request latency",
@@ -1109,14 +1254,14 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
       {
         id: "model",
         label: "Model",
-        value: value.model,
+        value: model,
         confidence: "exact",
         sensitivity: "operational",
       },
       {
         id: "finish-reason",
         label: "Finish reason",
-        value: successful ? value.finishReason || null : null,
+        value: successful ? finishReason || null : null,
         confidence: successful ? "exact" : "unknown",
         sensitivity: "operational",
       },
@@ -1158,6 +1303,9 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
 }
 
 function capabilitySection(value: z.infer<typeof CapabilitySchema>) {
+  // model and errorKind are unbounded strings in CapabilitySchema and reach
+  // the summary, a fact value, and an exception detail.
+  const model = clampText(value.model);
   const truncated = value.reasoningCheckTruncated ||
     value.formatCheckTruncated || value.fenceCheckTruncated;
   const complete = value.checksCompleted === 3 && !value.errorKind;
@@ -1175,7 +1323,7 @@ function capabilitySection(value: z.infer<typeof CapabilitySchema>) {
       "warning",
       "Capability battery incomplete",
       `${value.checksCompleted} of 3 checks completed${
-        value.errorKind ? `; ${value.errorKind}` : ""
+        value.errorKind ? `; ${clampId(value.errorKind)}` : ""
       }.`,
     ));
   }
@@ -1192,7 +1340,7 @@ function capabilitySection(value: z.infer<typeof CapabilitySchema>) {
     "Model capabilities",
     state,
     complete
-      ? `All capability checks completed for ${value.model}`
+      ? `All capability checks completed for ${model}`
       : `${value.checksCompleted} of 3 checks completed`,
     value.checkedAt,
     complete ? { state: "exact", observed: 3, expected: 3, rejected: 0 } : {
@@ -1219,7 +1367,7 @@ function capabilitySection(value: z.infer<typeof CapabilitySchema>) {
       {
         id: "model",
         label: "Model",
-        value: value.model,
+        value: model,
         confidence: "exact",
         sensitivity: "operational",
       },
