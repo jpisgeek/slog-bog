@@ -21,14 +21,28 @@ const SECRET = "SUPER-SECRET-VALUE-must-never-be-logged";
 
 /** Write an executable fake pass-cli emitting the given stdout/stderr/exit. */
 async function fakeCli(
-  opts: { stdout?: string; stderr?: string; exit?: number },
+  opts: {
+    stdout?: string;
+    stderr?: string;
+    exit?: number;
+    listing?: string;
+    title?: string;
+  },
 ): Promise<{ path: string; cleanup: () => Promise<void> }> {
   const dir = await Deno.makeTempDir();
   const path = `${dir}/pass-cli`;
+  // `get` now resolves a title to exactly one LIVE item before viewing it, so
+  // the fake has to answer `item list` as well as `item view`. Callers that
+  // do not care about resolution get a single active item named to match.
+  const listing = opts.listing ??
+    `{"items":[{"id":"ID1","title":"${
+      opts.title ?? "Example Service"
+    }","state":"Active"}]}`;
   const script = [
     "#!/bin/sh",
     // --version probe used by resolveBinary must succeed
     'if [ "$1" = "--version" ]; then echo "fake 1.0"; exit 0; fi',
+    `if [ "$2" = "list" ]; then cat <<'LIST_EOF'\n${listing}\nLIST_EOF\nexit 0; fi`,
     opts.stdout ? `cat <<'STDOUT_EOF'\n${opts.stdout}\nSTDOUT_EOF` : "",
     opts.stderr ? `cat >&2 <<'STDERR_EOF'\n${opts.stderr}\nSTDERR_EOF` : "",
     `exit ${opts.exit ?? 0}`,
@@ -224,11 +238,113 @@ Deno.test("a missing field names the field, not the item contents", async () => 
 
 Deno.test("list() returns item titles from JSON output", async () => {
   const cli = await fakeCli({
-    stdout: JSON.stringify([{ title: "Item A" }, { title: "Item B" }]),
+    listing: JSON.stringify([{ title: "Item A" }, { title: "Item B" }]),
   });
   try {
     const p = providerFor(cli.path);
     assertEquals(await p.list(), ["Item A", "Item B"]);
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// trashed items are deleted items
+// ---------------------------------------------------------------------------
+
+Deno.test("list() hides trashed items", async () => {
+  // `state` was in this response all along and nothing read it, so a secret
+  // the operator had deleted still advertised itself as available.
+  const cli = await fakeCli({
+    listing: JSON.stringify({
+      items: [
+        { id: "1", title: "live", state: "Active" },
+        { id: "2", title: "dead", state: "Trashed" },
+      ],
+    }),
+  });
+  try {
+    assertEquals(await providerFor(cli.path).list(), ["live"]);
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("list() collapses duplicate titles", async () => {
+  // put() creates a NEW item every call rather than updating, so real vaults
+  // accumulate same-titled items. Listing one key twice helps nobody.
+  const cli = await fakeCli({
+    listing: JSON.stringify({
+      items: [
+        { id: "1", title: "dup", state: "Active" },
+        { id: "2", title: "dup", state: "Active" },
+      ],
+    }),
+  });
+  try {
+    assertEquals(await providerFor(cli.path).list(), ["dup"]);
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("get() refuses a title that only matches a trashed item", async () => {
+  const cli = await fakeCli({
+    listing: JSON.stringify({
+      items: [{ id: "1", title: "Example Service", state: "Trashed" }],
+    }),
+    stdout: `{"password":"${SECRET}"}`,
+  });
+  try {
+    let msg = "";
+    try {
+      await providerFor(cli.path).get("Example Service");
+    } catch (e) {
+      msg = String(e);
+    }
+    assertEquals(msg.includes("no active item"), true, msg);
+    // And the trashed item's value must not come back anyway.
+    assertEquals(msg.includes(SECRET), false, "SECRET LEAKED");
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("get() refuses an ambiguous title rather than guessing", async () => {
+  // pass-cli's --item-title picks one when several match, silently. For a
+  // secret, "which one did I just read" must not be unanswerable.
+  const cli = await fakeCli({
+    listing: JSON.stringify({
+      items: [
+        { id: "1", title: "Example Service", state: "Active" },
+        { id: "2", title: "Example Service", state: "Active" },
+      ],
+    }),
+    stdout: `{"password":"${SECRET}"}`,
+  });
+  try {
+    let msg = "";
+    try {
+      await providerFor(cli.path).get("Example Service");
+    } catch (e) {
+      msg = String(e);
+    }
+    assertEquals(msg.includes("ambiguous"), true, msg);
+    assertEquals(msg.includes("2 active items"), true, msg);
+    assertEquals(msg.includes(SECRET), false, "SECRET LEAKED");
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("an item with no state field is treated as live", async () => {
+  // Older pass-cli builds omit state entirely. Hiding every secret from them
+  // would be a worse bug than the one being fixed.
+  const cli = await fakeCli({
+    listing: JSON.stringify({ items: [{ id: "1", title: "legacy" }] }),
+  });
+  try {
+    assertEquals(await providerFor(cli.path).list(), ["legacy"]);
   } finally {
     await cli.cleanup();
   }

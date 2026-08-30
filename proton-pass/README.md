@@ -8,7 +8,7 @@ Proton Pass and are never copied into swamp storage, this repository, or disk.
 For people who keep their lives in the Proton ecosystem and want swamp to read
 credentials from the same place everything else does.
 
-**Version** `2026.08.23.1` · **License** MIT · **Source**
+**Version** `2026.08.30.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/proton-pass
 
 ## Install
@@ -77,7 +77,18 @@ Every `get()` is a live lookup; no value is cached, logged, or persisted.
 pass-cli is invoked with `Deno.Command` (never a shell), so there is no argv
 injection. Error messages carry pass-cli's stderr or its `Error:` lines only.
 Raw stdout (which for `item view` is the whole item, secret included) is never
-placed in an exception. Written data: none.
+placed in an exception. Written data: none. **Deleted means deleted.** Proton
+Pass moves an item to the trash rather than purging it, and `state` has always
+been in the item list. This provider now reads it: a trashed item is not listed
+and is not resolvable, so deleting a secret actually stops it being handed out.
+Previously it did not — the item stayed visible as an available key and
+`--item-title` would resolve to it. **A title must identify exactly one live
+item.** `put()` creates a NEW item on every call rather than updating in place,
+so real vaults accumulate items sharing a title. `pass-cli --item-title`
+silently picks one of them. A lookup that matches more than one active item is
+now refused by name, and a successful lookup is re-addressed by item ID so the
+value returned is the one that was chosen deliberately. Use a `pass://` URI to
+name a specific item when duplicates are intentional.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

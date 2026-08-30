@@ -210,6 +210,67 @@ function extractValue(stdout: string, field: string): string {
 }
 
 /**
+ * One row of `pass-cli item list --output json`, reduced to what matters here.
+ */
+export type PassItem = { id: string; title: string; active: boolean };
+
+/**
+ * Parse the item list, and record whether each item is live or in the trash.
+ *
+ * `state` has been sitting in this response all along and nothing read it, so
+ * a trashed item was indistinguishable from a live one: it appeared in
+ * `list-keys` as an available key, and `item view --item-title` would happily
+ * resolve to it. Deleting a secret in Proton Pass therefore did not stop swamp
+ * from handing out its value -- which is the opposite of what deleting a
+ * secret is for.
+ *
+ * The human-readable fallback is parsed too, because it carries the same fact
+ * in a different shape: `- [id]: Title (state=Trashed)`. Previously that
+ * suffix was left glued to the title, producing key names no lookup could
+ * ever match.
+ */
+export function parseItems(stdout: string): PassItem[] {
+  const trimmed = stdout.trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    const out: PassItem[] = [];
+    for (const line of trimmed.split("\n")) {
+      const m = /^-\s*\[([^\]]*)\]:\s*(.+?)(?:\s*\(state=([A-Za-z]+)\))?\s*$/
+        .exec(line.trim());
+      if (!m) continue;
+      out.push({
+        id: m[1],
+        title: m[2].trim(),
+        active: (m[3] ?? "Active").toLowerCase() === "active",
+      });
+    }
+    return out;
+  }
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : (parsed as Record<string, unknown>)?.items;
+  if (!Array.isArray(rows)) return [];
+  const out: PassItem[] = [];
+  for (const r of rows) {
+    const rec = r as Record<string, unknown>;
+    const title = (rec.title ?? rec.name) as string | undefined;
+    if (typeof title !== "string") continue;
+    // Absent state is treated as ACTIVE: older pass-cli builds omit the field
+    // entirely, and hiding every secret from them would be worse than the bug
+    // this fixes.
+    const state = typeof rec.state === "string" ? rec.state : "Active";
+    out.push({
+      id: typeof rec.id === "string" ? rec.id : "",
+      title,
+      active: state.toLowerCase() === "active",
+    });
+  }
+  return out;
+}
+
+/**
  * The `@jpisgeek/proton-pass` vault provider definition: `get` resolves a
  * secret live through pass-cli (title, title/field, or pass:// URI), `put`
  * creates a login item, `list` returns item titles. See the module header
@@ -231,7 +292,8 @@ export const vault = {
         const field = secretKey.split("/").length > 4
           ? secretKey.split("/").pop()!
           : cfg.defaultField;
-        return { args: [secretKey], field };
+        // A pass:// URI names one item already; nothing to disambiguate.
+        return { args: [secretKey], field, title: undefined };
       }
       const slash = secretKey.indexOf("/");
       const title = slash === -1 ? secretKey : secretKey.slice(0, slash);
@@ -241,19 +303,67 @@ export const vault = {
       return {
         args: ["--vault-name", cfg.vaultName, "--item-title", title],
         field,
+        title,
       };
     };
 
     return {
       get: async (secretKey: string): Promise<string> => {
-        const { args, field } = locate(secretKey);
+        const { args, field, title } = locate(secretKey);
+
+        // Resolve the title to exactly one LIVE item, and address it by ID.
+        //
+        // `--item-title` lets pass-cli choose when several items share a
+        // name, and it will choose a trashed one just as readily as a live
+        // one. This vault genuinely holds duplicate titles -- the `put` below
+        // creates a new item every call rather than updating -- so "which
+        // secret did I just read" had no reliable answer. Nothing about that
+        // was visible: the wrong value simply came back.
+        //
+        // Skipped for pass:// URIs, which already name a specific item.
+        let resolved = args;
+        if (title !== undefined) {
+          const items = parseItems(
+            await run(cfg.binary, [
+              "item",
+              "list",
+              "--vault-name",
+              cfg.vaultName,
+              "--output",
+              "json",
+            ]),
+          ).filter((i) => i.active && i.title === title);
+          if (items.length === 0) {
+            throw new Error(
+              `Secret '${secretKey}' not found in Proton Pass vault ` +
+                `'${cfg.vaultName}': no active item titled '${title}' ` +
+                `(a trashed item with that title is not used).`,
+            );
+          }
+          if (items.length > 1) {
+            throw new Error(
+              `Secret '${secretKey}' is ambiguous in Proton Pass vault ` +
+                `'${cfg.vaultName}': ${items.length} active items are titled ` +
+                `'${title}'. Refusing to guess which one you meant -- remove ` +
+                `the duplicates, or address one by its pass:// URI.`,
+            );
+          }
+          if (items[0].id) {
+            resolved = [
+              "--vault-name",
+              cfg.vaultName,
+              "--item-id",
+              items[0].id,
+            ];
+          }
+        }
         // NOTE: deliberately no --field. pass-cli's own field resolution
         // rejects custom field names ("Field does not exist: password"),
         // so pull the whole item and pick the field out here instead.
         const stdout = await run(cfg.binary, [
           "item",
           "view",
-          ...args,
+          ...resolved,
           "--output",
           "json",
         ]);
@@ -300,26 +410,20 @@ export const vault = {
           "--output",
           "json",
         ]);
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(stdout.trim());
-        } catch {
-          // Fall back to the human format: "- [id]: Title"
-          return stdout
-            .split("\n")
-            .map((line) => line.replace(/^-\s*\[[^\]]*\]:\s*/, "").trim())
-            .filter(Boolean);
+        // Live items only. A trashed secret is one the operator deleted, and
+        // listing it as available is how a dead credential keeps getting
+        // handed out. Duplicate titles are collapsed -- `get` is where
+        // ambiguity is refused, and it is refused there rather than here so
+        // the message can say which key is at fault.
+        const seen = new Set<string>();
+        const out: string[] = [];
+        for (const it of parseItems(stdout)) {
+          if (!it.active) continue;
+          if (seen.has(it.title)) continue;
+          seen.add(it.title);
+          out.push(it.title);
         }
-        const rows = Array.isArray(parsed)
-          ? parsed
-          : (parsed as Record<string, unknown>)?.items;
-        if (!Array.isArray(rows)) return [];
-        return rows
-          .map((r) => {
-            const rec = r as Record<string, unknown>;
-            return (rec.title ?? rec.name) as string | undefined;
-          })
-          .filter((t): t is string => typeof t === "string");
+        return out;
       },
 
       getName: (): string => name,
