@@ -1,10 +1,21 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@1";
+import {
+  assertEquals,
+  assertNotEquals,
+  assertRejects,
+} from "jsr:@std/assert@1";
 import { normalize } from "./dashboard_swamp.ts";
 import { model, setCommandRunnerForTest } from "./swamp_observability.ts";
 
 type Json = Record<string, unknown>;
 
-const observedAt = "2026-08-25T18:00:00.000Z";
+// Freshness is now derived by comparing observedAt against the clock, so the
+// default fixture has to represent what a normal run looks like: the collector
+// and this report execute together, seconds apart. A frozen literal here would
+// silently make every fixture stale as the calendar moved past it.
+const observedAt = new Date().toISOString();
+
+// One hour back, well past the 300s freshness budget.
+const staleObservedAt = new Date(Date.now() - 3_600_000).toISOString();
 
 function observation(
   name: string,
@@ -22,11 +33,16 @@ function observation(
   };
 }
 
-function reportContext(items: Json[]) {
+function reportContext(items: Json[], corrupt: Record<string, string> = {}) {
   const encoded = new Map(items.map((item) => [
     `interface-${item.interface}`,
     new TextEncoder().encode(JSON.stringify(item)),
   ]));
+  // Overwrite a stored snapshot with bytes this report version cannot parse,
+  // standing in for schema drift between the collector and an older report.
+  for (const [name, body] of Object.entries(corrupt)) {
+    encoded.set(`interface-${name}`, new TextEncoder().encode(body));
+  }
   return {
     scope: "method" as const,
     modelType: { toString: () => "@jpisgeek/swamp-observability" },
@@ -352,4 +368,217 @@ Deno.test("collector cancellation aborts instead of recording unavailability", a
   } finally {
     setCommandRunnerForTest();
   }
+});
+
+Deno.test("compound statuses are never laundered into successes", async () => {
+  // The old classifier used unanchored substring probes with the success test
+  // ahead of the failure test, so "completed_with_errors" matched /completed/
+  // and "unsuccessful" matched /success/ — both landed in counts.succeeded and
+  // the section rendered healthy. Whole-token matching sends the first to
+  // unknown and the second to failed; neither may ever count as a success.
+  const bundle = await normalize(reportContext(complete({
+    "run-history": observation("run-history", {
+      runs: [
+        { status: "completed_with_errors" },
+        { status: "unsuccessful" },
+        { status: "pending_failure" },
+      ],
+    }),
+  })));
+  const section = bundle.sections[0];
+  const value = (id: string) =>
+    section.metrics.find((metric) => metric.id === id)?.value;
+  assertEquals(value("succeeded"), 0);
+  assertEquals(value("active"), 0);
+  assertEquals(value("failed"), 1);
+  assertEquals(value("unknown"), 2);
+  assertEquals(section.state, "degraded");
+});
+
+Deno.test("plain success and failure vocabularies still classify correctly", async () => {
+  const bundle = await normalize(reportContext(complete({
+    "run-history": observation("run-history", {
+      runs: [
+        { status: "succeeded" },
+        { status: "Completed" },
+        { status: "running" },
+        { status: "cancelled" },
+      ],
+    }),
+  })));
+  const section = bundle.sections[0];
+  const value = (id: string) =>
+    section.metrics.find((metric) => metric.id === id)?.value;
+  assertEquals(value("succeeded"), 2);
+  assertEquals(value("active"), 1);
+  assertEquals(value("failed"), 1);
+  assertEquals(value("unknown"), 0);
+});
+
+Deno.test("a wholly failed report inventory does not render as healthy", async () => {
+  // hasStatus was a presence probe only: every stored-reports branch keyed off
+  // "is a status string there", never its value, so an inventory in which every
+  // report failed produced a section byte-identical to one in which every
+  // report succeeded.
+  const failed = await normalize(reportContext(complete({
+    "stored-reports": observation("stored-reports", {
+      results: [
+        { reportName: "@jpisgeek/dashboard-swamp", status: "failed" },
+        { reportName: "@jpisgeek/other", status: "failed" },
+      ],
+    }),
+  })));
+  const succeeded = await normalize(reportContext(complete({
+    "stored-reports": observation("stored-reports", {
+      results: [
+        { reportName: "@jpisgeek/dashboard-swamp", status: "succeeded" },
+        { reportName: "@jpisgeek/other", status: "succeeded" },
+      ],
+    }),
+  })));
+  const section = failed.sections[3];
+  assertEquals(section.state, "degraded");
+  assertEquals(succeeded.sections[3].state, "healthy");
+  assertEquals(
+    section.metrics.find((metric) => metric.id === "failed")?.value,
+    2,
+  );
+  assertEquals(
+    section.metrics.find((metric) => metric.id === "succeeded")?.value,
+    0,
+  );
+  assertEquals(
+    section.exceptions.some((exception) =>
+      exception.headline === "Unsuccessful stored report executions observed"
+    ),
+    true,
+  );
+  // The whole rendering must differ, not just one field a renderer may ignore.
+  assertNotEquals(section.summary, succeeded.sections[3].summary);
+  assertEquals(succeeded.sections[3].exceptions.length, 0);
+});
+
+Deno.test("an unrecognized report status degrades rather than passing", async () => {
+  const bundle = await normalize(reportContext(complete({
+    "stored-reports": observation("stored-reports", {
+      results: [{ reportName: "@example/report", status: "completed_early" }],
+    }),
+  })));
+  const section = bundle.sections[3];
+  assertEquals(section.state, "degraded");
+  assertEquals(
+    section.metrics.find((metric) => metric.id === "succeeded")?.value,
+    0,
+  );
+});
+
+Deno.test("stored report status stays a capability probe, not a verdict", async () => {
+  // Absent status must remain "this build does not expose it" — partial state
+  // and unsupported metrics — never a health judgement in either direction.
+  const bundle = await normalize(reportContext(complete({
+    "stored-reports": observation("stored-reports", {
+      results: [{ reportName: "@example/report" }],
+    }),
+  })));
+  const section = bundle.sections[3];
+  assertEquals(section.state, "partial");
+  for (const id of ["status-known", "succeeded", "failed"]) {
+    assertEquals(
+      section.metrics.find((metric) => metric.id === id)?.availability,
+      "unsupported",
+      id,
+    );
+  }
+});
+
+Deno.test("an aged observation reports stale freshness instead of claiming fresh", async () => {
+  // All three available-section call sites emitted the literal
+  // { state: "fresh", observedAt, maxAgeSeconds: 300 } without ever reading
+  // observedAt, so a re-run over a stored 30-day observation asserted the data
+  // was under five minutes old while the timestamp was days back.
+  const stale = await normalize(reportContext(complete({
+    "run-history": observation("run-history", {
+      runs: [{ status: "succeeded" }],
+    }, { observedAt: staleObservedAt }),
+    "run-doctor": observation("run-doctor", {
+      totalTracked: 1,
+      active: 0,
+      stale: 0,
+      orphaned: 0,
+    }, { observedAt: staleObservedAt }),
+    "stored-reports": observation("stored-reports", {
+      results: [{ status: "succeeded" }],
+    }, { observedAt: staleObservedAt }),
+  })));
+  for (const index of [0, 1, 3]) {
+    const freshness = stale.sections[index].freshness;
+    assertEquals(freshness.state, "stale", String(index));
+    assertEquals(freshness.maxAgeSeconds, 300);
+    assertEquals(typeof freshness.reason, "string");
+  }
+
+  const fresh = await normalize(reportContext(complete()));
+  for (const index of [0, 1, 3]) {
+    assertEquals(fresh.sections[index].freshness.state, "fresh", String(index));
+  }
+});
+
+Deno.test("an unreadable snapshot degrades one interface, not the whole report", async () => {
+  // readObservations parsed each stored resource unguarded and normalize() did
+  // not catch, so a single snapshot this report version could not parse threw
+  // out of report.execute and the operator got no dashboard at all.
+  const bundle = await normalize(
+    reportContext(complete(), { "run-history": "{not valid json" }),
+  );
+  assertEquals(bundle.sections.length, 5);
+  const broken = bundle.sections[0];
+  assertEquals(broken.state, "partial");
+  assertEquals(broken.coverage.kind, "unknown");
+  assertEquals(broken.freshness.state, "unknown");
+  assertEquals(broken.exceptions[0].id, "swamp:run-history:invalid-response");
+  // The interfaces that parsed cleanly still carry their evidence.
+  assertEquals(bundle.sections[1].state, "healthy");
+  assertEquals(bundle.sections[3].state, "healthy");
+});
+
+Deno.test("a snapshot rejected by the inlined schema becomes a coverage gap", async () => {
+  // Valid JSON, but an errorKind this report version's inlined
+  // ObservationSchema does not know — the collector-drift case.
+  const bundle = await normalize(
+    reportContext(complete(), {
+      "workflow-history": JSON.stringify({
+        interface: "workflow-history",
+        available: true,
+        observedAt,
+        errorKind: "quota-exhausted",
+        error: "",
+        payload: { results: [] },
+      }),
+    }),
+  );
+  assertEquals(bundle.sections.length, 5);
+  assertEquals(bundle.sections[2].state, "partial");
+  assertEquals(bundle.sections[0].state, "healthy");
+});
+
+Deno.test("a datastore read failure for one interface does not abort the run", async () => {
+  const items = complete();
+  const base = reportContext(items);
+  const context = {
+    ...base,
+    dataRepository: {
+      getContent: (
+        type: string | { toString(): string },
+        id: string,
+        name: string,
+      ) =>
+        name === "interface-stored-reports"
+          ? Promise.reject(new Error("datastore unavailable"))
+          : base.dataRepository.getContent(type, id, name),
+    },
+  };
+  const bundle = await normalize(context);
+  assertEquals(bundle.sections.length, 5);
+  assertEquals(bundle.sections[3].state, "partial");
+  assertEquals(bundle.sections[0].state, "healthy");
 });
