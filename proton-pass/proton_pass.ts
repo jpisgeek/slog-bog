@@ -19,11 +19,22 @@ import { z } from "npm:zod@4";
 const ConfigSchema = z.object({
   vaultName: z
     .string()
-    .describe("Proton Pass vault to read from, e.g. 'homelab'"),
+    .describe("Proton Pass vault to read from, e.g. '<your-vault>'"),
   defaultField: z
     .string()
     .default("password")
     .describe("Item field used when the secret key names no field"),
+  timeoutSec: z
+    .number()
+    .int()
+    .positive()
+    .max(300)
+    .default(30)
+    .describe(
+      "How long any single pass-cli call may take. It reaches Proton's " +
+        "servers, so an unbounded call can hang for as long as the network " +
+        "allows.",
+    ),
   binary: z
     .string()
     .default("pass-cli")
@@ -83,17 +94,41 @@ async function resolveBinary(configured: string): Promise<string> {
 }
 
 /** Run pass-cli and return stdout. Never uses a shell, so no argv injection. */
-async function run(configured: string, args: string[]): Promise<string> {
+async function run(
+  configured: string,
+  args: string[],
+  opts: { timeoutSec?: number; signal?: AbortSignal } = {},
+): Promise<string> {
   const bin = await resolveBinary(configured);
   let out: Deno.CommandOutput;
+  // Bounded, and cancellable. pass-cli talks to Proton's servers, so a call
+  // can hang on the network for as long as the transport allows -- and with
+  // no signal wired through, a caller that had already given up was still
+  // waited on. A secret lookup that never returns stalls whatever asked for
+  // it, and this provider sits in the path of model runs that have their own
+  // deadlines.
+  const deadline = AbortSignal.timeout((opts.timeoutSec ?? 30) * 1000);
+  const signal = opts.signal
+    ? AbortSignal.any([opts.signal, deadline])
+    : deadline;
   try {
     out = await new Deno.Command(bin, {
       args,
       stdin: "null", // never let it block on an interactive prompt
       stdout: "piped",
       stderr: "piped",
+      signal,
     }).output();
   } catch (cause) {
+    if (deadline.aborted) {
+      throw new Error(
+        `pass-cli did not answer within ${opts.timeoutSec ?? 30}s`,
+        { cause },
+      );
+    }
+    if (opts.signal?.aborted) {
+      throw new Error("cancelled before pass-cli answered", { cause });
+    }
     throw new Error(
       `Could not execute '${bin}'. Is the Proton Pass CLI installed ` +
         `(brew install proton-pass-cli)?`,
@@ -127,10 +162,13 @@ async function run(configured: string, args: string[]): Promise<string> {
       .filter((l) => /^Error:/.test(l))
       .join(" ")
       .trim();
-    const detail = stderr || stdoutErrors ||
-      `exit ${out.code} (stdout withheld: it may contain item contents)`;
+    // Classify, do not forward. stderr is pass-cli's, not ours: it can echo
+    // the arguments it was given -- which include vault and item names -- and
+    // whatever the server said. The verdict is enough to act on; the text is
+    // not ours to publish into a run log.
+    const detail = classifyCliFailure(stderr, stdoutErrors, out.code);
     // Surface the actionable case rather than a raw CLI dump.
-    if (/not logged in|session|unauthor/i.test(detail)) {
+    if (detail === "session-not-usable") {
       throw new Error(
         `Proton Pass session is not usable: ${detail}. ` +
           `Run 'pass-cli login' (or attach a personal access token for ` +
@@ -140,6 +178,36 @@ async function run(configured: string, args: string[]): Promise<string> {
     throw new Error(`pass-cli failed: ${detail}`);
   }
   return stdout;
+}
+
+/**
+ * Reduce a pass-cli failure to a fixed verdict.
+ *
+ * The matching reads the full text; only the verdict escapes. Exception
+ * strings from this provider land in swamp run logs and reports, and the
+ * whole reason this extension was a publish blocker at its first review was
+ * output reaching an error path -- forwarding stderr verbatim is the same
+ * mistake with a different source.
+ */
+export function classifyCliFailure(
+  stderr: string,
+  stdoutErrors: string,
+  code: number,
+): string {
+  const text = `${stderr}\n${stdoutErrors}`;
+  const patterns: [RegExp, string][] = [
+    [/not logged in|session|unauthor|token/i, "session-not-usable"],
+    [/not found|no such item|does not exist/i, "item-not-found"],
+    [/field does not exist/i, "field-not-found"],
+    [/permission|denied|forbidden/i, "permission-denied"],
+    [
+      /network|timed? ?out|connection|dns|resolve|could not reach|unreachable/i,
+      "network-failure",
+    ],
+    [/vault .*not found|unknown vault/i, "vault-not-found"],
+  ];
+  for (const [re, verdict] of patterns) if (re.test(text)) return verdict;
+  return `unclassified (exit ${code})`;
 }
 
 /**
@@ -153,9 +221,14 @@ function extractValue(stdout: string, field: string): string {
   try {
     parsed = JSON.parse(trimmed);
   } catch {
-    // --field on a non-JSON build prints the bare value.
-    if (trimmed) return trimmed;
-    throw new Error("pass-cli returned no value");
+    // Previously: `if (trimmed) return trimmed` -- any non-JSON output at all
+    // was handed back AS THE SECRET. A usage message, a warning banner, a
+    // partially written line, all became values, and a caller would have
+    // authenticated with them. This provider always asks for --output json,
+    // so non-JSON here is a broken response, not an alternate format.
+    throw new Error(
+      `pass-cli returned ${trimmed.length} byte(s) that are not JSON`,
+    );
   }
 
   const seen = new Set<unknown>();
@@ -251,7 +324,13 @@ export function parseItems(stdout: string): PassItem[] {
   const rows = Array.isArray(parsed)
     ? parsed
     : (parsed as Record<string, unknown>)?.items;
-  if (!Array.isArray(rows)) return [];
+  // An unrecognised shape is a broken response, not an empty vault. Returning
+  // [] made "pass-cli answered with something we cannot read" and "you have
+  // no secrets" the same answer -- and the second is a fact a caller may act
+  // on, including by concluding a key is absent.
+  if (!Array.isArray(rows)) {
+    throw new Error("pass-cli item list returned an unrecognised shape");
+  }
   const out: PassItem[] = [];
   for (const r of rows) {
     const rec = r as Record<string, unknown>;
@@ -304,12 +383,13 @@ export const vault = {
         args: ["--vault-name", cfg.vaultName, "--item-title", title],
         field,
         title,
+        id: undefined,
       };
     };
 
     return {
       get: async (secretKey: string): Promise<string> => {
-        const { args, field, title } = locate(secretKey);
+        const { args, field, title, id } = locate(secretKey);
 
         // Resolve the title to exactly one LIVE item, and address it by ID.
         //
@@ -320,9 +400,32 @@ export const vault = {
         // secret did I just read" had no reliable answer. Nothing about that
         // was visible: the wrong value simply came back.
         //
-        // Skipped for pass:// URIs, which already name a specific item.
+        // pass:// URIs are checked too. A stable URI pinned in a config is
+        // the address form MOST likely to outlive the item it names, so
+        // exempting it would put the biggest hole in exactly the guarantee
+        // this provider makes.
         let resolved = args;
-        if (title !== undefined) {
+        if (id !== undefined) {
+          const item = parseItems(
+            await run(cfg.binary, [
+              "item",
+              "list",
+              "--vault-name",
+              cfg.vaultName,
+              "--output",
+              "json",
+            ], { timeoutSec: cfg.timeoutSec }),
+          ).find((i) => i.id === id);
+          if (item && !item.active) {
+            throw new Error(
+              `Secret '${secretKey}' refers to a trashed item in Proton Pass ` +
+                `vault '${cfg.vaultName}'. Restore it, or name a live item.`,
+            );
+          }
+          // An id absent from this listing is left alone: a pass:// URI can
+          // address a different vault, and refusing there would break a
+          // locator that works.
+        } else if (title !== undefined) {
           const items = parseItems(
             await run(cfg.binary, [
               "item",
@@ -331,7 +434,7 @@ export const vault = {
               cfg.vaultName,
               "--output",
               "json",
-            ]),
+            ], { timeoutSec: cfg.timeoutSec }),
           ).filter((i) => i.active && i.title === title);
           if (items.length === 0) {
             throw new Error(
@@ -366,7 +469,7 @@ export const vault = {
           ...resolved,
           "--output",
           "json",
-        ]);
+        ], { timeoutSec: cfg.timeoutSec });
         try {
           return extractValue(stdout, field);
         } catch (cause) {
@@ -398,7 +501,7 @@ export const vault = {
           title,
           "--password",
           secretValue,
-        ]);
+        ], { timeoutSec: cfg.timeoutSec });
       },
 
       list: async (): Promise<string[]> => {
@@ -409,7 +512,7 @@ export const vault = {
           cfg.vaultName,
           "--output",
           "json",
-        ]);
+        ], { timeoutSec: cfg.timeoutSec });
         // Live items only. A trashed secret is one the operator deleted, and
         // listing it as available is how a dead credential keeps getting
         // handed out. Duplicate titles are collapsed -- `get` is where

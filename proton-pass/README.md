@@ -24,11 +24,12 @@ copied into swamp storage. Every get() is a live lookup.
 
 ### Arguments
 
-| config         | type   | required | default      | description                                                                                                                                                                                                             |
-| -------------- | ------ | -------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vaultName`    | string | yes      |              | Proton Pass vault to read from, e.g. 'homelab'                                                                                                                                                                          |
-| `defaultField` | string | no       | `"password"` | Item field used when the secret key names no field                                                                                                                                                                      |
-| `binary`       | string | no       | `"pass-cli"` | pass-cli executable. Left as a bare name it is resolved against PATH and then a list of known install locations, because non-login contexts (ssh, launchd, cron, a daemon) often lack Homebrew's bin directory on PATH. |
+| config         | type    | required | default      | description                                                                                                                                                                                                             |
+| -------------- | ------- | -------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vaultName`    | string  | yes      |              | Proton Pass vault to read from, e.g. '<your-vault>'                                                                                                                                                                     |
+| `defaultField` | string  | no       | `"password"` | Item field used when the secret key names no field                                                                                                                                                                      |
+| `timeoutSec`   | integer | no       | `30`         | How long any single pass-cli call may take. It reaches Proton's servers, so an unbounded call can hang for as long as the network allows.                                                                               |
+| `binary`       | string  | no       | `"pass-cli"` | pass-cli executable. Left as a bare name it is resolved against PATH and then a list of known install locations, because non-login contexts (ssh, launchd, cron, a daemon) often lack Homebrew's bin directory on PATH. |
 
 ### Methods
 
@@ -77,18 +78,37 @@ Every `get()` is a live lookup; no value is cached, logged, or persisted.
 pass-cli is invoked with `Deno.Command` (never a shell), so there is no argv
 injection. Error messages carry pass-cli's stderr or its `Error:` lines only.
 Raw stdout (which for `item view` is the whole item, secret included) is never
-placed in an exception. Written data: none. **Deleted means deleted.** Proton
-Pass moves an item to the trash rather than purging it, and `state` has always
-been in the item list. This provider now reads it: a trashed item is not listed
-and is not resolvable, so deleting a secret actually stops it being handed out.
-Previously it did not — the item stayed visible as an available key and
-`--item-title` would resolve to it. **A title must identify exactly one live
+placed in an exception. Written data: none. **Secret keys appear in errors;
+remote text does not.** A failed lookup says which key failed —
+`Secret 'x/y' not found in vault 'z'` — and that is deliberate. The key is what
+YOU passed in; it is already in the model definition that asked for it, and an
+error that will not say which lookup failed makes a secrets provider
+undiagnosable. What is NOT forwarded is anything pass-cli or Proton said: stderr
+is reduced to a fixed verdict (`session-not-usable`, `item-not-found`,
+`network-failure`, `permission-denied`, `vault-not-found`, or `unclassified`),
+because that text can echo the arguments it was given and whatever the server
+returned. Exception strings from here reach swamp run logs and reports. **A key
+splits at the FIRST `/`.** `Example Service/API Key` means the item
+`Example Service`, field `API Key`. An item title containing `/` therefore
+cannot be addressed this way — use a `pass://SHARE_ID/ITEM_ID/FIELD` URI for
+those. The URI form is checked for liveness too. **Deleted means deleted.**
+Proton Pass moves an item to the trash rather than purging it, and `state` has
+always been in the item list. This provider now reads it: a trashed item is not
+listed and is not resolvable, so deleting a secret actually stops it being
+handed out. Previously it did not — the item stayed visible as an available key
+and `--item-title` would resolve to it. **A title must identify exactly one live
 item.** `put()` creates a NEW item on every call rather than updating in place,
 so real vaults accumulate items sharing a title. `pass-cli --item-title`
 silently picks one of them. A lookup that matches more than one active item is
 now refused by name, and a successful lookup is re-addressed by item ID so the
 value returned is the one that was chosen deliberately. Use a `pass://` URI to
-name a specific item when duplicates are intentional.
+name a specific item when duplicates are intentional. **What this provider does
+not promise.** An item whose `state` field is absent is treated as live, because
+older pass-cli builds omit it and hiding every secret from them would be worse
+than the bug that reading `state` fixes. A `pass://` URI naming an item this
+vault does not list is passed through untouched, since it may address a
+different vault. And every call is a live lookup with a bounded timeout: nothing
+is cached, so a Proton outage is a failure rather than a stale success.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

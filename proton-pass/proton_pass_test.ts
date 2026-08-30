@@ -15,7 +15,7 @@
  * Requires --allow-run --allow-write --allow-read (fake binary in a temp dir).
  */
 import { assertEquals } from "jsr:@std/assert@1";
-import { vault } from "./proton_pass.ts";
+import { classifyCliFailure, vault } from "./proton_pass.ts";
 
 const SECRET = "SUPER-SECRET-VALUE-must-never-be-logged";
 
@@ -87,11 +87,8 @@ Deno.test("failure with exit 0 + 'Error:' on stdout does not leak the item", asy
       false,
       `SECRET LEAKED INTO ERROR: ${msg}`,
     );
-    assertEquals(
-      msg.includes("item not found"),
-      true,
-      "the actionable Error: line should still surface",
-    );
+    // The Error: line is no longer forwarded; its VERDICT is.
+    assertEquals(msg.includes("item-not-found"), true, msg);
   } finally {
     await cli.cleanup();
   }
@@ -109,20 +106,28 @@ Deno.test("non-zero exit with a secret on stdout withholds stdout entirely", asy
     }
     assertEquals(msg !== "", true, "expected a throw");
     assertEquals(msg.includes(SECRET), false, `SECRET LEAKED: ${msg}`);
+    // The contract moved: failures are classified rather than described, so
+    // neither stdout NOR its absence is narrated. What matters is that a
+    // verdict comes back and the item does not.
     assertEquals(
-      msg.includes("stdout withheld"),
+      /unclassified|item-not-found|session-not-usable/.test(msg),
       true,
-      "the error should say stdout was withheld rather than print it",
+      `expected a fixed verdict, got: ${msg}`,
     );
   } finally {
     await cli.cleanup();
   }
 });
 
-Deno.test("stderr is surfaced (it carries no item contents)", async () => {
+Deno.test("stderr is classified, never forwarded", async () => {
+  // It used to be forwarded verbatim on the reasoning that stderr carries no
+  // item contents. It carries something else worth withholding: pass-cli can
+  // echo the arguments it was given -- vault and item names -- and whatever
+  // the server said. Exception strings from here reach run logs and reports.
   const cli = await fakeCli({
     stdout: `{"password":"${SECRET}"}`,
-    stderr: "could not reach the Proton API",
+    stderr:
+      "could not reach the Proton API for vault jason item my-db-password",
     exit: 1,
   });
   try {
@@ -133,11 +138,43 @@ Deno.test("stderr is surfaced (it carries no item contents)", async () => {
     } catch (e) {
       msg = String(e);
     }
-    assertEquals(msg.includes("could not reach the Proton API"), true);
+    assertEquals(msg.includes("network-failure"), true, msg);
+    // Neither the secret nor the identifiers stderr happened to mention.
     assertEquals(msg.includes(SECRET), false, `SECRET LEAKED: ${msg}`);
+    assertEquals(msg.includes("my-db-password"), false, `NAME LEAKED: ${msg}`);
+    assertEquals(
+      msg.includes("could not reach"),
+      false,
+      `TEXT FORWARDED: ${msg}`,
+    );
   } finally {
     await cli.cleanup();
   }
+});
+
+Deno.test("every classified verdict is a fixed string", () => {
+  // The point is that the SET of things this can say is closed, so no
+  // remote text can widen it.
+  assertEquals(
+    classifyCliFailure("not logged in", "", 1),
+    "session-not-usable",
+  );
+  assertEquals(
+    classifyCliFailure("", "Error: no such item", 1),
+    "item-not-found",
+  );
+  assertEquals(
+    classifyCliFailure("connection reset", "", 1),
+    "network-failure",
+  );
+  assertEquals(
+    classifyCliFailure("permission denied", "", 1),
+    "permission-denied",
+  );
+  // Anything unrecognised yields a verdict, never a sample of the text.
+  const v = classifyCliFailure("host quux-01 said something odd", "", 7);
+  assertEquals(v, "unclassified (exit 7)");
+  assertEquals(v.includes("quux-01"), false);
 });
 
 Deno.test("a keychain-locked session is reported as such, not as a raw code", async () => {
