@@ -21,6 +21,10 @@ caveats: >-
   Access requires an eligible OpenAI Admin API credential. This package does
   not inspect ChatGPT subscriptions, scrape personal dashboards, or infer
   remaining quota. Breakdown identifiers are retained as operational metadata.
+  Optional fields OpenAI omits are read as absent rather than as errors: a
+  missing cached-token counter is zero, and a cost row returned without an
+  amount is excluded from the totals with the cost dimension marked partial,
+  so an incomplete billed total is never reported as complete.
 security: >-
   Supply the Admin API key through a Swamp vault expression. It is marked
   sensitive, used only in the Authorization header, and never persisted in

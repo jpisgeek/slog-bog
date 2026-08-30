@@ -63,7 +63,11 @@ families are not silently included. The Usage and Costs APIs can differ, so
 billed cost remains a separate dimension and is authoritative for spend. Access
 requires an eligible OpenAI Admin API credential. This package does not inspect
 ChatGPT subscriptions, scrape personal dashboards, or infer remaining quota.
-Breakdown identifiers are retained as operational metadata.
+Breakdown identifiers are retained as operational metadata. Optional fields
+OpenAI omits are read as absent rather than as errors: a missing cached-token
+counter is zero, and a cost row returned without an amount is excluded from the
+totals with the cost dimension marked partial, so an incomplete billed total is
+never reported as complete.
 
 ## Security
 
