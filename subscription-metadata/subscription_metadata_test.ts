@@ -66,6 +66,101 @@ Deno.test("remaining quota and token price declarations are rejected", async () 
     "Unrecognized key",
   );
 });
+
+// The guard used to read limit.name only, so a per-token price or a remaining
+// quota declared through the unit or the period validated and reached the
+// dashboard as an exact observed metric. Each entry below is a plain thing an
+// operator would type, not an evasion attempt.
+Deno.test("forbidden declarations carried by unit or period are rejected", async () => {
+  const forbidden = [
+    { name: "Rate", value: 0.002, unit: "usd-per-token" },
+    { name: "Included", value: 500, unit: "requests-remaining" },
+    { name: "Bucket", value: 100, unit: "tokens", period: "per token" },
+    { name: "Budget", value: 5, unit: "usd", period: "tokens remaining" },
+    { name: "Blended", value: 3, unit: "usd-per-1k-tokens" },
+    { name: "Availability window", value: 1, unit: "ratio" },
+  ];
+  for (const limit of forbidden) {
+    await assertRejects(
+      () => run({ provider: "Example AI", declaredLimits: [limit] }),
+      Error,
+      "forbidden",
+      `expected ${JSON.stringify(limit)} to be rejected`,
+    );
+  }
+});
+
+// Zero-width and homoglyph spellings render to a human as the forbidden phrase.
+// The old ASCII regex saw a different string and let both through.
+Deno.test("invisible characters and homoglyphs do not evade the guard", async () => {
+  const names = [
+    "rem​aining tokens", // zero-width space splits the word
+    "remаining quota", // Cyrillic а
+    "аvаilable credits", // Cyrillic а twice
+    "ᵖer-token price", // NFKC-foldable modifier letter
+  ];
+  for (const name of names) {
+    await assertRejects(
+      () =>
+        run({
+          provider: "Example AI",
+          declaredLimits: [{ name, value: 1, unit: "tokens" }],
+        }),
+      Error,
+      "forbidden",
+      `expected ${JSON.stringify(name)} to be rejected`,
+    );
+  }
+});
+
+// Guard against the fix over-reaching: these are the ordinary declarations the
+// README's own example uses, and they must still capture.
+Deno.test("legitimate limit declarations still capture", async () => {
+  const snapshot = await run({
+    provider: "Example AI",
+    declaredLimits: [
+      {
+        name: "Included requests",
+        value: 1000,
+        unit: "requests",
+        period: "month",
+      },
+      { name: "Context window", value: 200000, unit: "tokens" },
+      { name: "Throughput", value: 40, unit: "tokens-per-second" },
+      {
+        name: "Seats included",
+        value: 4,
+        unit: "count",
+        period: "billing cycle",
+      },
+    ],
+  });
+  assertEquals((snapshot.declaredLimits as Json[]).length, 4);
+});
+
+// priceMinor had no digit bound, so a 500-digit paste persisted for 365 days and
+// then coerced to Infinity in the report, where the bundle requires a finite
+// value — the whole report threw rather than dropping one metric.
+Deno.test("priceMinor is bounded to a value that survives Number()", async () => {
+  await assertRejects(
+    () =>
+      run({
+        provider: "Example AI",
+        priceMinor: "9".repeat(500),
+        currency: "USD",
+      }),
+    Error,
+    "priceMinor",
+  );
+  const snapshot = await run({
+    provider: "Example AI",
+    priceMinor: "999999999999999",
+    currency: "USD",
+  });
+  const value = Number(snapshot.priceMinor as string);
+  assertEquals(Number.isFinite(value), true);
+  assertEquals(Number.isSafeInteger(value), true);
+});
 Deno.test("renewal window must be ordered", async () => {
   await assertRejects(
     () =>

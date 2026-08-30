@@ -24,11 +24,14 @@ caveats: >-
   Values are declarations, not live billing facts, unless the operator cites
   an authorized stable API in sourceReference. Missing fields remain absent.
   priceMinor is the recurring plan price in currency minor units and never API
-  usage cost. Limits named as remaining quota, availability, or per-token price
-  are rejected. Currency uses three uppercase letters; price and currency must
-  be supplied together; renewal timestamps use ISO datetime values; limit units
-  use lowercase letters, digits, dot, underscore, or hyphen. This package
-  performs no account-dashboard scraping.
+  usage cost. Limits whose name, unit, or period declares remaining quota,
+  availability, or per-token price are rejected, and that check folds
+  zero-width characters and homoglyphs first. Currency uses three uppercase
+  letters; price and currency must be supplied together; priceMinor carries at
+  most fifteen integer digits and four decimals, so it survives the report's
+  numeric conversion without loss; renewal timestamps use ISO datetime values;
+  limit units use lowercase letters, digits, dot, underscore, or hyphen. This
+  package performs no account-dashboard scraping.
 security: >-
   This package performs no network, process, environment, or vault operations.
   Plan, price, renewal, and seat metadata can be commercially sensitive, so
