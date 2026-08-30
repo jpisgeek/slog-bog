@@ -33,6 +33,9 @@ swamp extension pull @jpisgeek/netdata
 | `timeoutSec`       | integer         | no       | `15`    |                                                                                                                                                                                                                                                                                       |
 | `diskWarnPercent`  | number          | no       | `85`    | Mounts at or above this used% are flagged                                                                                                                                                                                                                                             |
 | `maxConcurrency`   | integer         | no       | `8`     | Maximum number of nodes polled at once. A large nodes list can otherwise exhaust local sockets or spawn an unbounded number of ssh processes at the same time.                                                                                                                        |
+| `maxMountsPerNode` | integer         | no       | `256`   | Maximum disk_space.* charts polled per node. Past this the extra mounts are skipped, the node is marked degraded, and its existing mount records are preserved rather than pruned.                                                                                                    |
+| `maxAlarmsPerNode` | integer         | no       | `512`   | Maximum active alarms recorded per node. Past this the extra alarms are skipped, the node is marked degraded, and its existing alarm records are preserved rather than pruned.                                                                                                        |
+| `nodeBudgetSec`    | integer         | no       | `300`   | Wall-clock ceiling for one node's ENTIRE poll (info + alarms + charts + every per-mount data query). timeoutSec bounds a single call; this bounds the node, so one slow or hostile agent cannot hold a concurrency slot indefinitely.                                                 |
 
 ### Methods
 
@@ -75,6 +78,9 @@ globalArguments:
   timeoutSec: 15
   diskWarnPercent: 85
   maxConcurrency: 8
+  maxMountsPerNode: 256
+  maxAlarmsPerNode: 512
+  nodeBudgetSec: 300
 ```
 
 ## Caveats
@@ -82,10 +88,17 @@ globalArguments:
 An unreachable node is data, not an error. It is written with `reachable: false`
 and the sweep continues. Something in the swamp is always powered off. A node
 that answers only partially (alarms or chart data timed out) keeps its last
-known detail instead of being zeroed. Pruning of departed records happens only
-on a full sweep. A single-node run (`--input node=<name>`) never deletes
-anything. Instance names for alarms and mounts carry a hash suffix, so look them
-up with `swamp data list <model>` rather than constructing them.
+known detail instead of being zeroed. That includes a single mount whose data
+query failed: its record and its place in `mountsOverThreshold` both carry
+forward, and the node counts toward `summary.nodesDegraded`. Whenever
+`nodesDegraded` is above zero, read the alarm and mount roll-ups as a floor
+rather than a current total. An alarm Netdata could not calculate a value for is
+stored with `value: null`, which means unknown -- it is deliberately not 0,
+which would be indistinguishable from a real reading of zero. Pruning of
+departed records happens only on a full sweep. A single-node run
+(`--input node=<name>`) never deletes anything. Instance names for alarms and
+mounts carry a hash suffix, so look them up with `swamp data list <model>`
+rather than constructing them.
 
 ## Security
 
@@ -97,10 +110,16 @@ inject text into the stored `error`/`info` fields). Prefer the SSH transport, or
 HTTPS for anything off a trusted LAN. `url` is restricted to `http(s)` and
 rejected if it embeds userinfo, and it is persisted verbatim as non-sensitive
 data. The SSH transport uses `BatchMode=yes` (unknown host keys fail closed) and
-never assembles a local shell command. Written data: node URL, hostname, OS,
-Netdata version, alarm names/values, mount paths and capacity, plus a free-text
-`error` field on unreachable nodes (a classified failure message, `user@host`
-and stderr stay in the log, not the resource).
+never assembles a local shell command. Because that rewrite is in the threat
+model, the volume a single agent can impose is bounded as well as its content:
+response bodies are refused above 8 MiB, `maxMountsPerNode` and
+`maxAlarmsPerNode` cap how many per-mount queries and alarm writes one node can
+drive, and `nodeBudgetSec` caps the wall-clock time its whole poll may take.
+Hitting any of those marks the node degraded and preserves its existing records
+rather than pruning them. Written data: node URL, hostname, OS, Netdata version,
+alarm names/values, mount paths and capacity, plus a free-text `error` field on
+unreachable nodes (a classified failure message, `user@host` and stderr stay in
+the log, not the resource).
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.
