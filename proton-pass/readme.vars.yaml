@@ -11,7 +11,7 @@ example: |
   type: "@jpisgeek/proton-pass"
   name: proton
   config:
-    vaultName: homelab        # the Proton Pass vault to read from
+    vaultName: <your-vault>        # the Proton Pass vault to read from
     defaultField: password    # field used when a key names none
     # binary: /opt/homebrew/bin/pass-cli   # optional; resolved on PATH + known prefixes otherwise
 
@@ -46,9 +46,12 @@ security: >-
   definition that asked for it, and an error that will not say which lookup
   failed makes a secrets provider undiagnosable. What is NOT forwarded is
   anything pass-cli or Proton said: stderr is reduced to a fixed verdict
-  (`session-not-usable`, `item-not-found`, `network-failure`,
-  `permission-denied`, `vault-not-found`, or `unclassified`), because that
-  text can echo the arguments it was given and whatever the server returned.
+  (`session-not-usable`, `vault-not-found`, `item-not-found`,
+  `field-not-found`, `permission-denied`, `network-failure`, or
+  `unclassified`), because that text can echo the arguments it was given and
+  whatever the server returned. Nothing pass-cli or Proton wrote is forwarded
+  verbatim — earlier versions of this document said otherwise and the code no
+  longer does.
   Exception strings from here reach swamp run logs and reports.
 
   **A key splits at the FIRST `/`.** `Example Service/API Key` means the item

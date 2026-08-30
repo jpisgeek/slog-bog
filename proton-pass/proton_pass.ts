@@ -6,10 +6,18 @@
  * into this repository, or onto disk. `${{ vault.get('myvault', 'KEY') }}`
  * resolves live at run time.
  *
- * Secret key forms accepted by `get()` (placeholders, not real item names):
- *   "Example Service/API Key"          -> item titled so, field = defaultField
- *   "Example Service/API Key/password" -> explicit field on that item
- *   "pass://SHARE_ID/ITEM_ID/FIELD"    -> stable URI, survives item renames
+ * Secret key forms accepted by `get()` (placeholders, not real item names).
+ * The split is at the FIRST slash, which the examples below used to
+ * contradict:
+ *   "<item>"                     -> that item, field = defaultField
+ *   "<item>/<field>"             -> that item, that field
+ *   "pass://SHARE_ID/ITEM_ID"        -> stable URI, field = defaultField
+ *   "pass://SHARE_ID/ITEM_ID/FIELD"  -> stable URI, that field
+ *
+ * An item title containing a slash therefore cannot be addressed by title at
+ * all -- use the URI form for those. Everything after the first slash is the
+ * field name, slashes included, so "<item>/a/b" asks for a field literally
+ * named "a/b".
  *
  * Prefer the URI form for anything long-lived: titles can be edited in the
  * Proton Pass UI, item IDs cannot.
@@ -55,12 +63,24 @@ const CANDIDATE_PATHS = [
   "/usr/local/bin/pass-cli",
   "/home/linuxbrew/.linuxbrew/bin/pass-cli",
 ];
-let resolvedBinary: string | null = null;
+// Keyed by the configured name. A bare "pass-cli" and a bare "pass-cli-beta"
+// are different programs, and one global slot meant whichever resolved FIRST
+// won for every provider afterwards -- so a second vault configured with a
+// different binary would silently send its secret lookups through the first
+// one's executable.
+const resolvedBinary = new Map<string, string>();
+
+/** A --version probe should answer instantly; anything slower is wedged. */
+const PROBE_TIMEOUT_MS = 5_000;
 
 async function resolveBinary(configured: string): Promise<string> {
   if (configured.includes("/")) return configured;
-  if (resolvedBinary) return resolvedBinary;
+  const cached = resolvedBinary.get(configured);
+  if (cached) return cached;
 
+  // Bounded. These probes ran before any timeout existed, so a hung or
+  // wedged executable could block a secret lookup forever while the
+  // documented per-call bound sat unused a few lines below.
   const probe = async (bin: string): Promise<boolean> => {
     try {
       const out = await new Deno.Command(bin, {
@@ -68,6 +88,7 @@ async function resolveBinary(configured: string): Promise<string> {
         stdin: "null",
         stdout: "null",
         stderr: "null",
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       }).output();
       return out.success;
     } catch {
@@ -76,12 +97,12 @@ async function resolveBinary(configured: string): Promise<string> {
   };
 
   if (await probe(configured)) {
-    resolvedBinary = configured;
+    resolvedBinary.set(configured, configured);
     return configured;
   }
   for (const candidate of CANDIDATE_PATHS) {
     if (await probe(candidate)) {
-      resolvedBinary = candidate;
+      resolvedBinary.set(configured, candidate);
       return candidate;
     }
   }
@@ -197,6 +218,10 @@ export function classifyCliFailure(
   const text = `${stderr}\n${stdoutErrors}`;
   const patterns: [RegExp, string][] = [
     [/not logged in|session|unauthor|token/i, "session-not-usable"],
+    // Vault before item: "vault X not found" contains "not found", so the
+    // generic rule matched first and mislabelled a missing VAULT as a missing
+    // ITEM -- which sends whoever is debugging to look for the wrong thing.
+    [/vault .*not found|unknown vault|no such vault/i, "vault-not-found"],
     [/not found|no such item|does not exist/i, "item-not-found"],
     [/field does not exist/i, "field-not-found"],
     [/permission|denied|forbidden/i, "permission-denied"],
@@ -204,7 +229,6 @@ export function classifyCliFailure(
       /network|timed? ?out|connection|dns|resolve|could not reach|unreachable/i,
       "network-failure",
     ],
-    [/vault .*not found|unknown vault/i, "vault-not-found"],
   ];
   for (const [re, verdict] of patterns) if (re.test(text)) return verdict;
   return `unclassified (exit ${code})`;
@@ -231,8 +255,16 @@ function extractValue(stdout: string, field: string): string {
     );
   }
 
+  // Depth-bounded, and it prefers a shallow match. The recursion walks EVERY
+  // nested object looking for the field name, so on an unexpected response
+  // shape it could return an unrelated string that merely shared a key --
+  // handing back the wrong value as a secret, silently. Bounding the depth
+  // does not make the search exact, but it stops it wandering arbitrarily far
+  // from the item it was asked about.
+  const MAX_DEPTH = 6;
   const seen = new Set<unknown>();
-  const search = (node: unknown): string | undefined => {
+  const search = (node: unknown, depth = 0): string | undefined => {
+    if (depth > MAX_DEPTH) return undefined;
     if (typeof node === "string") return undefined;
     if (node === null || typeof node !== "object") return undefined;
     if (seen.has(node)) return undefined;
@@ -257,7 +289,7 @@ function extractValue(stdout: string, field: string): string {
             }
           }
         }
-        const hit = search(entry);
+        const hit = search(entry, depth + 1);
         if (hit !== undefined) return hit;
       }
       return undefined;
@@ -266,7 +298,7 @@ function extractValue(stdout: string, field: string): string {
     const rec = node as Record<string, unknown>;
     if (typeof rec[field] === "string") return rec[field] as string;
     for (const value of Object.values(rec)) {
-      const hit = search(value);
+      const hit = search(value, depth + 1);
       if (hit !== undefined) return hit;
     }
     return undefined;
@@ -309,7 +341,9 @@ export function parseItems(stdout: string): PassItem[] {
     parsed = JSON.parse(trimmed);
   } catch {
     const out: PassItem[] = [];
+    let sawAnyLine = false;
     for (const line of trimmed.split("\n")) {
+      if (line.trim()) sawAnyLine = true;
       const m = /^-\s*\[([^\]]*)\]:\s*(.+?)(?:\s*\(state=([A-Za-z]+)\))?\s*$/
         .exec(line.trim());
       if (!m) continue;
@@ -318,6 +352,12 @@ export function parseItems(stdout: string): PassItem[] {
         title: m[2].trim(),
         active: (m[3] ?? "Active").toLowerCase() === "active",
       });
+    }
+    // Text that parsed as neither JSON nor a single recognisable row is a
+    // broken response. Returning [] made it indistinguishable from a vault
+    // that is genuinely empty, and the second is a fact a caller acts on.
+    if (out.length === 0 && sawAnyLine) {
+      throw new Error("pass-cli item list output was not recognisable");
     }
     return out;
   }
@@ -333,9 +373,17 @@ export function parseItems(stdout: string): PassItem[] {
   }
   const out: PassItem[] = [];
   for (const r of rows) {
+    if (typeof r !== "object" || r === null || Array.isArray(r)) {
+      throw new Error("pass-cli item list contained a non-object row");
+    }
     const rec = r as Record<string, unknown>;
     const title = (rec.title ?? rec.name) as string | undefined;
-    if (typeof title !== "string") continue;
+    // A row without a title used to be SKIPPED, which quietly shortened the
+    // inventory -- and a shortened inventory is how `get` concludes a key is
+    // absent when it is not, and how `list` under-reports. Refuse instead.
+    if (typeof title !== "string") {
+      throw new Error("pass-cli item list contained a row with no title");
+    }
     // Absent state is treated as ACTIVE: older pass-cli builds omit the field
     // entirely, and hiding every secret from them would be worse than the bug
     // this fixes.
@@ -371,8 +419,19 @@ export const vault = {
         const field = secretKey.split("/").length > 4
           ? secretKey.split("/").pop()!
           : cfg.defaultField;
-        // A pass:// URI names one item already; nothing to disambiguate.
-        return { args: [secretKey], field, title: undefined };
+        // pass://SHARE_ID/ITEM_ID[/FIELD]. Naming one item removes the
+        // AMBIGUITY problem but not the DELETION one, so hand back the item
+        // id and let get() confirm it is still live. A stable URI pinned in a
+        // config is the address form most likely to outlive the item it
+        // names, so exempting it would put the biggest hole in exactly the
+        // guarantee this provider makes.
+        const parts = secretKey.slice("pass://".length).split("/");
+        return {
+          args: [secretKey],
+          field,
+          title: undefined,
+          id: parts.length >= 2 && parts[1] ? parts[1] : undefined,
+        };
       }
       const slash = secretKey.indexOf("/");
       const title = slash === -1 ? secretKey : secretKey.slice(0, slash);

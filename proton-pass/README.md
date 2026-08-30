@@ -47,7 +47,7 @@ _none — a vault writes no resources_
 type: "@jpisgeek/proton-pass"
 name: proton
 config:
-  vaultName: homelab # the Proton Pass vault to read from
+  vaultName: <your-vault> # the Proton Pass vault to read from
   defaultField: password # field used when a key names none
 # binary: /opt/homebrew/bin/pass-cli   # optional; resolved on PATH + known prefixes otherwise
 
@@ -84,11 +84,13 @@ remote text does not.** A failed lookup says which key failed —
 YOU passed in; it is already in the model definition that asked for it, and an
 error that will not say which lookup failed makes a secrets provider
 undiagnosable. What is NOT forwarded is anything pass-cli or Proton said: stderr
-is reduced to a fixed verdict (`session-not-usable`, `item-not-found`,
-`network-failure`, `permission-denied`, `vault-not-found`, or `unclassified`),
-because that text can echo the arguments it was given and whatever the server
-returned. Exception strings from here reach swamp run logs and reports. **A key
-splits at the FIRST `/`.** `Example Service/API Key` means the item
+is reduced to a fixed verdict (`session-not-usable`, `vault-not-found`,
+`item-not-found`, `field-not-found`, `permission-denied`, `network-failure`, or
+`unclassified`), because that text can echo the arguments it was given and
+whatever the server returned. Nothing pass-cli or Proton wrote is forwarded
+verbatim — earlier versions of this document said otherwise and the code no
+longer does. Exception strings from here reach swamp run logs and reports. **A
+key splits at the FIRST `/`.** `Example Service/API Key` means the item
 `Example Service`, field `API Key`. An item title containing `/` therefore
 cannot be addressed this way — use a `pass://SHARE_ID/ITEM_ID/FIELD` URI for
 those. The URI form is checked for liveness too. **Deleted means deleted.**

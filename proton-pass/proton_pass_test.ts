@@ -424,3 +424,66 @@ Deno.test("the provider exposes the documented vault contract", () => {
   assertEquals(p.getName(), "proton");
   assertEquals(vault.type, "@jpisgeek/proton-pass");
 });
+
+Deno.test("a pass:// URI naming a trashed item is refused", async () => {
+  // This check was written twice and was DEAD both times: locate() returned
+  // no id, so `if (id !== undefined)` never ran. It still type-checked,
+  // because id destructured as undefined. Hence a test that exercises the
+  // path rather than an inspection that reads it.
+  const cli = await fakeCli({
+    listing: JSON.stringify({
+      items: [{ id: "ITEM9", title: "whatever", state: "Trashed" }],
+    }),
+    stdout: `{"password":"${SECRET}"}`,
+  });
+  try {
+    let msg = "";
+    try {
+      await providerFor(cli.path).get("pass://SHARE1/ITEM9/password");
+    } catch (e) {
+      msg = String(e);
+    }
+    assertEquals(
+      msg.includes("trashed item"),
+      true,
+      `expected refusal, got: ${msg}`,
+    );
+    assertEquals(msg.includes(SECRET), false, "SECRET LEAKED");
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("a pass:// URI naming a live item still resolves", async () => {
+  const cli = await fakeCli({
+    listing: JSON.stringify({
+      items: [{ id: "ITEM9", title: "whatever", state: "Active" }],
+    }),
+    stdout: `{"password":"${SECRET}"}`,
+  });
+  try {
+    assertEquals(
+      await providerFor(cli.path).get("pass://SHARE1/ITEM9/password"),
+      SECRET,
+    );
+  } finally {
+    await cli.cleanup();
+  }
+});
+
+Deno.test("a pass:// URI for an item this vault does not list is passed through", async () => {
+  // It may address a different vault; refusing there would break a working
+  // locator. Documented, and asserted so it stays deliberate.
+  const cli = await fakeCli({
+    listing: JSON.stringify({ items: [] }),
+    stdout: `{"password":"${SECRET}"}`,
+  });
+  try {
+    assertEquals(
+      await providerFor(cli.path).get("pass://SHARE1/ELSEWHERE/password"),
+      SECRET,
+    );
+  } finally {
+    await cli.cleanup();
+  }
+});
