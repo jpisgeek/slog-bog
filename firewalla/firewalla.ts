@@ -4,17 +4,25 @@
  * The firewall is the authoritative view of the network: it knows every device
  * that has ever been seen, including ones that are offline right now, which no
  * amount of SSH scanning can tell you. This model turns `GET /v2/devices` into
- * one `device` resource per device plus a single `inventory` roll-up, so the
- * rest of the homelab automation can be generated from real data instead of a
+ * one `device` resource per device, one `machine` resource per deduplicated
+ * host (NICs collapsed), and a single `inventory` roll-up, so the rest of the
+ * homelab automation can be generated from real data instead of a
  * hand-maintained host list.
+ *
+ * Instance names are deterministic so a re-sync updates rather than
+ * duplicates: `device-<slug>-<fnv1a>`, `machine-<slug>-<fnv1a>`, `inventory`.
  *
  * Devices are split into two tiers:
  *   deep     = infrastructure worth logging into and checking properly
  *   presence = everything else. The firewall's online/offline signal covers
  *              the shallow end of the swamp.
  *
- * The token is expected to arrive from Proton Pass:
+ * The token comes from a swamp vault expression, never a literal:
  *   token: ${{ vault.get('myvault', 'ExampleVault/API Key') }}
+ *
+ * (The named secret manager used to be spelled out here. It is operator-
+ * environment detail on a published surface and told a reader nothing about
+ * how to configure the model, so it is stated generically now.)
  */
 import { z } from "npm:zod@4";
 
@@ -163,8 +171,17 @@ const DeviceSchema = z.object({
   ipReserved: z.boolean(),
   isRouter: z.boolean(),
   isFirewalla: z.boolean(),
-  totalDownload: z.number(),
-  totalUpload: z.number(),
+  /**
+   * Omitted, not 0, when the firewall reports no counter — the same rule `ip`
+   * follows above. These used to be `Number(raw.totalDownload ?? 0)`, which
+   * turned "the MSP did not send this field" into the assertion "this device
+   * moved zero bytes". A renamed or scope-restricted field then read as a
+   * fleet that had gone completely silent, which is a plausible-looking
+   * number and therefore the worst kind of wrong. A missing key mechanically
+   * means "unknown" to anything reading it.
+   */
+  totalDownload: z.number().optional(),
+  totalUpload: z.number().optional(),
   /** "deep" or "presence", the monitoring tier this device falls into. */
   tier: z.string(),
   /** True when the device can plausibly be reached over SSH by the fleet. */
@@ -299,26 +316,38 @@ function machineKey(name: string, suffixes: string[]): string {
 }
 
 /**
- * Fold a network name for comparison against `excludeNetworks`.
+ * The single fold applied to BOTH sides of every operator-config-vs-API string
+ * comparison in this model: `excludeNetworks`, `exclude`, `apiManaged`, and
+ * the `dependencies` keys.
  *
- * This used to be a bare `g.excludeNetworks.includes(network)` -- exact,
- * case-sensitive, untrimmed -- while the sibling name matcher `isExcluded`
- * deliberately lowercases both sides. An operator who copied the README's
- * `excludeNetworks: [Guest]` for a VLAN the MSP reports as `guest` (or with
- * stray whitespace from a YAML quirk) got no match, every device on that
- * network written to the datastore, and no signal beyond
- * `skippedByNetwork: 0` in the roll-up. A scope control that silently
- * matches nothing is worse than one that errors.
+ * This started life as `foldNetwork`, for `excludeNetworks`, because that
+ * matcher used to be a bare `includes(network)` -- exact, case-sensitive,
+ * untrimmed -- while its sibling `isExcluded` lowercased both sides. An
+ * operator who copied the README's `excludeNetworks: [Guest]` for a VLAN the
+ * MSP reports as `guest` (or with stray whitespace from a YAML quirk) got no
+ * match, every device on that network written to the datastore, and no signal
+ * beyond `skippedByNetwork: 0` in the roll-up.
+ *
+ * The same defect was still live in the two matchers that were not audited at
+ * the time, so it is now one function rather than one per call site:
+ *   - `apiManaged` was an exact `includes()`, so `apiManaged: [nas]` against a
+ *     machine the firewall names `NAS` left that host an SSH fleet candidate.
+ *     The generated fleet then SSHes a box that is supposed to be reached
+ *     through its own API -- the precise outcome the option exists to prevent.
+ *   - `dependencies` was an exact object-key lookup, so `{App-Server: nas}`
+ *     against machine `app-server` produced no edge, and downstream alerting
+ *     lost the suppression it needed to tell a consequence from an incident.
+ * A scope control that silently matches nothing is worse than one that errors.
  */
-function foldNetwork(name: string): string {
-  return name.trim().toLowerCase();
+function fold(s: string): string {
+  return s.trim().toLowerCase();
 }
 
 /** Name-based exclusion with optional trailing wildcard. */
 function isExcluded(name: string, patterns: string[]): boolean {
-  const n = name.toLowerCase();
+  const n = fold(name);
   return patterns.some((p) => {
-    const pat = p.toLowerCase();
+    const pat = fold(p);
     return pat.endsWith("*") ? n.startsWith(pat.slice(0, -1)) : n === pat;
   });
 }
@@ -336,19 +365,80 @@ function isDeep(deviceType: string, deepTypes: string[]): boolean {
   return deepTypes.some((d) => t.startsWith(d.toLowerCase()));
 }
 
-/** The MSP API has returned both a bare array and an envelope; accept either. */
-function unwrapDevices(payload: unknown): Record<string, unknown>[] {
-  if (Array.isArray(payload)) return payload as Record<string, unknown>[];
+/**
+ * The MSP API has returned both a bare array and an envelope; accept either.
+ *
+ * Returns `unknown[]`, deliberately. This used to hand back
+ * `Record<string, unknown>[]` via a blind `as` cast, which is a lie about
+ * data that arrives over the network: a `null` or a bare string in the array
+ * typechecked as a device record and then threw a context-free
+ * `TypeError: Cannot read properties of null` out of the middle of the sync,
+ * killing a run that had already written most of its records. The caller now
+ * has to narrow each element, and can skip and report the bad ones.
+ */
+function unwrapDevices(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload;
   if (payload && typeof payload === "object") {
     const rec = payload as Record<string, unknown>;
     for (const key of ["results", "data", "devices", "items"]) {
-      if (Array.isArray(rec[key])) return rec[key] as Record<string, unknown>[];
+      if (Array.isArray(rec[key])) return rec[key];
     }
   }
   throw new Error(
     "Unexpected /v2/devices response shape. Expected an array or an " +
       "envelope containing one.",
   );
+}
+
+/*
+ * Field narrowing for raw MSP records.
+ *
+ * Every one of these returns `undefined` for "the API did not give me a usable
+ * value", so the CALLER decides, in one visible place, what each absence
+ * means. The rule this enforces is the one `DeviceSchema.ip` already
+ * documents: absence must stay distinguishable from a value. The previous
+ * `Number(raw.x ?? 0)` / `Boolean(raw.x)` / `String(raw.x ?? "")` coercions
+ * all collapsed the two, so a field the MSP stopped sending was backfilled
+ * with something that reads as a measurement.
+ *
+ * Deliberately NOT a `z.object({...}).strict()` over the raw record, which the
+ * review suggested. Strict parsing makes any field the MSP ADDS a hard failure
+ * of the whole sync -- an inventory model going dark because the vendor
+ * shipped a new attribute is a worse outcome than the coercion this replaces,
+ * and the unknown-key rejection buys nothing here because unknown keys are
+ * never read. Validation is per-field and by type; unknown keys are ignored.
+ */
+
+/** A JSON scalar as a string, or undefined. Objects/arrays are not names. */
+function optStr(v: unknown): string | undefined {
+  if (typeof v === "string") return v === "" ? undefined : v;
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  if (typeof v === "bigint") return String(v);
+  return undefined;
+}
+
+/** A finite number, accepting the numeric strings some MSP builds send. */
+function optNum(v: unknown): number | undefined {
+  if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * A boolean. `Boolean(raw.x)` was wrong in both directions here: the JSON
+ * string `"false"` is truthy, and any absent field became a hard `false`.
+ */
+function optBool(v: unknown): boolean | undefined {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") {
+    const s = fold(v);
+    if (s === "true") return true;
+    if (s === "false") return false;
+  }
+  return undefined;
 }
 
 function networkName(value: unknown): string {
@@ -368,12 +458,24 @@ function networkName(value: unknown): string {
  * classify. This only ever retries a *transient* failure, never interprets
  * a permanent one. Network errors and timeouts are wrapped with the URL so
  * they don't escape as a bare, context-free fetch exception.
+ *
+ * Two abort signals, not one, and both are needed:
+ *   - `caller` is the workflow cancelling the run. Reported as CANCELLED.
+ *   - `effective` is caller OR the request timeout, and is what the retry
+ *     sleep listens to.
+ * This used to read `ctx.signal` directly for both jobs. The sleep therefore
+ * watched only the caller, so `timeoutSec: 1` against a server sending
+ * `Retry-After: 5` sat in a wait for the full five seconds -- three times over
+ * across the retry budget -- after the timeout the operator configured had
+ * already fired. The timeout bounded a single fetch, never the call.
  */
 async function fetchWithRetry(
   url: string,
   init: RequestInit,
   // deno-lint-ignore no-explicit-any
   ctx: any,
+  signals: { caller?: AbortSignal; effective: AbortSignal },
+  redact: (text: string) => string,
   maxAttempts = 3,
 ): Promise<Response> {
   // Upper bound on a single retry wait regardless of what Retry-After asks
@@ -381,7 +483,15 @@ async function fetchWithRetry(
   // or misconfigured header must not be able to park a workflow step for
   // hours.
   const MAX_RETRY_DELAY_MS = 5000;
-  const signal: AbortSignal | undefined = ctx.signal;
+  const { caller, effective } = signals;
+
+  /** CANCELLED only when the CALLER aborted; a timeout is not a cancellation. */
+  const abortError = (where: string) =>
+    new Error(
+      caller?.aborted
+        ? `CANCELLED: request to MSP API ${url} was cancelled by the caller ${where}`
+        : `MSP API ${url} timed out ${where}`,
+    );
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let response: Response;
@@ -390,13 +500,11 @@ async function fetchWithRetry(
     } catch (e) {
       // The caller pulling the plug is not an outage -- say so, rather than
       // reporting a cancelled run as "failed to reach".
-      if (signal?.aborted) {
-        throw new Error(
-          `CANCELLED: request to MSP API ${url} was cancelled by the caller`,
-        );
-      }
+      if (effective.aborted) throw abortError("mid-request");
+      // Redacted for the same reason the HTTP-error body is: this message is
+      // foreign text, and no foreign text reaches an error unscrubbed.
       throw new Error(
-        `Failed to reach MSP API ${url}: ${(e as Error).message}`,
+        `Failed to reach MSP API ${url}: ${redact((e as Error).message)}`,
       );
     }
 
@@ -424,25 +532,23 @@ async function fetchWithRetry(
         max: maxAttempts,
       },
     );
-    // Abortable wait: a cancelled run must not sit in a sleep nobody is
-    // waiting on any more.
+    // Abortable wait: a cancelled OR timed-out run must not sit in a sleep
+    // nobody is waiting on any more. Listening on `effective` rather than the
+    // caller signal is what makes `timeoutSec` bound the whole call.
     await new Promise<void>((resolve) => {
-      if (signal?.aborted) return resolve();
+      if (effective.aborted) return resolve();
       const timer = setTimeout(() => {
-        signal?.removeEventListener("abort", onAbort);
+        effective.removeEventListener("abort", onAbort);
         resolve();
       }, delayMs);
       const onAbort = () => {
         clearTimeout(timer);
         resolve();
       };
-      signal?.addEventListener("abort", onAbort, { once: true });
+      effective.addEventListener("abort", onAbort, { once: true });
     });
-    if (signal?.aborted) {
-      throw new Error(
-        `CANCELLED: request to MSP API ${url} was cancelled while waiting ` +
-          `to retry after HTTP ${response.status}`,
-      );
+    if (effective.aborted) {
+      throw abortError(`while waiting to retry after HTTP ${response.status}`);
     }
   }
   // Unreachable: the loop always returns on its last iteration.
@@ -465,14 +571,37 @@ async function syncDevices(
   ctx.logger.info("fetching device inventory from {url}", { url });
 
   const timeout = AbortSignal.timeout(g.timeoutSec * 1000);
-  const response = await fetchWithRetry(url, {
-    headers: {
-      // MSP uses the "Token" scheme, not "Bearer".
-      Authorization: `Token ${g.token}`,
-      Accept: "application/json",
+  // `ctx.signal` is typed optional and reduced harnesses really do omit it.
+  // `AbortSignal.any([undefined, timeout])` is a TypeError, so this used to
+  // blow up before the first fetch on any context without a signal -- the
+  // timeout, the only bound on a token-bearing request, taking the run down
+  // with it. Build the list from the signals that exist.
+  const callerSignal: AbortSignal | undefined = ctx.signal;
+  const effectiveSignal = callerSignal
+    ? AbortSignal.any([callerSignal, timeout])
+    : timeout;
+  const response = await fetchWithRetry(
+    url,
+    {
+      headers: {
+        // MSP uses the "Token" scheme, not "Bearer".
+        Authorization: `Token ${g.token}`,
+        Accept: "application/json",
+      },
+      // A redirect is never a legitimate answer from the MSP API, and this
+      // request carries a live credential. Whether the Authorization header
+      // survives a cross-origin (or https -> http) redirect is the runtime's
+      // fetch implementation's business; leaving the default `follow` in place
+      // outsourced the "the token only ever goes to *.firewalla.net" guarantee
+      // to somebody else's stripping rules. `error` keeps it here, where the
+      // hostname was validated.
+      redirect: "error",
+      signal: effectiveSignal,
     },
-    signal: AbortSignal.any([ctx.signal, timeout]),
-  }, ctx);
+    ctx,
+    { caller: callerSignal, effective: effectiveSignal },
+    redact,
+  );
 
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
@@ -497,9 +626,18 @@ async function syncDevices(
   try {
     payload = await response.json();
   } catch (e) {
+    // V8's SyntaxError quotes a prefix of the offending body verbatim
+    // ("Unexpected token 'x', \"<the body>\" is not valid JSON"). A proxy or
+    // captive portal that answers 200 with an HTML page echoing the request
+    // headers therefore put the token straight into this message -- the one
+    // body-derived path that was not scrubbed, while the README promised the
+    // token is "redacted from any error body before it can reach a message".
+    // It is now the same rule everywhere: no foreign text reaches an Error
+    // without passing through redact(), and the quote is length-capped like
+    // the HTTP-error detail beside it.
     throw new Error(
       `MSP API ${url} returned a response that could not be parsed as ` +
-        `JSON: ${(e as Error).message}`,
+        `JSON: ${redact((e as Error).message).slice(0, 200)}`,
     );
   }
   const devices = unwrapDevices(payload);
@@ -533,9 +671,14 @@ async function syncDevices(
     try {
       return await ctx.writeResource(specName, name, data, opts);
     } catch (e) {
+      // Redacted like every other foreign message in this file. A datastore
+      // driver that echoes the model's rendered configuration into its error
+      // (several do) would otherwise carry the token out through the one
+      // error path nobody was looking at, because it is not "the response
+      // body" and so escaped the review of the HTTP paths.
       throw new Error(
         `Failed to write ${specName} resource "${name}": ${
-          (e as Error).message
+          redact((e as Error).message)
         }`,
       );
     }
@@ -543,14 +686,34 @@ async function syncDevices(
 
   // Folded once rather than per device: the comparison is case- and
   // whitespace-insensitive on BOTH sides, so `[Guest]` in config matches a
-  // network the MSP calls `guest ` and vice versa.
-  const excludedNetworkSet = new Set(g.excludeNetworks.map(foldNetwork));
+  // network the MSP calls `guest ` and vice versa. Same treatment for the two
+  // sibling matchers -- see `fold` for what each of them silently missed.
+  const excludedNetworkSet = new Set(g.excludeNetworks.map(fold));
+  const apiManagedSet = new Set(g.apiManaged.map(fold));
+  const dependencyByMachine = new Map<string, string>();
+  for (const [parent, child] of Object.entries(g.dependencies)) {
+    const key = fold(parent);
+    if (dependencyByMachine.has(key)) {
+      // Two config keys folding to one machine is an ambiguity, not a merge.
+      // Report it rather than letting object-iteration order pick a winner.
+      ctx.logger.warning(
+        "dependencies has more than one entry for machine {machine} after " +
+          "case/whitespace folding; keeping {kept} and ignoring {dropped}",
+        { machine: key, kept: dependencyByMachine.get(key), dropped: child },
+      );
+      continue;
+    }
+    dependencyByMachine.set(key, child);
+  }
 
   const handles = [];
   const liveNames = new Set<string>();
   const typeCounts: Record<string, number> = {};
   const networks = new Set<string>();
   let online = 0, deep = 0, reserved = 0, excluded = 0, skippedNetworks = 0;
+  // Counted, not logged per record: a systemic MSP field rename would
+  // otherwise emit one warning line per device.
+  let malformed = 0, missingOnline = 0;
 
   // machineName -> accumulating record, built as devices stream past.
   const machines = new Map<string, {
@@ -584,29 +747,42 @@ async function syncDevices(
     >;
   }>();
 
-  for (const raw of devices) {
+  for (const element of devices) {
+    // The array elements are `unknown` because that is what came off the wire.
+    // A `null` or a bare string here used to reach `raw.id` and throw a
+    // context-free TypeError out of the middle of the loop, abandoning a run
+    // that had already written most of its resources. One bad element is not
+    // a reason to lose the other four hundred.
+    if (
+      element === null || typeof element !== "object" || Array.isArray(element)
+    ) {
+      malformed++;
+      continue;
+    }
+    const raw = element as Record<string, unknown>;
+
     // The documented /v2/devices response identifies every device by `id`
     // (shown as a MAC address) and its example has no separate `mac` field
     // at all. `id` doubling as the MAC is the norm, not an edge case. A
     // record with neither is too malformed to name or deduplicate safely,
     // so it's skipped and logged rather than silently coerced into an
     // empty-string identity that would collide with every other such record.
-    const rawId = raw.id == null ? "" : String(raw.id);
+    const rawId = optStr(raw.id) ?? "";
     if (!rawId) {
       ctx.logger.warning(
         "skipping device with no id in /v2/devices response: {name}",
-        { name: String(raw.name ?? "(unnamed)") },
+        { name: optStr(raw.name) ?? "(unnamed)" },
       );
       continue;
     }
 
-    const deviceType = String(raw.deviceType ?? "");
+    const deviceType = optStr(raw.deviceType) ?? "";
     const network = networkName(raw.network);
 
     // Off-limits networks are dropped before any resource is written, so no
     // trace of them enters the datastore. Counted only so the skip is
     // reported rather than silent.
-    if (excludedNetworkSet.has(foldNetwork(network))) {
+    if (excludedNetworkSet.has(fold(network))) {
       skippedNetworks++;
       continue;
     }
@@ -616,36 +792,52 @@ async function syncDevices(
     if (args.tier !== "all" && args.tier !== tier) continue;
     if (args.network && network !== args.network) continue;
 
-    const rawName = String(raw.name ?? "(unnamed)");
+    const rawName = optStr(raw.name) ?? "(unnamed)";
     const dropped = isExcluded(rawName, g.exclude);
     if (dropped) excluded++;
 
-    const isFirewalla = Boolean(raw.isFirewalla);
-    const rawIp = raw.ip == null ? undefined : String(raw.ip);
+    const isFirewalla = optBool(raw.isFirewalla) ?? false;
+    // `online` absent is recorded as false, deliberately, and NOT made
+    // optional the way the traffic counters were. Every consumer of this
+    // model -- the machine-wide OR, the roll-up counts, the `online` tag,
+    // downstream CEL -- asks a two-state question, and a third state would
+    // have to be handled correctly in all of them or it is worse than useless.
+    // The direction of error matters too: reading an absent field as offline
+    // fails LOUD (the whole fleet reports down, alerts fire, someone looks)
+    // where reading it as online fails silent-and-green, which is the failure
+    // a presence tier exists to prevent. The count below names the reason in
+    // the log so the loud failure is diagnosable in one line.
+    const onlineFlag = optBool(raw.online);
+    if (onlineFlag === undefined) missingOnline++;
+    const isOnline = onlineFlag ?? false;
+    const totalDownload = optNum(raw.totalDownload);
+    const totalUpload = optNum(raw.totalUpload);
     const device = {
       id: rawId,
-      gid: raw.gid === undefined ? undefined : String(raw.gid),
-      name: String(raw.name ?? "(unnamed)"),
-      ip: rawIp,
+      gid: optStr(raw.gid),
+      name: rawName,
+      ip: optStr(raw.ip),
       // `mac` falls back to `id` per the documented response shape above,
       // not to "", which would silently misrepresent a present-but-elided
       // field as a genuinely absent one.
-      mac: raw.mac == null ? rawId : String(raw.mac),
-      macVendor: String(raw.macVendor ?? "(unknown)"),
+      mac: optStr(raw.mac) ?? rawId,
+      macVendor: optStr(raw.macVendor) ?? "(unknown)",
       deviceType: deviceType || "(unset)",
       network,
-      online: Boolean(raw.online),
-      ipReserved: Boolean(raw.ipReserved),
-      isRouter: Boolean(raw.isRouter),
+      online: isOnline,
+      ipReserved: optBool(raw.ipReserved) ?? false,
+      isRouter: optBool(raw.isRouter) ?? false,
       isFirewalla,
-      totalDownload: Number(raw.totalDownload ?? 0),
-      totalUpload: Number(raw.totalUpload ?? 0),
+      // Spread rather than assigned: an absent counter leaves the key off the
+      // record entirely, which is how DeviceSchema encodes "unknown".
+      ...(totalDownload === undefined ? {} : { totalDownload }),
+      ...(totalUpload === undefined ? {} : { totalUpload }),
       tier,
       // The Firewalla itself is deep-tier but has SSH disabled by default, so
       // it is never an SSH fleet candidate. Excluded names (docks and
       // friends) are reported but never targeted.
       sshCandidate: tier === "deep" && !isFirewalla && !dropped &&
-        !g.apiManaged.includes(machineKey(rawName, g.interfaceSuffixes)),
+        !apiManagedSet.has(fold(machineKey(rawName, g.interfaceSuffixes))),
       excluded: dropped,
     };
 
@@ -776,6 +968,26 @@ async function syncDevices(
 
   const deviceCount = handles.length;
 
+  // Both of these are warnings, not info: they mean the response did not have
+  // the shape this model was written against, and the roll-up that follows is
+  // built on whatever survived. A silent partial sync is the failure mode that
+  // makes generated fleets quietly wrong.
+  if (malformed > 0) {
+    ctx.logger.warning(
+      "skipped {n} non-object entr(ies) in the /v2/devices array; the " +
+        "response shape is not what this model expects",
+      { n: malformed },
+    );
+  }
+  if (missingOnline > 0) {
+    ctx.logger.warning(
+      "{n} device(s) had no usable `online` field and were recorded as " +
+        "offline. If that is most of the fleet, the MSP has probably " +
+        "renamed the field rather than everything having gone down.",
+      { n: missingOnline },
+    );
+  }
+
   // One resource per machine. This is what the SSH fleet is generated from.
   // Never the raw device list, which double-counts multi-homed hosts.
   let sshCandidates = 0;
@@ -783,7 +995,7 @@ async function syncDevices(
     if (m.sshCandidate) sshCandidates++;
     const mName = machineResourceName(m.name);
     liveNames.add(mName);
-    const dependsOn = g.dependencies[m.name];
+    const dependsOn = dependencyByMachine.get(fold(m.name));
     handles.push(
       await writeOrThrow("machine", mName, {
         name: m.name,
@@ -803,7 +1015,7 @@ async function syncDevices(
           online: String(m.online),
           sshCandidate: String(m.sshCandidate),
           multiHomed: String(m.interfaces.length > 1),
-          dependsOn: g.dependencies[m.name] ?? "",
+          dependsOn: dependsOn ?? "",
         },
       }),
     );
@@ -896,7 +1108,7 @@ async function syncDevices(
     } catch (e) {
       throw new Error(
         `Failed to list existing device/machine records for pruning: ${
-          (e as Error).message
+          redact((e as Error).message)
         }`,
       );
     }
@@ -909,7 +1121,7 @@ async function syncDevices(
         } catch (e) {
           throw new Error(
             `Failed to prune departed record ${rec.name}: ${
-              (e as Error).message
+              redact((e as Error).message)
             }`,
           );
         }
