@@ -20,13 +20,13 @@ swamp extension pull @jpisgeek/truenas
 
 ### Arguments
 
-| argument            | type    | required | default | description                                                                                                                                                                                                                                              |
-| ------------------- | ------- | -------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `baseUrl`           | string  | yes      |         | Base URL of the TrueNAS host, e.g. https://nas.example.com. Prefer the DNS name over an IP so TLS verification actually succeeds. The WebSocket URL is derived from this (https -> wss, /api/current).                                                   |
-| `apiKey`            | string  | yes      |         | TrueNAS API key; source it from a vault expression                                                                                                                                                                                                       |
-| `allowInsecureHttp` | boolean | no       | `false` | Allow baseUrl to use http://, which becomes an unencrypted ws:// connection carrying the API key in cleartext on every call. Off by default; only set this for a trusted loopback/VPN path where TLS genuinely cannot be terminated on the TrueNAS host. |
-| `timeoutSec`        | integer | no       | `20`    |                                                                                                                                                                                                                                                          |
-| `certWarnDays`      | integer | no       | `30`    | Certificates expiring within this many days are flagged                                                                                                                                                                                                  |
+| argument            | type    | required | default | description                                                                                                                                                                                                                                                                          |
+| ------------------- | ------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `baseUrl`           | string  | yes      |         | Base URL of the TrueNAS host, e.g. https://nas.example.com. Prefer the DNS name over an IP so TLS verification actually succeeds. The WebSocket URL is rebuilt from this (https -> wss, /api/current), so a host, port and path are fine but a query string or fragment is rejected. |
+| `apiKey`            | string  | yes      |         | TrueNAS API key; source it from a vault expression                                                                                                                                                                                                                                   |
+| `allowInsecureHttp` | boolean | no       | `false` | Allow baseUrl to use http://, which becomes an unencrypted ws:// connection carrying the API key in cleartext on every call. Off by default; only set this for a trusted loopback/VPN path where TLS genuinely cannot be terminated on the TrueNAS host.                             |
+| `timeoutSec`        | integer | no       | `20`    |                                                                                                                                                                                                                                                                                      |
+| `certWarnDays`      | integer | no       | `30`    | Certificates expiring within this many days are flagged                                                                                                                                                                                                                              |
 
 ### Methods
 
@@ -40,14 +40,14 @@ No arguments.
 
 ### Data written
 
-| resource      | lifetime | fields                                                                                                                                                                                            | description                                                                                                                                                           |
-| ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `system`      | infinite | `hostname`, `version`, `model`, `cores`, `physmemBytes`, `uptimeSeconds`, `loadavg`                                                                                                               | Host identity, version, CPU, memory, uptime, load.                                                                                                                    |
-| `pool`        | infinite | `name`, `status`, `healthy`, `allocatedBytes`, `freeBytes`, `sizeBytes`, `usedPercent`, `fragmentationPercent`                                                                                    | One record per ZFS pool with status, health, capacity, fragmentation.                                                                                                 |
-| `disk`        | infinite | `name`, `serial`, `model`, `sizeBytes`, `type`, `pool`                                                                                                                                            | One record per physical disk and its pool membership.                                                                                                                 |
-| `alert`       | infinite | `id`, `klass`, `level`, `formatted`, `dismissed`, `silenced`                                                                                                                                      | One record per active TrueNAS alert. `silenced` marks alerts that were dismissed in the UI. Still true, just no longer visible there.                                 |
-| `certificate` | infinite | `name`, `commonName`, `notAfter`, `daysRemaining`, `expiryKnown`, `expiringSoon`, `expired`                                                                                                       | One record per certificate with days remaining, tracked independently of TrueNAS alert state so a dismissed expiry warning cannot hide a cert that is about to lapse. |
-| `summary`     | infinite | `hostname`, `version`, `pools`, `poolsUnhealthy`, `disks`, `alerts`, `alertsSilenced`, `certificates`, `certificatesExpiringSoon`, `certificatesExpired`, `certificatesWithoutExpiry`, `syncedAt` | Single roll-up of the most recent discover.                                                                                                                           |
+| resource      | lifetime | fields                                                                                                                                                                                                                    | description                                                                                                                                                                                                                                           |
+| ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `system`      | infinite | `hostname`, `version`, `model`, `cores`, `physmemBytes`, `uptimeSeconds`, `loadavg`, `metricsKnown`                                                                                                                       | Host identity, version, CPU, memory, uptime, load. `metricsKnown` is false when TrueNAS omitted cores/memory/uptime; those read -1 rather than 0 so an absent uptime cannot look like a fresh reboot.                                                 |
+| `pool`        | infinite | `name`, `status`, `healthy`, `allocatedBytes`, `freeBytes`, `sizeBytes`, `usedPercent`, `fragmentationPercent`, `capacityKnown`                                                                                           | One record per ZFS pool with status, health, capacity, fragmentation. Check `capacityKnown` before gating on capacity: when TrueNAS reports no allocated/free the four capacity fields are -1, not 0, so an unknown pool cannot read as an empty one. |
+| `disk`        | infinite | `name`, `serial`, `model`, `sizeBytes`, `type`, `pool`, `sizeKnown`                                                                                                                                                       | One record per physical disk and its pool membership. `sizeKnown` is false when TrueNAS reported no size; `sizeBytes` is then -1.                                                                                                                     |
+| `alert`       | infinite | `id`, `klass`, `level`, `formatted`, `dismissed`, `silenced`                                                                                                                                                              | One record per active TrueNAS alert. `silenced` marks alerts that were dismissed in the UI. Still true, just no longer visible there.                                                                                                                 |
+| `certificate` | infinite | `name`, `commonName`, `notAfter`, `daysRemaining`, `expiryKnown`, `expiringSoon`, `expired`                                                                                                                               | One record per certificate with days remaining, tracked independently of TrueNAS alert state so a dismissed expiry warning cannot hide a cert that is about to lapse.                                                                                 |
+| `summary`     | infinite | `hostname`, `version`, `pools`, `poolsUnhealthy`, `poolsCapacityUnknown`, `disks`, `alerts`, `alertsSilenced`, `certificates`, `certificatesExpiringSoon`, `certificatesExpired`, `certificatesWithoutExpiry`, `syncedAt` | Single roll-up of the most recent discover.                                                                                                                                                                                                           |
 
 ## Example
 
@@ -68,26 +68,51 @@ Discovery only: there is no write path to TrueNAS anywhere in this model.
 Certificate expiry is computed independently of TrueNAS's own alert state. A
 `CertificateIsExpiring` alert dismissed in the UI is still reported, with
 `silenced: true`. Dismissing an alert does not renew a certificate, we checked.
-`expiryKnown` must be checked before `daysRemaining` (a CSR has no expiry).
-Verified against SCALE 25.10. `auth.login_with_api_key` is scheduled for removal
-in TrueNAS 27 and the model warns when it connects to a host that new. If a
-scheduled run fails to connect while the same call works from a shell on the
-same Mac, suspect macOS Local Network privacy. A run in which TrueNAS reports
-zero pools (or zero disks) does not prune the existing `pool`/`disk` records,
-because that is what a pool still importing after a reboot looks like; the run
-logs a warning instead. Records for an object that really was removed are pruned
-by the next run that reports any object of that kind, so only the removal of the
-very last pool or disk leaves a stale record to clear by hand. Alerts and
-certificates are pruned on absence as before — a resolved alert must go.
+Four fields say whether a number is real before you gate on it: `expiryKnown` on
+a certificate (a CSR has no expiry), `capacityKnown` on a pool, `sizeKnown` on a
+disk, and `metricsKnown` on `system` for cores/memory/uptime. When one of those
+is false the numbers it covers are `-1`, never `0`, because `0` is a value
+TrueNAS legitimately reports for all of them and a capacity gate reading
+`usedPercent: 0` would call an unknown pool empty.
+`summary.poolsCapacityUnknown` surfaces the same thing for a workflow that only
+reads the roll-up. `baseUrl` may carry a host, port and path (a reverse-proxied
+subpath works) but not a query string or fragment; the `wss://` URL is rebuilt
+from its parts. Verified against SCALE 25.10. `auth.login_with_api_key` is
+scheduled for removal in TrueNAS 27: a successful connect to a host that new
+logs a warning, and a failed authentication says so in the error, which is where
+you actually hit it if the call is gone. If a scheduled run fails to connect
+while the same call works from a shell on the same Mac, suspect macOS Local
+Network privacy. Instance names are
+`<prefix>-<slug of the identity fields, ≤48 chars>-<8 hex digits of FNV-1a over the raw identity>`,
+with fixed names `system` and `summary`. Certificates use the prefix `cert-`
+even though the resource kind is `certificate`: the name is the record's
+identity in the datastore, so renaming the prefix would prune and recreate every
+stored certificate and lose its history, which is not worth a tidier spelling. A
+run in which TrueNAS reports zero pools (or zero disks) does not prune the
+existing `pool`/`disk` records, because that is what a pool still importing
+after a reboot looks like; the run logs a warning instead. Records for an object
+that really was removed are pruned by the next run that reports any object of
+that kind, so only the removal of the very last pool or disk leaves a stale
+record to clear by hand. Alerts and certificates are pruned on absence as before
+— a resolved alert must go.
 
 ## Security
 
 The API key is marked sensitive, sent once over the authenticated WebSocket, and
-never logged. `baseUrl` must be `https://` (→ `wss://`) and must not embed
-userinfo. `allowInsecureHttp: true` permits `http://` → `ws://` with the key in
-cleartext. Off by default, for trusted loopback/VPN paths only. Written data:
-hostname, version, pool names and health, disk models and serial numbers, alert
-text, certificate names and CNs.
+never logged. `baseUrl` must be `https://` (→ `wss://`), must not embed
+userinfo, and must not carry a query string or fragment (both would be copied
+into the connection log and every connection error). Remote text that reaches an
+error or a log line is truncated to a bounded preview rather than pasted in
+whole. `allowInsecureHttp: true` permits `http://` → `ws://` with the key in
+cleartext on every call, so anyone on the path captures a live TrueNAS API key.
+It is off by default and exists for a trusted loopback or VPN path where TLS
+genuinely cannot be terminated on the NAS; leave it off unless that describes
+you. Written data: hostname, version, pool names and health, disk models and
+serial numbers, certificate names and CNs (which commonly reveal internal DNS
+names), and full alert text. Alert text is free-form prose written by TrueNAS
+and routinely embeds IP addresses, usernames from failed-login alerts, share and
+dataset paths, and disk serial numbers. Anywhere these resources are read is
+somewhere that data goes.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.
