@@ -23,22 +23,48 @@ example: |
     pruneMaxShrink: 0.5
 caveats: >-
   Inventory, not control: it only reads `/v2/devices` and never writes to the
-  firewall. Pruning of departed records happens only on a full, unfiltered
+  firewall. Instance names are deterministic, so a re-sync updates rather than
+  duplicates: `device-<slug>-<hash>`, `machine-<slug>-<hash>`, and the single
+  `inventory`. Pruning of departed records happens only on a full, unfiltered
   sync. A `tier`- or `network`-restricted run never deletes. It is also
   skipped, with a warning, when the run looks unrepresentative: no devices
   written at all, or a count that fell more than `pruneMaxShrink` below the
   previous roll-up's total. Pass `forcePrune: true` after a genuine mass
-  decommission. Devices on `excludeNetworks` are skipped before anything is
-  written; network names are matched case- and whitespace-insensitively.
-  Two devices reported under the same name are kept as separate machines
-  even when both names carry a NIC suffix. The `machine` list, not the raw
-  `device` list, is the correct source for generating an SSH fleet.
+  decommission. Every operator-supplied name is matched case- and
+  whitespace-insensitively against what the MSP reports — `excludeNetworks`,
+  `exclude`, `apiManaged`, and the `dependencies` keys all fold the same way,
+  and two `dependencies` keys that fold together are reported rather than
+  silently merged. Two devices reported under the same name are kept as
+  separate machines even when both names carry a NIC suffix. The `machine`
+  list, not the raw `device` list, is the correct source for generating an SSH
+  fleet.
+  Fields the MSP omits are omitted from the record rather than defaulted:
+  `ip`, `totalDownload`, and `totalUpload` are simply absent when unknown, so
+  a missing counter never reads as measured zero traffic. `online` is the
+  deliberate exception. It stays a required boolean and an absent value is
+  recorded as offline, because every consumer of this model asks a two-state
+  question and an absent presence signal should fail loudly (a fleet that
+  reports down gets looked at) rather than quietly green. A run that had to
+  do this logs a warning naming the count.
+  The response is validated field by field rather than parsed strictly:
+  entries that are not objects are skipped and counted, but a field the MSP
+  *adds* is ignored, not treated as an error. An inventory model going dark
+  because the vendor shipped a new attribute would be a worse failure than the
+  one strict parsing prevents.
 security: >-
   `mspDomain` is parsed as a URL and must be a bare `*.firewalla.net`
   hostname (no path, query, fragment, port, or userinfo) because that is
-  where the token is sent. The request always goes to `https://<hostname>`.
-  The token is marked sensitive, sent in the `Token` header, and redacted from
-  any error body before it can reach a message. 429/503 retries honour
-  `Retry-After` capped at 5 s and are cancellable. Written data is a personal
-  inventory of your network: device names, MAC addresses, IPs, vendors,
-  networks, online state, traffic totals. Treat the datastore accordingly.
+  where the token is sent. The request always goes to `https://<hostname>`
+  and sets `redirect: "error"`, so a redirect away from the validated host
+  fails the call instead of relying on the runtime to strip the credential.
+  The token is marked sensitive and sent as `Authorization: Token <token>`.
+  Every piece of foreign text that reaches an error message — HTTP error
+  bodies, JSON parser messages that quote the body, network errors, and
+  datastore driver errors — is passed through the same redaction first, and
+  401/403 bodies are discarded entirely. 429/503 retries honour `Retry-After`
+  capped at 5 s, and `timeoutSec` bounds the whole call including the retry
+  waits, not just one request. Written data is a personal inventory of your
+  network: device names, MAC addresses, IPs, vendors, networks, online state,
+  traffic totals, plus your MSP tenant hostname in the `inventory` roll-up.
+  Treat the datastore accordingly. The LICENSE carries the author's real name
+  as ordinary MIT attribution; that is a deliberate choice, not an oversight.
