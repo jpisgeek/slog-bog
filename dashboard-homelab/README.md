@@ -34,10 +34,17 @@ globalArguments:
 ## Caveats
 
 This package observes only the data handles produced by the collector execution
-it is attached to. Firewalla filtered runs declare filtered coverage. TrueNAS
-alerts remain independent from certificate exceptions because the current alert
-resource exposes no stable certificate identity. The report never guesses a
-match from message text or list order.
+it is attached to. Firewalla filtered runs declare filtered coverage, and the
+Firewalla device count and online count are cross-checked against the published
+device records; an inventory rollup the device records do not corroborate is
+reported as coverage drift and its online metric drops below exact confidence.
+TrueNAS alerts remain independent from certificate exceptions because the
+current alert resource exposes no stable certificate identity. The report never
+guesses a match from message text or list order. An alert dismissed in the
+TrueNAS UI still counts toward section and bundle state; the dismissal is
+reported as detail, never as suppression. An alert level outside the recognized
+vocabulary, including an empty one, is treated as a warning and named in the
+exception rather than filed as information.
 
 ## Security
 

@@ -702,12 +702,70 @@ function stableId(prefix: string, ...parts: string[]): string {
   return `${prefix}:${hash.toString(16).padStart(16, "0")}`;
 }
 
+// Severity levels this report recognizes, spelled out per bucket so that an
+// unrecognized level is a distinguishable case rather than a silent default.
+//
+// The critical bucket carries the syslog levels at or above ERROR. ERROR sits
+// above WARNING in the syslog ordering and, on a NAS, names a failure that has
+// already happened (a scrub or replication that did not complete), not a
+// prediction about one. TrueNAS emits it; this report used to file it as
+// "info" and drop it out of state entirely.
+const CRITICAL_LEVELS = [
+  "CRITICAL",
+  "CRIT",
+  "ALERT",
+  "EMERGENCY",
+  "EMERG",
+  "ERROR",
+  "ERR",
+  "FATAL",
+];
+const WARNING_LEVELS = ["WARNING", "WARN"];
+// Levels that genuinely mean "not a raised condition". TrueNAS alerts carry
+// the low syslog levels; Netdata alarm records carry its non-raised alarm
+// statuses. Both must stay "info" or every quiet run reads as degraded.
+const INFO_LEVELS = [
+  "INFO",
+  "INFORMATIONAL",
+  "NOTICE",
+  "DEBUG",
+  "CLEAR",
+  "OK",
+  "NOMINAL",
+  "UNDEFINED",
+  "UNINITIALIZED",
+  "REMOVED",
+];
+
+/**
+ * Classify a source level string.
+ *
+ * The fall-through used to be "info", which made an unmapped level invisible:
+ * "info" exceptions move neither the section state ladder nor
+ * deriveOverallState, so an alert the collector could not label was published
+ * as a low-priority line item under a healthy bundle. That case is reachable
+ * without anything exotic — truenas.ts types the raw API field as
+ * `level: z.string().nullable().optional()` and writes `level: a.level ?? ""`,
+ * so an alert payload with no `level` key persists as the empty string.
+ *
+ * An unrecognized level now classifies as "warning": enough to take the
+ * section out of "healthy" and put the condition in front of an operator,
+ * without asserting a severity the source never gave us.
+ */
 function severity(level: string): "critical" | "warning" | "info" {
-  const normalized = level.toUpperCase();
-  if (["CRITICAL", "ALERT", "EMERGENCY"].includes(normalized)) {
-    return "critical";
-  }
-  return normalized === "WARNING" ? "warning" : "info";
+  const normalized = level.trim().toUpperCase();
+  if (CRITICAL_LEVELS.includes(normalized)) return "critical";
+  if (WARNING_LEVELS.includes(normalized)) return "warning";
+  if (INFO_LEVELS.includes(normalized)) return "info";
+  return "warning";
+}
+
+/** True when `level` is outside every bucket above, so it can be named. */
+function levelUnmapped(level: string): boolean {
+  const normalized = level.trim().toUpperCase();
+  return !CRITICAL_LEVELS.includes(normalized) &&
+    !WARNING_LEVELS.includes(normalized) &&
+    !INFO_LEVELS.includes(normalized);
 }
 
 function freshness(observedAt: string | undefined) {
@@ -959,15 +1017,37 @@ function trueNasSection(ctx: ReportContext, read: ReadResult) {
     })),
     // Alert records expose no stable certificate identifier. Preserve every
     // alert independently instead of attaching it to the first certificate.
+    //
+    // `suppressed` is deliberately always false here. The collector sets
+    // `silenced` from the TrueNAS `dismissed` flag and says so explicitly
+    // (truenas.ts: "A dismissed alert is hidden in the TrueNAS UI but the
+    // condition behind it is still true. Surface it rather than inherit the
+    // dismissal."). This report used to map that flag straight onto
+    // `suppressed`, which re-applied the dismissal one layer up: suppressed
+    // exceptions are filtered out of the section state ladder below AND out of
+    // deriveOverallState, and the renderer files them into a collapsed
+    // "Expected" block. A CRITICAL alert somebody had dismissed months ago
+    // therefore published as a healthy bundle with an all-clear banner. The
+    // dismissal is kept as visible detail instead of as state.
     ...alerts.map((a) => ({
       id: stableId("truenas-alert", a.id),
       severity: severity(a.level),
       subject: a.klass,
       headline: a.klass,
-      detail: a.formatted,
+      detail: [
+        a.formatted,
+        a.silenced
+          ? "dismissed in the TrueNAS UI; the condition is still active"
+          : "",
+        // Name the level we could not classify rather than letting it vanish
+        // into a bucket the operator cannot see from the rendered line.
+        levelUnmapped(a.level)
+          ? `unrecognized alert level ${JSON.stringify(a.level)}`
+          : "",
+      ].filter((part) => part !== "").join(" — "),
       source: "truenas:alert",
-      suppressed: a.silenced,
-      suppressReason: a.silenced ? "silenced in TrueNAS" : "",
+      suppressed: false,
+      suppressReason: "",
       sensitivity: "operational" as const,
     })),
     ...sourceFailureExceptions(ctx, read),
@@ -1028,9 +1108,34 @@ function trueNasSection(ctx: ReportContext, read: ReadResult) {
 
 function firewallaSection(ctx: ReportContext, read: ReadResult) {
   const machines = read.records.machine as z.infer<typeof FirewallaMachine>[];
+  const devices = read.records.device as z.infer<typeof FirewallaDevice>[];
   const inventory =
     (read.records.inventory as z.infer<typeof FirewallaInventory>[])[0];
-  const mismatch = inventory && inventory.machines !== machines.length;
+  // The section headline and the `devices.online` metric are both read
+  // straight off the inventory rollup. The only cross-check this section used
+  // to run was `inventory.machines !== machines.length`, which validates a
+  // different figure entirely — so a rollup that raced the device scan could
+  // publish "12/12 devices online" at confidence "exact" against three machine
+  // records and nothing would notice. Device records were being fetched and
+  // Zod-validated by readRecords() and then thrown away.
+  //
+  // These two invariants are exact on the collector side, not approximate:
+  // firewalla.ts sets `total` from `deviceCount = handles.length` taken
+  // immediately after the device write loop, and increments `online` inside
+  // that same loop. Devices on excluded networks are skipped before any write
+  // and so are absent from both sides; name-excluded devices are written and
+  // counted on both sides. So any difference here is real drift.
+  const deviceCountsKnown = devices.length > 0;
+  const devicesOnline = devices.filter((d) => d.online).length;
+  const deviceMismatch = Boolean(inventory) && deviceCountsKnown &&
+    (inventory.total !== devices.length || inventory.online !== devicesOnline);
+  // An inventory claiming devices with no device record published alongside it
+  // is drift too: readRecords sees every handle the execution produced.
+  const devicesMissing = Boolean(inventory) && !deviceCountsKnown &&
+    inventory.total > 0;
+  const mismatch = Boolean(inventory) &&
+    (inventory.machines !== machines.length || deviceMismatch ||
+      devicesMissing);
   const exceptions = [
     ...machines.filter((m) => !m.online && m.tier === "deep").map((m) => ({
       id: stableId("firewalla-machine", m.name),
@@ -1049,9 +1154,18 @@ function firewallaSection(ctx: ReportContext, read: ReadResult) {
         id: "firewalla:summary-record-mismatch",
         severity: "warning" as const,
         subject: "Firewalla coverage",
-        headline: "Inventory and machine coverage differ",
-        detail:
+        // Renamed from "machine coverage": this check now also covers the
+        // device records the headline figure is actually derived from.
+        headline: "Inventory and record coverage differ",
+        detail: [
           "Collector inventory counts do not match the available records.",
+          deviceMismatch
+            ? `Inventory reports ${inventory.online}/${inventory.total} devices online; device records show ${devicesOnline}/${devices.length}.`
+            : "",
+          devicesMissing
+            ? `Inventory reports ${inventory.total} devices but no device record was published.`
+            : "",
+        ].filter((part) => part !== "").join(" "),
         source: "firewalla:inventory",
         suppressed: false,
         suppressReason: "",
@@ -1100,7 +1214,13 @@ function firewallaSection(ctx: ReportContext, read: ReadResult) {
         id: "devices.online",
         label: "Online devices",
         unit: "count" as const,
-        confidence: "exact" as const,
+        // "exact" is reserved for a figure the device records corroborate.
+        // Publishing the uncorroborated rollup at "exact" made a raced or
+        // drifted count indistinguishable from a verified reading, which is
+        // the one thing confidence exists to prevent.
+        confidence: (deviceCountsKnown && !deviceMismatch)
+          ? "exact" as const
+          : "inferred" as const,
         availability: "observed" as const,
         value: inventory.online,
         sensitivity: "operational" as const,
