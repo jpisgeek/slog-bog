@@ -13,7 +13,12 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { model as endpoint } from "./lmstudio_endpoint.ts";
 import { model as probe } from "./lmstudio_probe.ts";
-import { model as daemon, setCommandRunnerForTest } from "./lmstudio_daemon.ts";
+import {
+  MAX_OUTPUT_BYTES,
+  model as daemon,
+  runCommandForTest,
+  setCommandRunnerForTest,
+} from "./lmstudio_daemon.ts";
 
 const OK = {
   baseUrl: "https://inference.example.com/v1",
@@ -477,4 +482,250 @@ Deno.test("daemon model supports local headless and safe remote hosts", () => {
     false,
   );
   assertEquals(daemon.type, "@jpisgeek/lmstudio/daemon");
+});
+
+// ---------------------------------------------------------------------------
+// The real subprocess runner. Every test above substitutes commandRunner, so
+// the one function that actually spawns a process had no coverage at all --
+// which is how it kept an unbounded `await child.output()` behind a SIGTERM
+// that a child is free to ignore.
+// ---------------------------------------------------------------------------
+
+Deno.test("daemon runner: a SIGTERM-ignoring child is escalated to SIGKILL", async () => {
+  const controller = new AbortController();
+  // Ignores SIGTERM and spins in-process: no grandchild, so nothing but the
+  // shell itself holds the pipes. The iteration count is a backstop -- if the
+  // escalation regresses this fails in seconds instead of hanging the suite
+  // forever, which is exactly what the old runner did to a live workflow.
+  const running = runCommandForTest("/bin/sh", [
+    "-c",
+    "trap '' TERM; n=0; while [ $n -lt 40000000 ]; do n=$((n+1)); done",
+  ], controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  controller.abort();
+
+  let guard: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    running.then(() => "exited" as const),
+    new Promise<"still running">((resolve) => {
+      guard = setTimeout(() => resolve("still running"), 8000);
+    }),
+  ]);
+  clearTimeout(guard);
+  assertEquals(
+    outcome,
+    "exited",
+    "aborting must actually stop the child -- SIGTERM alone never does when " +
+      "the child ignores it",
+  );
+  const result = await running;
+  assertEquals(result.success, false);
+});
+
+Deno.test("daemon runner: output past the cap is truncated, never reported as success", async () => {
+  const controller = new AbortController();
+  // ~8 MB of stdout, well past the cap. The old runner buffered all of it
+  // before anything got the chance to look at the size.
+  const result = await runCommandForTest("/bin/sh", [
+    "-c",
+    "yes 0123456789012345678901234567890123456789 | head -n 200000",
+  ], controller.signal);
+  assertEquals(
+    result.stdout.length <= MAX_OUTPUT_BYTES,
+    true,
+    `stdout was ${result.stdout.length} bytes, cap is ${MAX_OUTPUT_BYTES}`,
+  );
+  assertEquals(
+    result.success,
+    false,
+    "a truncated answer must fail, not be returned as though it were whole",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// `lms ps` output is remote-controlled text in --host mode. The daemon
+// resource calls itself "sanitized", so hostile or unbounded model metadata
+// must fail closed rather than being stored for 30 days.
+// ---------------------------------------------------------------------------
+
+const HOSTILE_IDENTIFIERS: [string, string, string][] = [
+  ["terminal escape", "qwen\u001b]0;PWNED\u0007-7b", "PWNED"],
+  ["bidi override", "qwen\u202egnp.exe-7b", "gnp.exe"],
+  ["zero width", "qwen\u200b-7b", "\u200b"],
+  ["unpaired surrogate", "qwen\ud800-7b", "\ud800"],
+  ["over long name", `qwen-${"a".repeat(400)}`, "a".repeat(400)],
+];
+
+for (const [label, identifier, marker] of HOSTILE_IDENTIFIERS) {
+  Deno.test(`daemon: a model identifier with a ${label} fails closed`, async () => {
+    const value = await runDaemon(() =>
+      Promise.resolve({
+        success: true,
+        code: 0,
+        stdout: JSON.stringify([{
+          identifier,
+          type: "llm",
+          architecture: "example",
+        }]),
+        stderr: "",
+      })
+    );
+    assertEquals(value.errorKind, "invalid-response");
+    assertEquals(value.loadedModelCount, 0);
+    assertEquals(
+      JSON.stringify(value).includes(marker),
+      false,
+      `unscreened identifier reached stored data: ${label}`,
+    );
+
+    // Asserted against the resource schema as well, not just the parse path:
+    // a bound that lives only in parseModels() is one refactor away from
+    // being silently gone.
+    assertEquals(
+      daemon.resources.daemon.schema.safeParse({
+        cliAvailable: true,
+        daemonRunning: true,
+        status: "running",
+        loadedModelCount: 1,
+        loadedModels: [{ identifier, type: "llm", architecture: "example" }],
+        observedAt: new Date(0).toISOString(),
+        errorKind: "",
+        error: "",
+      }).success,
+      false,
+      `resource schema accepted a ${label} identifier`,
+    );
+  });
+}
+
+Deno.test("daemon: an unbounded model list fails closed", async () => {
+  const models = Array.from({ length: 600 }, (_unused, i) => ({
+    identifier: `example/model-${i}`,
+    type: "llm",
+    architecture: "example",
+  }));
+  const value = await runDaemon(() =>
+    Promise.resolve({
+      success: true,
+      code: 0,
+      stdout: JSON.stringify(models),
+      stderr: "",
+    })
+  );
+  assertEquals(value.errorKind, "invalid-response");
+  assertEquals(value.loadedModelCount, 0);
+  assertEquals(
+    daemon.resources.daemon.schema.safeParse({
+      cliAvailable: true,
+      daemonRunning: true,
+      status: "running",
+      loadedModelCount: models.length,
+      loadedModels: models,
+      observedAt: new Date(0).toISOString(),
+      errorKind: "",
+      error: "",
+    }).success,
+    false,
+    "resource schema accepted an unbounded loadedModels array",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// A transient refusal is not a capability finding. embedding() used to
+// relabel EVERY non-2xx as no_embedding_capability and store it for ever.
+// ---------------------------------------------------------------------------
+
+async function runEmbedding(queue: (() => Response)[]) {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  let written: Record<string, unknown> | undefined;
+  globalThis.fetch = () => {
+    calls++;
+    const next = queue.shift();
+    if (!next) return Promise.reject(new Error("unexpected extra request"));
+    return Promise.resolve(next());
+  };
+  try {
+    await probe.methods.embedding.execute({
+      model: "example/embed",
+      input: "swamp lmstudio probe",
+    }, {
+      globalArgs: OK,
+      signal: new AbortController().signal,
+      logger: { info: () => {}, warning: () => {} },
+      writeResource: (
+        _spec: string,
+        _name: string,
+        value: Record<string, unknown>,
+      ) => {
+        written = value;
+        return Promise.resolve({ name: "embedding" });
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  return { written: written as Record<string, unknown>, calls };
+}
+
+// retry-after: 0 keeps the bounded backoff from putting a real second into
+// every one of these tests.
+const rateLimited = () =>
+  new Response("slow down", {
+    status: 429,
+    headers: { "retry-after": "0" },
+  });
+
+Deno.test("embedding: a persistent rate limit is not stored as a missing capability", async () => {
+  const { written, calls } = await runEmbedding([rateLimited, rateLimited]);
+  assertEquals(calls, 2, "429 must get the same bounded retry completion gets");
+  assertEquals(
+    written.errorKind,
+    "rate_limited",
+    "a 429 stored as no_embedding_capability is a transient condition " +
+      "recorded for ever as a capability finding",
+  );
+  assertEquals(written.servesEmbeddings, false);
+  assertEquals(written.dimensionKnown, false);
+});
+
+Deno.test("embedding: a server fault is not stored as a missing capability", async () => {
+  const { written, calls } = await runEmbedding([
+    () => new Response("upstream exploded", { status: 502 }),
+  ]);
+  assertEquals(calls, 1);
+  assertEquals(written.errorKind, "server_error");
+  assertEquals(written.dimensionKnown, false);
+});
+
+Deno.test("embedding: a transient 503 is retried before anything is recorded", async () => {
+  const { written, calls } = await runEmbedding([
+    () =>
+      new Response("loading another model", {
+        status: 503,
+        headers: { "retry-after": "0" },
+      }),
+    () =>
+      new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+  ]);
+  assertEquals(calls, 2, "the embedding probe must retry 503 like completion");
+  assertEquals(written.errorKind, "");
+  assertEquals(written.servesEmbeddings, true);
+  assertEquals(written.measuredDimension, 3);
+  assertEquals(written.dimensionKnown, true);
+});
+
+Deno.test("embedding: a generic 4xx is still labelled no_embedding_capability", async () => {
+  // The deliberate behaviour this probe exists for: chat keeps working while
+  // the endpoint refuses embeddings. Scoping the relabel must not lose it.
+  const { written, calls } = await runEmbedding([
+    () =>
+      new Response("no embedding model is currently loaded", { status: 400 }),
+  ]);
+  assertEquals(calls, 1);
+  assertEquals(written.errorKind, "no_embedding_capability");
+  assertEquals(written.servesEmbeddings, false);
 });
