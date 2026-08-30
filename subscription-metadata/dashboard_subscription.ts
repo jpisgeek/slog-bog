@@ -428,7 +428,33 @@ export function parseDashboardBundle(input: unknown): DashboardBundleV1 {
 }
 // END INLINED DASHBOARD CONTRACT V1
 type Json = Record<string, unknown>;
-const DecimalSchema = z.string().regex(/^\d+(\.\d+)?$/);
+// Everything below mirrors the canonical snapshot contract in
+// subscription_metadata.ts. Reports and models are separate bundle entry points
+// in this repo, so the contract is duplicated rather than imported, the same way
+// the dashboard contract above is inlined. The two copies had drifted: this one
+// dropped the forbidden-declaration guard entirely and was not .strict(), so the
+// read path enforced less than the write path and any snapshot written by
+// another route — a direct Swamp data write, or a capture from an older, looser
+// version of this model still inside its 365-day lifetime — could carry
+// {name: "remaining tokens"} through read() and be rendered by section() as a
+// healthy exact metric with no revalidation of the guarantee. A snapshot that
+// fails these schemas now falls out of read()'s catch as null and degrades to
+// the informational "unknown" section instead of being published.
+// subscription_metadata_test.ts and dashboard_subscription_test.ts both assert
+// the two copies accept and reject the same snapshots.
+const DecimalSchema = z.string().regex(/^\d{1,15}(\.\d{1,4})?$/);
+const CONFUSABLE_PAIRS = "аaеeоoрpсcуyхxіiјjѕsмmтtкkвbнhαaεeοoρpνvιiκkτt";
+const CONFUSABLES = new Map<string, string>();
+for (let index = 0; index < CONFUSABLE_PAIRS.length; index += 2) {
+  CONFUSABLES.set(CONFUSABLE_PAIRS[index], CONFUSABLE_PAIRS[index + 1]);
+}
+function foldDeclaredText(value: string): string {
+  const stripped = value.normalize("NFKC").replace(/\p{Cf}|\p{Cc}/gu, "")
+    .toLowerCase();
+  return [...stripped].map((char) => CONFUSABLES.get(char) ?? char).join("");
+}
+const FORBIDDEN_DECLARATION =
+  /remain|avail|left|per.{0,8}tokens?|tokens?.{0,8}price/;
 const ReferenceSchema = z.string().url().refine(
   (value) => {
     const url = new URL(value);
@@ -438,16 +464,38 @@ const ReferenceSchema = z.string().url().refine(
   "sourceReference must use https and must not contain credentials, query parameters, or fragments",
 );
 const LimitSchema = z.object({
-  name: z.string(),
+  name: z.string().min(1),
   value: z.number().nonnegative().finite(),
   unit: z.string().regex(/^[a-z][a-z0-9._-]*$/),
-  period: z.string().optional(),
+  period: z.string().min(1).optional(),
   sourceReference: ReferenceSchema.optional(),
+}).strict().superRefine((limit, ctx) => {
+  for (const field of ["name", "unit", "period"] as const) {
+    const declared = limit[field];
+    if (
+      declared !== undefined &&
+      FORBIDDEN_DECLARATION.test(foldDeclaredText(declared))
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: [field],
+        message:
+          "remaining quota and per-token price declarations are forbidden",
+      });
+    }
+  }
 });
 const SnapshotSchema = z.object({
-  provider: z.string(),
-  planName: z.string().optional(),
-  billingCadence: z.string().optional(),
+  provider: z.string().min(1),
+  planName: z.string().min(1).optional(),
+  billingCadence: z.enum([
+    "monthly",
+    "annual",
+    "quarterly",
+    "weekly",
+    "one-time",
+    "other",
+  ]).optional(),
   priceMinor: DecimalSchema.optional(),
   currency: z.string().regex(/^[A-Z]{3}$/).optional(),
   renewalStart: z.iso.datetime().optional(),
@@ -459,7 +507,27 @@ const SnapshotSchema = z.object({
     kind: z.literal("operator-config"),
     capturedAt: z.iso.datetime(),
     sourceReference: ReferenceSchema.optional(),
-  }),
+  }).strict(),
+}).strict().superRefine((snapshot, ctx) => {
+  if (
+    (snapshot.priceMinor === undefined) !== (snapshot.currency === undefined)
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["currency"],
+      message: "priceMinor and currency must be supplied together",
+    });
+  }
+  if (
+    snapshot.renewalStart && snapshot.renewalEnd &&
+    Date.parse(snapshot.renewalStart) > Date.parse(snapshot.renewalEnd)
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["renewalStart"],
+      message: "renewalStart must not follow renewalEnd",
+    });
+  }
 });
 type Snapshot = z.infer<typeof SnapshotSchema>;
 interface Context {

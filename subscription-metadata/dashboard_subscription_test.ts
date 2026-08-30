@@ -1,5 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { normalize, report } from "./dashboard_subscription.ts";
+import { model } from "./subscription_metadata.ts";
 type Json = Record<string, unknown>;
 function context(snapshot: Json | null) {
   const bytes = snapshot
@@ -86,6 +87,93 @@ Deno.test("missing snapshot is informational unknown", async () => {
   const bundle = await normalize(context(null));
   assertEquals(bundle.sections[0].state, "unknown");
   assertEquals(bundle.state, "unknown");
+});
+
+// The read path used to enforce less than the write path: its LimitSchema had
+// no forbidden-declaration guard and its SnapshotSchema was not .strict(), so a
+// snapshot written by another route — a direct Swamp data write, or a capture
+// from an older, looser version of this model still inside its 365-day lifetime
+// — was rendered as a healthy exact metric. Drive candidates through capture()
+// and through normalize() and assert the two verdicts agree, so the duplicated
+// copies cannot drift apart again without a test failing.
+Deno.test("read path and write path accept and reject the same snapshots", async () => {
+  const candidates: Json[] = [
+    { provider: "Example AI" },
+    {
+      provider: "Example AI",
+      declaredLimits: [{
+        name: "Included requests",
+        value: 1000,
+        unit: "requests",
+        period: "month",
+      }],
+    },
+    { provider: "Example AI", priceMinor: "2500", currency: "USD", seats: 4 },
+    {
+      provider: "Example AI",
+      declaredLimits: [{
+        name: "remaining tokens",
+        value: 500,
+        unit: "tokens",
+      }],
+    },
+    {
+      provider: "Example AI",
+      declaredLimits: [{ name: "Rate", value: 0.002, unit: "usd-per-token" }],
+    },
+    {
+      provider: "Example AI",
+      declaredLimits: [{
+        name: "Budget",
+        value: 5,
+        unit: "usd",
+        period: "per token",
+      }],
+    },
+    { provider: "Example AI", priceMinor: "9".repeat(500), currency: "USD" },
+    { provider: "Example AI", priceMinor: "2500" },
+    { provider: "", declaredLimits: [] },
+    { provider: "Example AI", billingCadence: "biweekly" },
+    { provider: "Example AI", remainingQuota: 10 },
+  ];
+  for (const candidate of candidates) {
+    let captureAccepted = true;
+    try {
+      await model.methods.capture.execute({}, {
+        globalArgs: candidate,
+        writeResource: () => Promise.resolve({}),
+      });
+    } catch {
+      captureAccepted = false;
+    }
+    const bundle = await normalize(context({
+      declaredLimits: [],
+      ...candidate,
+      provenance: {
+        kind: "operator-config",
+        capturedAt: "2026-08-25T20:00:00Z",
+      },
+    }));
+    const readAccepted = bundle.sections[0].state !== "unknown";
+    assertEquals(
+      readAccepted,
+      captureAccepted,
+      `read/write disagree on ${
+        JSON.stringify(candidate)
+      }: capture ${captureAccepted}, read ${readAccepted}`,
+    );
+  }
+});
+
+// An over-long priceMinor that predates the capture-side bound used to reach
+// Number() as Infinity, and ObservedMetricSchema requires .finite() — the whole
+// bundle parse threw. It must now degrade to the informational unknown section.
+Deno.test("an unrenderable persisted priceMinor degrades instead of throwing", async () => {
+  const bundle = await normalize(
+    context(snapshot({ priceMinor: "9".repeat(500), currency: "USD" })),
+  );
+  assertEquals(bundle.sections[0].state, "unknown");
+  assertEquals(bundle.sections[0].metrics.length, 0);
 });
 
 Deno.test("operator strings cannot inject raw Markdown or HTML", async () => {
