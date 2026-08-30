@@ -37,9 +37,13 @@ caveats: >-
   an `errorKind`. `contextExhausted` is a heuristic (finish_reason "length"
   under the requested cap) and remains unknown when the endpoint omits valid
   token usage. Probe instance names are
-  `<method>-<slug-of-model-id>-<hash>`, so look them up after a run. The daemon
-  model runs `lms ps --json` beside llmster. Set its optional `host` argument
-  only when deliberately using LM Studio's supported remote CLI mode.
+  `<method>-<slug-of-model-id>-<hash>`, so look them up after a run. All three
+  probe methods retry a 429/503 once, Retry-After-aware and capped; on the
+  embedding probe a rate limit or a 5xx that survives the retry is recorded as
+  `rate_limited` / `server_error`, never as `no_embedding_capability` -- the
+  endpoint declined to answer the capability question rather than answering no.
+  The daemon model runs `lms ps --json` beside llmster. Set its optional `host`
+  argument only when deliberately using LM Studio's supported remote CLI mode.
 security: >-
   The bearer token is marked sensitive, must come from a vault expression
   (never an environment variable, env values persist into `.swamp/data/`),
@@ -51,4 +55,10 @@ security: >-
   model ids, latencies, optional token counts, boolean findings, and short
   sanitized endpoint error text. Caller prompts are not stored. Daemon
   observations retain loaded model identifiers, type, and architecture but
-  discard model paths and raw command error output.
+  discard model paths and raw command error output. `lms` output is read under
+  a per-stream byte cap rather than buffered to completion, its identifiers are
+  length-bounded and screened for control, bidi, and zero-width characters, and
+  an oversized or unscreenable payload is refused as `invalid-response` instead
+  of being stored. The `timeoutMs` argument is a hard bound: the CLI is sent
+  SIGTERM, escalated to SIGKILL, and abandoned outright if it still has not
+  released its pipes.

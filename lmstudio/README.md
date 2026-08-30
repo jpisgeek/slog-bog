@@ -73,7 +73,9 @@ plus whether the endpoint serves embeddings at all. Never assumes dimension from
 the model's name or reputation. A 401/403 throws a distinct UNAUTHORIZED error
 rather than being written as data -- a bad token is a configuration fault, not a
 measurement of the endpoint. Caller cancellation throws too, rather than being
-recorded as a timeout.
+recorded as a timeout. 429/503 responses get one bounded, Retry-After-aware
+retry, and a rate limit or server fault that survives it is recorded as such
+rather than as a missing embedding capability.
 
 | argument | type   | required | default                  | description                                                                                                                                 |
 | -------- | ------ | -------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -113,11 +115,11 @@ remaining capabilities absent.
 
 ### Data written
 
-| resource          | lifetime | fields                                                                                                                                                                                                                                                         | description                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ----------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `embeddingProbe`  | infinite | `model`, `servesEmbeddings`, `measuredDimension`, `dimensionKnown`, `latencyMs`, `httpStatus`, `errorKind`, `error`, `checkedAt`                                                                                                                               | Measured (never assumed) embedding vector dimension for one model, plus whether the endpoint serves embeddings at all. A generic error on this endpoint while chat still works is labelled no_embedding_capability rather than a bare http_error, and a malformed 2xx body is labelled malformed_response rather than scored as a zero-length vector.                                                                                                      |
-| `completionProbe` | infinite | `model`, `latencyMs`, `httpStatus`, `finishReason`, `promptTokens`, `completionTokens`, `totalTokens`, `reasoningTokens`, `reasoningChars`, `contentChars`, `emptyContentWithReasoning`, `contextExhausted`, `maxTokensHit`, `errorKind`, `error`, `checkedAt` | One chat completion probe, with reasoningTokens/reasoningChars, emptyContentWithReasoning, and a heuristic contextExhausted flag that distinguishes a context-window stop from a genuine max_tokens cutoff -- see the schema comment for the heuristic's limits.                                                                                                                                                                                           |
-| `capabilityProbe` | infinite | `model`, `emitsReasoning`, `honorsResponseFormat`, `wrapsInCodeFences`, `checksCompleted`, `reasoningCheckTruncated`, `formatCheckTruncated`, `fenceCheckTruncated`, `latencyMs`, `errorKind`, `error`, `checkedAt`                                            | A short 3-call battery against one model: unprompted reasoning, honouring a requested response_format, and markdown code-fence wrapping. Fencing is recorded as a habit, never scored as a failure. checksCompleted and the per-check *Truncated flags let a reader tell a battery that ran clean and found a capability absent apart from one that stopped partway through or was capped by max_tokens before it could answer -- see the schema comments. |
+| resource          | lifetime | fields                                                                                                                                                                                                                                                         | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `embeddingProbe`  | infinite | `model`, `servesEmbeddings`, `measuredDimension`, `dimensionKnown`, `latencyMs`, `httpStatus`, `errorKind`, `error`, `checkedAt`                                                                                                                               | Measured (never assumed) embedding vector dimension for one model, plus whether the endpoint serves embeddings at all. A generic 4xx on this endpoint while chat still works is labelled no_embedding_capability rather than a bare http_error, and a malformed 2xx body is labelled malformed_response rather than scored as a zero-length vector. A 429 or a 5xx keeps its own kind (rate_limited / server_error) and survives one bounded retry first -- a transient refusal is not evidence the endpoint serves no embeddings. |
+| `completionProbe` | infinite | `model`, `latencyMs`, `httpStatus`, `finishReason`, `promptTokens`, `completionTokens`, `totalTokens`, `reasoningTokens`, `reasoningChars`, `contentChars`, `emptyContentWithReasoning`, `contextExhausted`, `maxTokensHit`, `errorKind`, `error`, `checkedAt` | One chat completion probe, with reasoningTokens/reasoningChars, emptyContentWithReasoning, and a heuristic contextExhausted flag that distinguishes a context-window stop from a genuine max_tokens cutoff -- see the schema comment for the heuristic's limits.                                                                                                                                                                                                                                                                   |
+| `capabilityProbe` | infinite | `model`, `emitsReasoning`, `honorsResponseFormat`, `wrapsInCodeFences`, `checksCompleted`, `reasoningCheckTruncated`, `formatCheckTruncated`, `fenceCheckTruncated`, `latencyMs`, `errorKind`, `error`, `checkedAt`                                            | A short 3-call battery against one model: unprompted reasoning, honouring a requested response_format, and markdown code-fence wrapping. Fencing is recorded as a habit, never scored as a failure. checksCompleted and the per-check *Truncated flags let a reader tell a battery that ran clean and found a capability absent apart from one that stopped partway through or was capped by max_tokens before it could answer -- see the schema comments.                                                                         |
 
 ## `@jpisgeek/lmstudio/daemon`
 
@@ -140,9 +142,9 @@ No arguments.
 
 ### Data written
 
-| resource | lifetime | fields                                                                                                            | description                                                                                          |
-| -------- | -------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `daemon` | 30d      | `cliAvailable`, `daemonRunning`, `status`, `loadedModelCount`, `loadedModels`, `observedAt`, `errorKind`, `error` | Sanitized daemon status and models currently loaded in memory; missing measurements remain explicit. |
+| resource | lifetime | fields                                                                                                            | description                                                                                                                                                                                                                                                                                         |
+| -------- | -------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemon` | 30d      | `cliAvailable`, `daemonRunning`, `status`, `loadedModelCount`, `loadedModels`, `observedAt`, `errorKind`, `error` | Sanitized daemon status and models currently loaded in memory; missing measurements remain explicit. Model identifiers are length-bounded and screened for control, bidi, and zero-width characters, and an oversized or unscreenable ps payload is refused as invalid-response rather than stored. |
 
 ## Example
 
@@ -175,9 +177,13 @@ on caller cancellation; the three `probe` methods throw only on a bad token and
 cancellation and record everything else with an `errorKind`. `contextExhausted`
 is a heuristic (finish_reason "length" under the requested cap) and remains
 unknown when the endpoint omits valid token usage. Probe instance names are
-`<method>-<slug-of-model-id>-<hash>`, so look them up after a run. The daemon
-model runs `lms ps --json` beside llmster. Set its optional `host` argument only
-when deliberately using LM Studio's supported remote CLI mode.
+`<method>-<slug-of-model-id>-<hash>`, so look them up after a run. All three
+probe methods retry a 429/503 once, Retry-After-aware and capped; on the
+embedding probe a rate limit or a 5xx that survives the retry is recorded as
+`rate_limited` / `server_error`, never as `no_embedding_capability` -- the
+endpoint declined to answer the capability question rather than answering no.
+The daemon model runs `lms ps --json` beside llmster. Set its optional `host`
+argument only when deliberately using LM Studio's supported remote CLI mode.
 
 ## Security
 
@@ -191,6 +197,12 @@ in cleartext on that hop. Written data: served model ids, latencies, optional
 token counts, boolean findings, and short sanitized endpoint error text. Caller
 prompts are not stored. Daemon observations retain loaded model identifiers,
 type, and architecture but discard model paths and raw command error output.
+`lms` output is read under a per-stream byte cap rather than buffered to
+completion, its identifiers are length-bounded and screened for control, bidi,
+and zero-width characters, and an oversized or unscreenable payload is refused
+as `invalid-response` instead of being stored. The `timeoutMs` argument is a
+hard bound: the CLI is sent SIGTERM, escalated to SIGKILL, and abandoned
+outright if it still has not released its pipes.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
 for the release gates every version passes before it reaches the registry.

@@ -39,14 +39,18 @@
  * a configuration fault, not a measurement -- left as data it would be
  * indistinguishable from a genuine finding (e.g. "no embedding model
  * loaded" leaves measuredDimension absent for the same reason a bad token
- * does), and only one of those is actually about the endpoint. Caller
- * cancellation (workflow abort, not the request timeout) throws for the
- * same reason: a cancelled probe never observed the endpoint at all, so
+ * does), and only one of those is actually about the endpoint. For the same
+ * reason, a 429 or a 5xx on the embedding probe is stored as rate_limited /
+ * server_error rather than as no_embedding_capability: the endpoint declined
+ * to answer the capability question, which is not the same as answering no.
+ * Caller cancellation (workflow abort, not the request timeout) throws for
+ * the same reason: a cancelled probe never observed the endpoint at all, so
  * recording it as errorKind "timeout" would be indistinguishable from a
  * genuinely slow endpoint. Every other failure -- unreachable, timeout,
- * http_error, model_not_found, no_embedding_capability, empty_response,
- * malformed_response -- stays non-throwing: those are genuine observations
- * about endpoint state, not our own misconfiguration.
+ * http_error, rate_limited, server_error, model_not_found,
+ * no_embedding_capability, empty_response, malformed_response -- stays
+ * non-throwing: those are genuine observations about endpoint state, not our
+ * own misconfiguration.
  *
  * `apiToken` must never be read from an environment variable: env values
  * persist into `.swamp/data/`, which would leak the token into stored state.
@@ -175,7 +179,7 @@ const EmbeddingProbeSchema = z.object({
   dimensionKnown: z.boolean(),
   latencyMs: z.number(),
   httpStatus: z.number(),
-  /** "" | "model_not_found" | "no_embedding_capability" | "empty_response" | "malformed_response" | "unreachable" | "timeout" | "http_error" -- "unauthorized" and cancellation are never stored here; both throw instead (see chatCompletion/embedding). */
+  /** "" | "model_not_found" | "no_embedding_capability" | "rate_limited" | "server_error" | "empty_response" | "malformed_response" | "unreachable" | "timeout" | "http_error" -- "unauthorized" and cancellation are never stored here; both throw instead (see chatCompletion/embedding). "rate_limited" and "server_error" are deliberately NOT folded into "no_embedding_capability": they mean the endpoint never answered the capability question, not that it answered no. */
   errorKind: z.string(),
   error: z.string(),
   checkedAt: z.string(),
@@ -397,6 +401,88 @@ function classifyHttpError(
   };
 }
 
+/**
+ * One POST, with the bounded 429/503 retry every probe in this file needs.
+ *
+ * The retry used to live inside chatCompletion(), which meant completion() and
+ * capabilities() rode out a momentary rate limit while embedding() -- the probe
+ * most likely to hit one, because a gateway sees it as just another POST --
+ * recorded the very first 429 as a permanent finding. Shared here so all three
+ * have the resilience the README claims for the package.
+ *
+ * `signal` is the caller's raw cancellation signal, not yet combined with the
+ * per-attempt timeout: it is what classifyFetchError() uses to tell "the caller
+ * cancelled this run" apart from "this attempt timed out", and what the backoff
+ * wait checks so a cancelled run does not sit in a sleep no one is waiting on.
+ * Cancellation throws; every other transport failure comes back as `failed` for
+ * the caller to record as data.
+ */
+async function postWithRetry(
+  url: string,
+  token: string,
+  body: Record<string, unknown>,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<
+  { response: Response; failed?: undefined } | {
+    response?: undefined;
+    failed: { kind: string; message: string };
+  }
+> {
+  const maxAttempts = 2;
+  let response: Response | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      response = await fetch(url, {
+        redirect: "error",
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
+      });
+    } catch (e) {
+      const c = classifyFetchError(e, signal);
+      if (c.kind === "cancelled") {
+        // Not an observation about the endpoint -- the caller pulled the
+        // plug. Thrown (same distinction as the UNAUTHORIZED branch in each
+        // caller) so a cancelled run does not persist a "timeout" or
+        // "unreachable" finding that never actually happened.
+        throw new Error(`CANCELLED: ${c.message}`);
+      }
+      return { failed: c };
+    }
+
+    // Rate-limited or momentarily overloaded: worth one bounded retry,
+    // honouring Retry-After when the endpoint sends one, capped so an
+    // adversarial or misconfigured header can't stall the run for minutes.
+    if (RETRYABLE_STATUS.has(response.status) && attempt < maxAttempts) {
+      const delayMs = Math.min(
+        parseRetryAfterMs(response) ?? DEFAULT_RETRY_DELAY_MS,
+        MAX_RETRY_DELAY_MS,
+      );
+      await response.body?.cancel().catch(() => {});
+      await abortableDelay(delayMs, signal);
+      if (signal.aborted) {
+        throw new Error(
+          "CANCELLED: request was cancelled while waiting to retry after " +
+            `a HTTP ${response.status} response`,
+        );
+      }
+      continue;
+    }
+    break;
+  }
+
+  // The loop always assigns `response` (it either returns, throws, or falls
+  // through with a response) before reaching here.
+  return { response: response! };
+}
+
 interface ChatResult {
   ok: boolean;
   httpStatus: number;
@@ -444,63 +530,22 @@ async function chatCompletion(
     latencyMs: 0,
   };
 
-  const maxAttempts = 2;
-  let response: Response | undefined;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      response = await fetch(`${base}/chat/completions`, {
-        redirect: "error",
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
-      });
-    } catch (e) {
-      const c = classifyFetchError(e, signal);
-      result.latencyMs = Math.round(performance.now() - started);
-      if (c.kind === "cancelled") {
-        // Not an observation about the endpoint -- the caller pulled the
-        // plug. Thrown (same distinction as the UNAUTHORIZED branch below)
-        // so a cancelled run does not persist a "timeout" or "unreachable"
-        // finding that never actually happened.
-        throw new Error(`CANCELLED: ${c.message}`);
-      }
-      result.errorKind = c.kind;
-      result.error = c.message;
-      return result;
-    }
-
-    // Rate-limited or momentarily overloaded: worth one bounded retry,
-    // honouring Retry-After when the endpoint sends one, capped so an
-    // adversarial or misconfigured header can't stall the run for minutes.
-    if (RETRYABLE_STATUS.has(response.status) && attempt < maxAttempts) {
-      const delayMs = Math.min(
-        parseRetryAfterMs(response) ?? DEFAULT_RETRY_DELAY_MS,
-        MAX_RETRY_DELAY_MS,
-      );
-      await response.body?.cancel().catch(() => {});
-      await abortableDelay(delayMs, signal);
-      if (signal.aborted) {
-        throw new Error(
-          "CANCELLED: request was cancelled while waiting to retry after " +
-            `a HTTP ${response.status} response`,
-        );
-      }
-      continue;
-    }
-    break;
+  const outcome = await postWithRetry(
+    `${base}/chat/completions`,
+    token,
+    body,
+    timeoutMs,
+    signal,
+  );
+  result.latencyMs = Math.round(performance.now() - started);
+  if (outcome.failed) {
+    result.errorKind = outcome.failed.kind;
+    result.error = outcome.failed.message;
+    return result;
   }
 
-  // The loop always assigns `response` (it either returns, throws, or falls
-  // through with a response) before reaching here.
-  const finalResponse = response!;
+  const finalResponse = outcome.response;
   result.httpStatus = finalResponse.status;
-  result.latencyMs = Math.round(performance.now() - started);
 
   if (!finalResponse.ok) {
     const bodyText = await finalResponse.text().catch(() => "");
@@ -646,29 +691,21 @@ async function embedding(
   let error = "";
 
   const started = performance.now();
-  let response: Response | undefined;
-  try {
-    response = await fetch(`${base}/embeddings`, {
-      redirect: "error",
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${g.apiToken}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({ model: a.model, input: a.input }),
-      signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(timeoutMs)]),
-    });
-  } catch (e) {
-    const c = classifyFetchError(e, ctx.signal);
-    // Cancellation is the caller pulling the plug, not an endpoint
-    // observation -- thrown rather than folded into errorKind so it isn't
-    // stored as a "timeout" or "unreachable" finding that never happened.
-    if (c.kind === "cancelled") {
-      throw new Error(`CANCELLED: ${c.message}`);
-    }
-    errorKind = c.kind;
-    error = c.message;
+  // Same bounded 429/503 retry the completion probe gets. Cancellation is the
+  // caller pulling the plug, not an endpoint observation, so postWithRetry
+  // throws it rather than folding it into errorKind where it would be stored
+  // as a "timeout" or "unreachable" finding that never happened.
+  const outcome = await postWithRetry(
+    `${base}/embeddings`,
+    g.apiToken,
+    { model: a.model, input: a.input },
+    timeoutMs,
+    ctx.signal,
+  );
+  const response = outcome.response;
+  if (outcome.failed) {
+    errorKind = outcome.failed.kind;
+    error = outcome.failed.message;
   }
 
   if (response) {
@@ -733,7 +770,25 @@ async function embedding(
       // probe exists to catch: chat still works, but no embedding model is
       // loaded. Re-labelled so that failure mode is nameable rather than a
       // bare "http_error".
-      if (c.kind === "http_error") {
+      //
+      // But ONLY for a status that actually means "this endpoint refused the
+      // request it understood". The relabel used to swallow every non-2xx,
+      // including 429 and every 5xx, so a gateway rate-limiting the probe --
+      // or LM Studio returning 503 while it swapped models -- was stored for
+      // ever (lifetime: "infinite") as proof the endpoint serves no
+      // embeddings. That is a transient condition recorded as a permanent
+      // capability finding: precisely the misdiagnosis this module exists to
+      // prevent, and it survived the retry above because a persistent 429 is
+      // still a 429. Rate limiting and server faults now keep their own kinds.
+      if (c.kind === "http_error" && response.status === 429) {
+        errorKind = "rate_limited";
+        error = `endpoint is rate limiting this probe, so embedding support ` +
+          `is unmeasured: ${c.message}`;
+      } else if (c.kind === "http_error" && response.status >= 500) {
+        errorKind = "server_error";
+        error = `endpoint failed while serving the request, so embedding ` +
+          `support is unmeasured: ${c.message}`;
+      } else if (c.kind === "http_error") {
         errorKind = "no_embedding_capability";
         error = `endpoint likely has no embedding model loaded: ${c.message}`;
       } else {
@@ -1073,10 +1128,13 @@ export const model = {
       description:
         "Measured (never assumed) embedding vector dimension for one " +
         "model, plus whether the endpoint serves embeddings at all. A " +
-        "generic error on this endpoint while chat still works is " +
+        "generic 4xx on this endpoint while chat still works is " +
         "labelled no_embedding_capability rather than a bare http_error, " +
         "and a malformed 2xx body is labelled malformed_response rather " +
-        "than scored as a zero-length vector.",
+        "than scored as a zero-length vector. A 429 or a 5xx keeps its own " +
+        "kind (rate_limited / server_error) and survives one bounded retry " +
+        "first -- a transient refusal is not evidence the endpoint serves " +
+        "no embeddings.",
       schema: EmbeddingProbeSchema,
       lifetime: "infinite" as const,
       garbageCollection: 20,
@@ -1116,7 +1174,10 @@ export const model = {
         "A 401/403 throws a distinct UNAUTHORIZED error rather than being " +
         "written as data -- a bad token is a configuration fault, not a " +
         "measurement of the endpoint. Caller cancellation throws too, " +
-        "rather than being recorded as a timeout.",
+        "rather than being recorded as a timeout. 429/503 responses get one " +
+        "bounded, Retry-After-aware retry, and a rate limit or server fault " +
+        "that survives it is recorded as such rather than as a missing " +
+        "embedding capability.",
       arguments: EmbeddingArgsSchema,
       execute: embedding,
     },
