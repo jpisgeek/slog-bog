@@ -190,11 +190,14 @@ footnote to it. This is deliberate — IDs that cannot be read are IDs nobody ca
 operate on — but it means the ID namespace is part of the inventory exposure
 described below, not a way around it.
 
-**What mutates, and what stops it.** `start` and `stop` change run state;
-`stop --force` cuts power and risks the guest filesystem exactly as pulling the
-plug would, and says so when used. `checkpoint` and `removeCheckpoint` add and
-drop restore points. Two methods can destroy work that cannot be recovered, and
-both require an explicit acknowledgement that repeats the target's name:
+**What mutates, and what stops it.** `start` and `stop` change run state. The
+default stop is genuinely graceful — it asks the guest to shut down and passes
+no force flag of any kind, so a guest that will not cooperate leaves the VM
+running rather than losing its unsaved work. `stop --force` cuts power and risks
+the guest filesystem exactly as pulling the plug would, and says so when used.
+`checkpoint` and `removeCheckpoint` add and drop restore points. Two methods can
+destroy work that cannot be recovered, and both require an explicit
+acknowledgement that repeats the target's name:
 
 - `delete` removes the machine and its checkpoints, and needs `confirmName` to
   equal `vmName` exactly. `deleteDisks` is off by default, because Hyper-V's own

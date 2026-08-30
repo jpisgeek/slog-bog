@@ -1247,3 +1247,40 @@ Deno.test("a pass-through disk is skipped, not treated as a broken chain", async
   );
   assertStringIncludes(src, "if (-not $p) { continue }");
 });
+
+// --- security review round 19 --------------------------------------------
+
+Deno.test("a graceful stop passes no force flag at all", async () => {
+  // The default branch used to emit -Force anyway. Microsoft documents
+  // Stop-VM -Force as forcing shutdown after five minutes, or immediately
+  // when the guest is locked -- so the documented "graceful by default"
+  // was quietly the dangerous option.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  assertStringIncludes(
+    src,
+    'Stop-VM -VM $vm${args.force ? " -TurnOff -Force" : ""}',
+  );
+  // The forced form must remain reachable only behind the flag.
+  assertStringIncludes(src, "-TurnOff -Force");
+});
+
+Deno.test("no bare Test-Path survives after the point of no return", async () => {
+  // Test-Path THROWS under $ErrorActionPreference=Stop on an unreadable or
+  // disconnected path. Both calls run after Remove-VM, so an uncaught one
+  // aborts with the VM destroyed and no envelope returned.
+  const src = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  const removal = src.indexOf("Remove-VM -VM $vm -Force");
+  assertEquals(removal > 0, true);
+  const after = src.slice(removal);
+  // Every Test-Path after the removal must sit inside a try. Comment lines
+  // are skipped -- the point is what executes, not what is described.
+  for (const line of after.split("\n")) {
+    if (!line.includes("Test-Path")) continue;
+    if (line.trim().startsWith("#")) continue;
+    assertStringIncludes(line, "try");
+  }
+});

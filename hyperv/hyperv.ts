@@ -254,6 +254,11 @@ export const VmNameArgs = z.object({
  */
 export const StopArgsSchema = z.object({
   vmName: SafeName,
+  // The default branch used to pass -Force anyway, which is not the graceful
+  // stop the README promised: Microsoft documents Stop-VM -Force as forcing
+  // the shutdown after five minutes, or immediately if the guest is locked,
+  // with the unsaved-data loss that implies. A default that quietly does the
+  // dangerous thing is worse than no default.
   force: z.boolean().default(false).describe(
     "Cut power instead of asking the guest to shut down. A graceful stop " +
       "needs the Shutdown integration service responding; force does not, " +
@@ -1425,7 +1430,7 @@ async function stop(args: z.infer<typeof StopArgsSchema>, ctx: Ctx) {
   await runPowerShell(
     g,
     `${resolveOneVm(args.vmName)}
-Stop-VM -VM $vm${args.force ? " -TurnOff -Force" : " -Force"}`,
+Stop-VM -VM $vm${args.force ? " -TurnOff -Force" : ""}`,
     ctx.signal,
   );
   const after = await vmState(g, args.vmName, ctx.signal);
@@ -1797,7 +1802,14 @@ for ($i = 0; $i -lt $disks.Count; $i++) {
   if ($blocked) {
     $ok = $false
   } else {
-    if (-not (Test-Path -LiteralPath $d)) {
+    # Test-Path can THROW under $ErrorActionPreference='Stop' -- an unreadable
+    # or disconnected path is an error, not a false. Both calls in this loop
+    # run after Remove-VM, so an uncaught one aborts the script with the VM
+    # already destroyed and no envelope returned, which is exactly what the
+    # comment above swore this loop would never do.
+    $present = $true
+    try { $present = [bool](Test-Path -LiteralPath $d) } catch { $present = $true }
+    if (-not $present) {
       # Already gone, and that is the outcome this method wanted. Hyper-V's
       # own cleanup removes automatic differencing disks when the VM and its
       # checkpoints go, so by the time this loop runs some files legitimately
@@ -1807,8 +1819,9 @@ for ($i = 0; $i -lt $disks.Count; $i++) {
     } else {
       try { Remove-Item -LiteralPath $d -Force -ErrorAction Stop; $ok = $true } catch { $ok = $false }
       # Verify absence rather than trusting the call. Note this can only turn
-      # a claimed success into a failure, never the reverse.
-      if (Test-Path -LiteralPath $d) { $ok = $false }
+      # a claimed success into a failure, never the reverse -- and it is
+      # wrapped for the same reason as the check above.
+      try { if (Test-Path -LiteralPath $d) { $ok = $false } } catch { $ok = $false }
     }
   }
   $results += [pscustomobject]@{ index = $i; removed = $ok }
