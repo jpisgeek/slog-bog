@@ -13,9 +13,18 @@ const GlobalArgsSchema = z.object({
   ),
   timeoutMs: z.number().int().positive().default(15_000),
 });
+// RFC 3339 permits both "…Z" and a numeric offset ("…+02:00"). zod's
+// z.iso.datetime() without { offset: true } accepts ONLY the Z spelling, so a
+// caller passing a legal offset-form window used to get a raw ZodError out of a
+// schema whose own description promised RFC 3339. Accept both spellings here
+// and canonicalize to Z in collect() so the stored snapshot has one shape.
 const CollectArgsSchema = z.object({
-  startingAt: z.iso.datetime().describe("Inclusive RFC 3339 coverage start"),
-  endingAt: z.iso.datetime().describe("Exclusive RFC 3339 coverage end"),
+  startingAt: z.iso.datetime({ offset: true }).describe(
+    "Inclusive RFC 3339 coverage start",
+  ),
+  endingAt: z.iso.datetime({ offset: true }).describe(
+    "Exclusive RFC 3339 coverage end",
+  ),
 });
 const ErrorKindSchema = z.enum([
   "",
@@ -49,7 +58,13 @@ const CostRowSchema = z.object({
   model: z.string().nullable(),
   workspaceId: z.string().nullable(),
   description: z.string().nullable(),
-  amountMinor: z.string().regex(/^\d+(\.\d+)?$/),
+  // Named `amount`, not `amountMinor`: the Cost Report returns a decimal string
+  // in the currency's MAJOR unit ("1.25" is 1.25 USD). The old name claimed
+  // minor units but no code path ever scaled anything, and this repo's other
+  // extensions really do use minor units (subscription-metadata carries
+  // priceMinor "2500" for a 25.00 plan), so a consumer that trusted the name
+  // and divided by 100 underreported spend by 100x. See costRows().
+  amount: z.string().regex(/^\d+(\.\d+)?$/),
   currency: z.string().regex(/^[A-Z]{3}$/),
 });
 const SnapshotSchema = z.object({
@@ -72,10 +87,10 @@ const SnapshotSchema = z.object({
     groupedTop100Cap: z.boolean(),
   }).nullable(),
   costs: z.object({
-    totalsMinor: z.array(
+    totals: z.array(
       z.object({
         currency: z.string().regex(/^[A-Z]{3}$/),
-        amountMinor: z.string().regex(/^\d+(\.\d+)?$/),
+        amount: z.string().regex(/^\d+(\.\d+)?$/),
       }),
     ),
     breakdowns: z.array(CostRowSchema),
@@ -128,6 +143,38 @@ interface Pages {
   status: Status;
   refreshedAt: string | null;
 }
+/**
+ * Ceilings on one readPages() walk.
+ *
+ * timeoutMs bounds a single HTTP request and its AbortSignal is rebuilt on
+ * every iteration, so it never bounded the walk as a whole — an operator who
+ * set timeoutMs: 15000 could still be inside one collect() call hours later.
+ * The only termination guard used to be the repeated-cursor Set, which stops a
+ * paginator that loops but not one that keeps minting fresh cursors. These two
+ * ceilings make the loop terminate on its own and report what it did read as
+ * partial, rather than accumulating pages in memory without bound.
+ */
+const MAX_PAGES = 500;
+const MAX_ELAPSED_MS = 300_000;
+/**
+ * RFC 3339 shape, both spellings of the zone. See the CollectArgsSchema note:
+ * the snapshot stores z.iso.datetime(), which is Z-only.
+ */
+const RFC3339 =
+  /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/;
+/**
+ * data_refreshed_at used to be copied into the snapshot on nothing more than
+ * `typeof === "string"`. Anthropic documents it as RFC 3339, which permits
+ * "2026-08-29T10:00:00+00:00" — a value SnapshotSchema rejects — so a legal
+ * offset-form timestamp threw a ZodError at the very end of a wholly successful
+ * two-endpoint collection and nothing was written at all. Canonicalize to UTC
+ * (same instant, Z spelling) and drop anything that is not a timestamp.
+ */
+function timestamp(value: unknown): string | null {
+  if (typeof value !== "string" || !RFC3339.test(value)) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
 async function readPages(
   g: Globals,
   path: string,
@@ -138,7 +185,23 @@ async function readPages(
   const cursors = new Set<string>();
   let page: string | null = null;
   let refreshedAt: string | null = null;
+  const startedAt = Date.now();
   while (true) {
+    if (pages.length >= MAX_PAGES || Date.now() - startedAt >= MAX_ELAPSED_MS) {
+      const capped = pages.length >= MAX_PAGES;
+      return {
+        pages,
+        refreshedAt,
+        status: {
+          state: pages.length ? "partial" : "unavailable",
+          pagesRead: pages.length,
+          errorKind: capped ? "" : "timeout",
+          message: capped
+            ? `Stopped after ${MAX_PAGES} pages while Anthropic still reported more results`
+            : message("timeout"),
+        },
+      };
+    }
     const query = new URLSearchParams(params);
     if (page) query.set("page", page);
     const timeout = AbortSignal.timeout(g.timeoutMs);
@@ -189,9 +252,8 @@ async function readPages(
       }
       const object = body as Record<string, unknown>;
       pages.push(object);
-      if (typeof object.data_refreshed_at === "string") {
-        refreshedAt = object.data_refreshed_at;
-      }
+      const refreshed = timestamp(object.data_refreshed_at);
+      if (refreshed) refreshedAt = refreshed;
       if (object.has_more !== true) {
         return {
           pages,
@@ -266,6 +328,39 @@ function integer(value: unknown): number | null {
     ? value
     : null;
 }
+/**
+ * An absent cache sub-field means "no cache activity in this grouping", which
+ * is 0. A present but wrong-typed one is still rejected — this tolerates
+ * absence, it does not let a malformed dimension become a reassuring zero.
+ */
+function optionalInteger(value: unknown): number | null {
+  return value === undefined ? 0 : integer(value);
+}
+/**
+ * Anthropic's grouped reports return at most 100 groups per time bucket, so a
+ * bucket that comes back exactly full is the only evidence available that
+ * groups were dropped. groupedTop100Cap used to be `accountKind === "enterprise"`
+ * — true for every Enterprise snapshot regardless of the response — which made
+ * the dashboard mark every Enterprise section partial, downgrade every metric
+ * to unknown confidence, and raise a standing warning exception on a complete
+ * two-group result. A warning that is always on teaches operators to ignore it.
+ *
+ * Kept Enterprise-only at the call site: the top-100 cap is what Anthropic
+ * documents for the Analytics grouped reports, and inventing the same claim for
+ * Platform would be guessing.
+ */
+const GROUP_CAP = 100;
+function bucketAtCap(pages: Record<string, unknown>[]): boolean {
+  for (const page of pages) {
+    if (!Array.isArray(page.data)) continue;
+    for (const bucket of page.data) {
+      if (!bucket || typeof bucket !== "object") continue;
+      const results = (bucket as Record<string, unknown>).results;
+      if (Array.isArray(results) && results.length >= GROUP_CAP) return true;
+    }
+  }
+  return false;
+}
 function usageRows(
   pages: Record<string, unknown>[],
   enterprise: boolean,
@@ -274,13 +369,23 @@ function usageRows(
   const items = records(pages);
   if (!items) return null;
   for (const item of items) {
-    const cache = item.cache_creation && typeof item.cache_creation === "object"
-      ? item.cache_creation as Record<string, unknown>
-      : {};
+    // The old `: {}` fallback looked like it tolerated a missing cache_creation
+    // object but was self-defeating: integer(undefined) returned null, and one
+    // such row anywhere in the paged result nulled usage for the whole window
+    // and reported "Anthropic returned an invalid response". A grouping with no
+    // 1-hour-cache activity may legitimately omit the sub-field rather than
+    // send 0. Absence is now genuinely 0; a present-but-wrong-typed
+    // cache_creation, or sub-field, still rejects the whole window.
+    if (
+      item.cache_creation !== undefined && item.cache_creation !== null &&
+      (typeof item.cache_creation !== "object" ||
+        Array.isArray(item.cache_creation))
+    ) return null;
+    const cache = (item.cache_creation ?? {}) as Record<string, unknown>;
     const values = [
       integer(item.uncached_input_tokens),
-      integer(cache.ephemeral_5m_input_tokens),
-      integer(cache.ephemeral_1h_input_tokens),
+      optionalInteger(cache.ephemeral_5m_input_tokens),
+      optionalInteger(cache.ephemeral_1h_input_tokens),
       integer(item.cache_read_input_tokens),
       integer(item.output_tokens),
     ];
@@ -326,9 +431,10 @@ function addDecimal(a: string, b: string): string {
   );
   return fraction ? `${whole}.${fraction}` : whole.toString();
 }
+// No `enterprise` parameter any more: cost amounts are read and stored
+// identically for both account kinds. See the amount comment below.
 function costRows(
   pages: Record<string, unknown>[],
-  enterprise: boolean,
 ): CostRow[] | null {
   const rows: CostRow[] = [];
   const items = records(pages);
@@ -348,7 +454,14 @@ function costRows(
       description: typeof item.description === "string"
         ? item.description
         : null,
-      amountMinor: enterprise ? amount : addDecimal("0", amount),
+      // One spelling for both account kinds. The old ternary
+      // (`enterprise ? amount : addDecimal("0", amount)`) performed no unit
+      // conversion in either branch — it only chose whether to normalize the
+      // string — so the same value was stored differently depending on account
+      // kind, and "125.00" survived in an Enterprise breakdown next to a "125"
+      // total. Normalize both so breakdowns compare equal to the totals that
+      // addDecimal produces downstream.
+      amount: addDecimal("0", amount),
       currency,
     });
   }
@@ -394,7 +507,7 @@ async function collect(args: z.infer<typeof CollectArgsSchema>, ctx: Context) {
     readPages(g, `${prefix}/cost_report`, costParams, ctx.signal),
   ]);
   const usage = usageRows(usageResult.pages, enterprise);
-  const costs = costRows(costResult.pages, enterprise);
+  const costs = costRows(costResult.pages);
   if (usage === null) {
     usageResult.status = {
       state: usageResult.pages.length ? "partial" : "unavailable",
@@ -415,17 +528,22 @@ async function collect(args: z.infer<typeof CollectArgsSchema>, ctx: Context) {
   for (const row of costs ?? []) {
     totals.set(
       row.currency,
-      addDecimal(totals.get(row.currency) ?? "0", row.amountMinor),
+      addDecimal(totals.get(row.currency) ?? "0", row.amount),
     );
   }
   const sum = (key: keyof UsageRow) =>
     (usage ?? []).reduce((n, row) => n + (row[key] as number), 0);
-  const snapshot = SnapshotSchema.parse({
+  // The window may arrive in either RFC 3339 spelling (see CollectArgsSchema);
+  // the snapshot stores the canonical Z form so consumers see one shape and the
+  // strict z.iso.datetime() fields below cannot reject our own input.
+  const coverageStart = new Date(input.startingAt).toISOString();
+  const coverageEnd = new Date(input.endingAt).toISOString();
+  const candidate = {
     provider: "anthropic",
     accountKind: g.accountKind,
     collectedAt: new Date().toISOString(),
-    coverageStart: input.startingAt,
-    coverageEnd: input.endingAt,
+    coverageStart,
+    coverageEnd,
     dataRefreshedAt: usageResult.refreshedAt ?? costResult.refreshedAt,
     usageStatus: usageResult.status,
     costStatus: costResult.status,
@@ -440,20 +558,52 @@ async function collect(args: z.infer<typeof CollectArgsSchema>, ctx: Context) {
         outputTokens: sum("outputTokens"),
         requests: enterprise ? sum("requests") : null,
         breakdowns: usage,
-        groupedTop100Cap: enterprise,
+        groupedTop100Cap: enterprise && bucketAtCap(usageResult.pages),
       },
     costs: costs === null || costResult.status.state === "unavailable" ||
         costResult.status.state === "unsupported"
       ? null
       : {
-        totalsMinor: [...totals].map(([currency, amountMinor]) => ({
+        totals: [...totals].map(([currency, amount]) => ({
           currency,
-          amountMinor,
+          amount,
         })),
         breakdowns: costs,
-        groupedTop100Cap: enterprise,
+        groupedTop100Cap: enterprise && bucketAtCap(costResult.pages),
       },
-  });
+  };
+  // Everything above this line is fail-soft: an unusable response degrades to a
+  // status and usage/costs go null, never to a reassuring zero. This parse was
+  // the single fail-hard step. A late schema violation — a token count above
+  // Number.MAX_SAFE_INTEGER, which integer() accepts but z.number().int()
+  // rejects, or a per-row sum that crosses it — threw an uncaught ZodError
+  // after both paginated fetches had already succeeded, and nothing at all was
+  // written. Degrade to the same invalid-response shape the rest of collect()
+  // uses so the operator gets a snapshot that says so.
+  let snapshot: z.infer<typeof SnapshotSchema>;
+  const parsed = SnapshotSchema.safeParse(candidate);
+  if (parsed.success) {
+    snapshot = parsed.data;
+  } else {
+    const degrade = (result: Pages): Status => ({
+      state: result.pages.length ? "partial" : "unavailable",
+      pagesRead: result.pages.length,
+      errorKind: "invalid-response",
+      message: message("invalid-response"),
+    });
+    snapshot = SnapshotSchema.parse({
+      provider: "anthropic",
+      accountKind: g.accountKind,
+      collectedAt: new Date().toISOString(),
+      coverageStart,
+      coverageEnd,
+      dataRefreshedAt: null,
+      usageStatus: degrade(usageResult),
+      costStatus: degrade(costResult),
+      usage: null,
+      costs: null,
+    });
+  }
   const handle = await ctx.writeResource(
     "snapshot",
     "organization-usage",

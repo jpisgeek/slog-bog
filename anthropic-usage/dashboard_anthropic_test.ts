@@ -28,7 +28,7 @@ function snapshot(overrides: Json = {}): Json {
       groupedTop100Cap: false,
     },
     costs: {
-      totalsMinor: [{ currency: "USD", amountMinor: "1.25" }],
+      totals: [{ currency: "USD", amount: "1.25" }],
       breakdowns: [{}],
       groupedTop100Cap: false,
     },
@@ -76,29 +76,72 @@ Deno.test("platform request count is unsupported without harming exact tokens", 
     5,
   );
 });
-Deno.test("enterprise grouped cap forces partial coverage", async () => {
+const enterpriseUsage = (groupedTop100Cap: boolean) => ({
+  uncachedInputTokens: 10,
+  cacheCreation5mTokens: 0,
+  cacheCreation1hTokens: 0,
+  cacheReadTokens: 0,
+  outputTokens: 5,
+  requests: 2,
+  breakdowns: [{}],
+  groupedTop100Cap,
+});
+const enterpriseCosts = (groupedTop100Cap: boolean) => ({
+  totals: [{ currency: "USD", amount: "125" }],
+  breakdowns: [{}],
+  groupedTop100Cap,
+});
+Deno.test("an observed grouped cap forces partial coverage", async () => {
   const bundle = await normalize(context(snapshot({
     accountKind: "enterprise",
-    usage: {
-      uncachedInputTokens: 10,
-      cacheCreation5mTokens: 0,
-      cacheCreation1hTokens: 0,
-      cacheReadTokens: 0,
-      outputTokens: 5,
-      requests: 2,
-      breakdowns: [{}],
-      groupedTop100Cap: true,
-    },
-    costs: {
-      totalsMinor: [{ currency: "USD", amountMinor: "125" }],
-      breakdowns: [{}],
-      groupedTop100Cap: true,
-    },
+    usage: enterpriseUsage(true),
+    costs: enterpriseCosts(true),
   })));
   assertEquals(bundle.state, "partial");
   assertEquals(
     bundle.sections.every((s) => s.completeness.state === "partial"),
     true,
+  );
+  assertEquals(
+    (bundle.extensions["jpisgeek/anthropic-usage"] as Json)
+      .groupedEnterpriseTop100Cap,
+    true,
+  );
+});
+// The collector used to set groupedTop100Cap from accountKind alone, so a
+// complete Enterprise result arrived here flagged as truncated and the
+// dashboard degraded it to partial with a standing warning exception. A cap
+// flag that is always on for Enterprise trains operators to ignore the warning.
+Deno.test("a complete enterprise result stays healthy and raises no cap warning", async () => {
+  const bundle = await normalize(context(snapshot({
+    accountKind: "enterprise",
+    usage: enterpriseUsage(false),
+    costs: enterpriseCosts(false),
+  })));
+  assertEquals(bundle.state, "healthy");
+  assertEquals(
+    bundle.sections.every((s) => s.completeness.state === "exact"),
+    true,
+  );
+  assertEquals(bundle.sections.every((s) => s.exceptions.length === 0), true);
+  assertEquals(
+    bundle.sections.every((s) => s.coverage.kind === "exact"),
+    true,
+  );
+  assertEquals(
+    (bundle.extensions["jpisgeek/anthropic-usage"] as Json)
+      .groupedEnterpriseTop100Cap,
+    false,
+  );
+});
+// The value is a major-unit decimal; the summary used to append "minor units",
+// inviting a consumer to divide by 100 against an unscaled number.
+Deno.test("cost summary states the currency without claiming minor units", async () => {
+  const bundle = await normalize(context(snapshot()));
+  assertEquals(bundle.sections[1].summary, "1.25 USD");
+  assertEquals(
+    bundle.sections[1].metrics.find((m) => m.id === "cost-usd")?.value,
+    1.25,
   );
 });
 Deno.test("authorization and unsupported capabilities remain distinct", async () => {
@@ -138,7 +181,7 @@ Deno.test("missing cost currency is unknown rather than zero", async () => {
   const bundle = await normalize(
     context(
       snapshot({
-        costs: { totalsMinor: [], breakdowns: [], groupedTop100Cap: false },
+        costs: { totals: [], breakdowns: [], groupedTop100Cap: false },
       }),
     ),
   );
