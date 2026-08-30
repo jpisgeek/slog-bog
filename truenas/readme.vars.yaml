@@ -21,11 +21,27 @@ caveats: >-
   Certificate expiry is computed independently of TrueNAS's own alert state.
   A `CertificateIsExpiring` alert dismissed in the UI is still reported, with
   `silenced: true`. Dismissing an alert does not renew a certificate, we
-  checked. `expiryKnown` must be checked before `daysRemaining` (a CSR has no
-  expiry). Verified against SCALE 25.10. `auth.login_with_api_key` is
-  scheduled for removal in TrueNAS 27 and the model warns when it connects to
-  a host that new. If a scheduled run fails to connect while the same call
+  checked. Four fields say whether a number is real before you gate on it:
+  `expiryKnown` on a certificate (a CSR has no expiry), `capacityKnown` on a
+  pool, `sizeKnown` on a disk, and `metricsKnown` on `system` for
+  cores/memory/uptime. When one of those is false the numbers it covers are
+  `-1`, never `0`, because `0` is a value TrueNAS legitimately reports for all
+  of them and a capacity gate reading `usedPercent: 0` would call an unknown
+  pool empty. `summary.poolsCapacityUnknown` surfaces the same thing for a
+  workflow that only reads the roll-up. `baseUrl` may carry a host, port and
+  path (a reverse-proxied subpath works) but not a query string or fragment;
+  the `wss://` URL is rebuilt from its parts. Verified against SCALE 25.10.
+  `auth.login_with_api_key` is scheduled for removal in TrueNAS 27: a
+  successful connect to a host that new logs a warning, and a failed
+  authentication says so in the error, which is where you actually hit it if
+  the call is gone. If a scheduled run fails to connect while the same call
   works from a shell on the same Mac, suspect macOS Local Network privacy.
+  Instance names are `<prefix>-<slug of the identity fields, ≤48 chars>-<8 hex
+  digits of FNV-1a over the raw identity>`, with fixed names `system` and
+  `summary`. Certificates use the prefix `cert-` even though the resource kind
+  is `certificate`: the name is the record's identity in the datastore, so
+  renaming the prefix would prune and recreate every stored certificate and
+  lose its history, which is not worth a tidier spelling.
   A run in which TrueNAS reports zero pools (or zero disks) does not prune the
   existing `pool`/`disk` records, because that is what a pool still importing
   after a reboot looks like; the run logs a warning instead. Records for an
@@ -35,8 +51,17 @@ caveats: >-
   on absence as before — a resolved alert must go.
 security: >-
   The API key is marked sensitive, sent once over the authenticated WebSocket,
-  and never logged. `baseUrl` must be `https://` (→ `wss://`) and must not
-  embed userinfo. `allowInsecureHttp: true` permits `http://` → `ws://` with
-  the key in cleartext. Off by default, for trusted loopback/VPN paths only.
-  Written data: hostname, version, pool names and health, disk models and
-  serial numbers, alert text, certificate names and CNs.
+  and never logged. `baseUrl` must be `https://` (→ `wss://`), must not embed
+  userinfo, and must not carry a query string or fragment (both would be
+  copied into the connection log and every connection error). Remote text that
+  reaches an error or a log line is truncated to a bounded preview rather than
+  pasted in whole. `allowInsecureHttp: true` permits `http://` → `ws://` with
+  the key in cleartext on every call, so anyone on the path captures a live
+  TrueNAS API key. It is off by default and exists for a trusted loopback or
+  VPN path where TLS genuinely cannot be terminated on the NAS; leave it off
+  unless that describes you. Written data: hostname, version, pool names and
+  health, disk models and serial numbers, certificate names and CNs (which
+  commonly reveal internal DNS names), and full alert text. Alert text is
+  free-form prose written by TrueNAS and routinely embeds IP addresses,
+  usernames from failed-login alerts, share and dataset paths, and disk serial
+  numbers. Anywhere these resources are read is somewhere that data goes.

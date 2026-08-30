@@ -88,6 +88,17 @@ const respondWith =
   (over: Record<string, unknown>): Responder => (method, params) =>
     method in over ? over[method] : healthyResponder(method, params);
 
+/**
+ * Marker a responder returns to make the fake answer with a JSON-RPC *error*
+ * frame rather than a result. Without this the suite could only reach the
+ * `result` branch of `onmessage`, and the two behaviours that live on the
+ * error branch — the TrueNAS 27 hint on a failed auth, and the bound on a
+ * remote error message — would have no way to be exercised at all.
+ */
+const rpcError = (code: number, message: string) => ({
+  __rpcError: { code, message },
+});
+
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   static responder: Responder = healthyResponder;
@@ -114,9 +125,17 @@ class FakeWebSocket {
       params: unknown[];
     };
     const result = FakeWebSocket.responder(msg.method, msg.params);
+    const err = result && typeof result === "object"
+      ? (result as { __rpcError?: { code: number; message: string } })
+        .__rpcError
+      : undefined;
     queueMicrotask(() =>
       this.onmessage?.({
-        data: JSON.stringify({ jsonrpc: "2.0", id: msg.id, result }),
+        data: JSON.stringify(
+          err
+            ? { jsonrpc: "2.0", id: msg.id, error: err }
+            : { jsonrpc: "2.0", id: msg.id, result },
+        ),
       })
     );
   }
@@ -289,6 +308,10 @@ Deno.test("summary schema: counts every category the dashboard gates on", () => 
     version: "25.10",
     pools: 1,
     poolsUnhealthy: 0,
+    // Rewritten, not deleted: this test asserted the pre-fix roll-up, which
+    // had no way to say "capacity is unknown on N pools". A workflow gating on
+    // the summary alone could not distinguish that from "capacity is fine".
+    poolsCapacityUnknown: 0,
     disks: 8,
     alerts: 0,
     alertsSilenced: 0,
@@ -299,6 +322,11 @@ Deno.test("summary schema: counts every category the dashboard gates on", () => 
     syncedAt: new Date(0).toISOString(),
   };
   assertEquals(model.resources.summary.schema.safeParse(summary).success, true);
+  const { poolsCapacityUnknown: _drop, ...without } = summary;
+  assertEquals(
+    model.resources.summary.schema.safeParse(without).success,
+    false,
+  );
 });
 
 Deno.test("discover is read-only: no method mutates TrueNAS", () => {
@@ -352,6 +380,10 @@ Deno.test("abort between connect and auth: the API key is never sent", async () 
     assertEquals(ws.sent.join("").includes(KEY), false);
     assertEquals(ws.sent, []);
     assertEquals(err !== null && err.message.includes("aborted"), true);
+    // The TrueNAS 27 hint is attached to auth failures, and a cancellation is
+    // not one. Pointing an operator at a deprecated login call when they hit
+    // Ctrl-C sends them to debug the wrong thing entirely.
+    assertEquals(err!.message.includes("auth.login_ex"), false);
   }, { autoOpen: false });
 });
 
@@ -495,4 +527,257 @@ Deno.test("alert.list without any identity field throws", async () => {
       }),
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// absent numerics — "TrueNAS did not say" must not read as "TrueNAS said zero"
+// ---------------------------------------------------------------------------
+
+Deno.test("pool without allocated/free: capacity reads unknown, not empty", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+    {
+      responder: respondWith({
+        "pool.query": [{
+          name: "tank",
+          id: 1,
+          status: "ONLINE",
+          healthy: true,
+          fragmentation: "3%",
+        }],
+      }),
+    },
+  );
+  const pool = rec.written.find((w) => w.type === "pool")!;
+  assertEquals(pool.data.capacityKnown, false);
+  // The property, not the spelling: a capacity gate must not be able to read
+  // this record as a pool with room. `usedPercent: 0` and `sizeBytes: 0` are
+  // exactly what an empty-but-healthy pool looks like, which is what the
+  // backfill produced for a pool whose fill level was in fact unreported.
+  assertEquals(pool.data.usedPercent === 0, false);
+  assertEquals(pool.data.sizeBytes === 0, false);
+  assertEquals((pool.data.usedPercent as number) < 0, true);
+  // ...and it is visible from the roll-up, for a workflow that only reads that.
+  const summary = rec.written.find((w) => w.type === "summary")!;
+  assertEquals(summary.data.poolsCapacityUnknown, 1);
+});
+
+Deno.test("pool with real capacity still computes usedPercent", async () => {
+  const rec = recorder();
+  await withFakeWs(() =>
+    model.methods.discover.execute({}, ctxFor(OK, { recorder: rec }))
+  );
+  // Guards against over-tightening: the healthy NAS reports allocated 50 /
+  // free 50, and that must still come through as a real 50%.
+  const pool = rec.written.find((w) => w.type === "pool")!;
+  assertEquals(pool.data.capacityKnown, true);
+  assertEquals(pool.data.sizeBytes, 100);
+  assertEquals(pool.data.usedPercent, 50);
+  const summary = rec.written.find((w) => w.type === "summary")!;
+  assertEquals(summary.data.poolsCapacityUnknown, 0);
+});
+
+Deno.test("system.info without cores/memory/uptime: absent uptime is not a fresh reboot", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+    {
+      responder: respondWith({
+        "system.info": { hostname: "nas", version: "25.10.6", model: "x86" },
+      }),
+    },
+  );
+  const sys = rec.written.find((w) => w.type === "system")!;
+  assertEquals(sys.data.metricsKnown, false);
+  // A "rebooted in the last five minutes" gate reads uptimeSeconds. The
+  // backfilled 0 made that gate fire on every run where TrueNAS simply left
+  // the field out.
+  assertEquals(sys.data.uptimeSeconds === 0, false);
+  assertEquals(sys.data.cores === 0, false);
+  assertEquals(sys.data.physmemBytes === 0, false);
+});
+
+Deno.test("disk without a size: sizeKnown false and sizeBytes is not zero", async () => {
+  const rec = recorder();
+  await withFakeWs(
+    () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
+    {
+      responder: respondWith({
+        "disk.query": [{
+          devname: "sda",
+          identifier: "{serial}ABC",
+          serial: "ABC",
+          model: "WD",
+          type: "HDD",
+          pool: "tank",
+        }],
+      }),
+    },
+  );
+  const disk = rec.written.find((w) => w.type === "disk")!;
+  assertEquals(disk.data.sizeKnown, false);
+  assertEquals(disk.data.sizeBytes === 0, false);
+});
+
+// ---------------------------------------------------------------------------
+// the TrueNAS 27 hint has to reach the path it was written for
+// ---------------------------------------------------------------------------
+
+Deno.test("auth rejection names the auth.login_with_api_key removal", async () => {
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(OK)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    { responder: respondWith({ "auth.login_with_api_key": false }) },
+  );
+  // The warning that used to carry this ran only after system.info, i.e. only
+  // once auth had already succeeded — so on the host it was written for it
+  // never printed. Assert it is reachable from the failure itself.
+  assertEquals(err !== null, true);
+  assertEquals(err!.message.includes("auth.login_ex"), true);
+  assertEquals(err!.message.includes("revoked"), true);
+});
+
+Deno.test("an RPC error on auth carries the removal hint alongside the remote message", async () => {
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(OK)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    {
+      responder: respondWith({
+        "auth.login_with_api_key": rpcError(-32601, "Method does not exist"),
+      }),
+    },
+  );
+  // This is what a 27 host actually does: the method is gone, so the failure
+  // arrives as an RPC error rather than a false result. Both halves must
+  // survive — the remote message says what happened, the hint says why.
+  assertEquals(err !== null, true);
+  assertEquals(err!.message.includes("Method does not exist"), true);
+  assertEquals(err!.message.includes("auth.login_ex"), true);
+});
+
+Deno.test("the hint is scoped to auth: a later RPC failure does not claim it", async () => {
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(OK)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    { responder: respondWith({ "pool.query": rpcError(11, "pool is busy") }) },
+  );
+  assertEquals(err !== null, true);
+  assertEquals(err!.message.includes("pool is busy"), true);
+  assertEquals(err!.message.includes("auth.login_ex"), false);
+});
+
+// ---------------------------------------------------------------------------
+// baseUrl -> wsUrl is built from the parsed URL, not pasted together
+// ---------------------------------------------------------------------------
+
+Deno.test("baseUrl: a query string is rejected before a socket opens", async () => {
+  await withFakeWs(async () => {
+    await assertRejects(
+      () =>
+        model.methods.discover.execute(
+          {},
+          ctxFor({ ...OK, baseUrl: "https://nas.example.com/?debug=1" }),
+        ),
+      Error,
+      "query string or fragment",
+    );
+    // Concatenation used to turn this into
+    // wss://nas.example.com/?debug=1/api/current — a URL that never reaches
+    // the endpoint and copies whatever the operator typed after the ? into
+    // the info log and every connection error on the way.
+    assertEquals(FakeWebSocket.instances.length, 0);
+  });
+});
+
+Deno.test("baseUrl: a fragment is rejected before a socket opens", async () => {
+  await withFakeWs(async () => {
+    await assertRejects(
+      () =>
+        model.methods.discover.execute(
+          {},
+          ctxFor({ ...OK, baseUrl: "https://nas.example.com/#frag" }),
+        ),
+      Error,
+      "query string or fragment",
+    );
+    assertEquals(FakeWebSocket.instances.length, 0);
+  });
+});
+
+Deno.test("the derived WebSocket URL addresses /api/current, port and subpath intact", async () => {
+  for (
+    const [baseUrl, expected] of [
+      ["https://nas.example.com", "wss://nas.example.com/api/current"],
+      ["https://nas.example.com/", "wss://nas.example.com/api/current"],
+      [
+        "https://nas.example.com:8443/truenas/",
+        "wss://nas.example.com:8443/truenas/api/current",
+      ],
+    ] as const
+  ) {
+    await withFakeWs(async () => {
+      await model.methods.discover.execute({}, ctxFor({ ...OK, baseUrl }));
+      // Rebuilding from the parsed URL must not lose the port or a
+      // reverse-proxied subpath, and must always land on /api/current.
+      assertEquals(FakeWebSocket.instances[0].url, expected);
+      assertEquals(
+        new URL(FakeWebSocket.instances[0].url).pathname.endsWith(
+          "/api/current",
+        ),
+        true,
+      );
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// remote text reaching an error message is bounded
+// ---------------------------------------------------------------------------
+
+Deno.test("a non-array result is previewed, not pasted whole into the error", async () => {
+  const huge = "x".repeat(5000);
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(OK)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    { responder: respondWith({ "pool.query": { detail: huge } }) },
+  );
+  assertEquals(err !== null, true);
+  // The whole payload used to be JSON.stringify'd into the message verbatim,
+  // so an unbounded amount of remote text went wherever the throw was logged.
+  assertEquals(err!.message.length < 500, true);
+  assertEquals(err!.message.includes(huge), false);
+  // Truncated, not redacted: the type and the leading text still identify it.
+  assertEquals(err!.message.includes("object"), true);
+  assertEquals(err!.message.includes("detail"), true);
+  assertEquals(err!.message.includes("truncated"), true);
+});
+
+Deno.test("an oversized RPC error message is bounded the same way", async () => {
+  const huge = "y".repeat(5000);
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(OK)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    { responder: respondWith({ "pool.query": rpcError(11, huge) }) },
+  );
+  // Same class, second instance: remote free text on the RPC error branch.
+  assertEquals(err !== null, true);
+  assertEquals(err!.message.length < 500, true);
+  assertEquals(err!.message.includes("truncated"), true);
+  assertEquals(err!.message.startsWith("TrueNAS RPC error 11:"), true);
 });

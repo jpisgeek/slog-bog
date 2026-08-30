@@ -36,7 +36,9 @@ const GlobalArgsSchema = z.object({
     .describe(
       "Base URL of the TrueNAS host, e.g. https://nas.example.com. Prefer " +
         "the DNS name over an IP so TLS verification actually succeeds. The " +
-        "WebSocket URL is derived from this (https -> wss, /api/current).",
+        "WebSocket URL is rebuilt from this (https -> wss, /api/current), so " +
+        "a host, port and path are fine but a query string or fragment is " +
+        "rejected.",
     ),
   apiKey: z
     .string()
@@ -62,12 +64,48 @@ const GlobalArgsSchema = z.object({
 });
 
 /**
+ * Bound a remote-supplied value before it is interpolated into an error
+ * message or a log line.
+ *
+ * Everything on the far side of this socket is remote text: RPC error
+ * messages, an unexpected result payload, whatever string a runtime puts on a
+ * WebSocket error event. The non-array guard below used to paste a whole
+ * `JSON.stringify(raw)` into the thrown error verbatim, which is unbounded and
+ * carries whatever hostnames, share paths or alert prose the payload happened
+ * to hold straight into swamp's logs.
+ *
+ * This truncates, it does not redact. The leading text is what makes a failure
+ * diagnosable and blanking it would hand an operator an error that says
+ * nothing. The defect being fixed is the *unbounded* part, not the presence of
+ * remote text.
+ */
+function preview(value: unknown, max = 200): string {
+  let s: string;
+  if (typeof value === "string") {
+    s = value;
+  } else {
+    try {
+      s = JSON.stringify(value) ?? String(value);
+    } catch {
+      // Circular or otherwise unserialisable: the type is still diagnostic.
+      s = `[unserialisable ${typeof value}]`;
+    }
+  }
+  return s.length <= max
+    ? s
+    : `${s.slice(0, max)}… (${s.length} chars, truncated)`;
+}
+
+/**
  * Runtime validation of baseUrl. Deliberately NOT an object-level zod
  * refinement: swamp calls .partial() on globalArguments, and zod 4 refuses
  * that on an object carrying refinements -- a superRefine here made every
  * discover() fail before it connected.
+ *
+ * Returns the parsed URL so the caller builds the WebSocket URL from its
+ * components instead of pasting strings onto the raw argument.
  */
-function assertBaseUrl(baseUrl: string, allowInsecureHttp: boolean): void {
+function assertBaseUrl(baseUrl: string, allowInsecureHttp: boolean): URL {
   if (!/^https?:\/\//i.test(baseUrl)) {
     throw new Error("baseUrl must start with http:// or https://");
   }
@@ -92,9 +130,45 @@ function assertBaseUrl(baseUrl: string, allowInsecureHttp: boolean): void {
         "allowInsecureHttp: true to override (not recommended).",
     );
   }
+  // A query string or fragment cannot mean anything to the JSON-RPC endpoint,
+  // and the wsUrl used to be built by concatenation onto the raw argument, so
+  // `https://nas.example.com/?debug=1` produced
+  // `wss://nas.example.com/?debug=1/api/current` -- a URL whose path is buried
+  // inside its query string. That never reaches /api/current, it fails with a
+  // connection error that does not say why, and whatever the operator typed
+  // there was logged at info and copied into every connection error along the
+  // way. Reject both; the caller rebuilds the URL from `u` below.
+  if (u.search !== "" || u.hash !== "") {
+    throw new Error(
+      "baseUrl must not carry a query string or fragment. It addresses the " +
+        "TrueNAS JSON-RPC endpoint at /api/current and nothing else; anything " +
+        "after ? or # corrupts the derived wss:// URL.",
+    );
+  }
+  return u;
 }
 
 const DiscoverArgsSchema = z.object({});
+
+/**
+ * Sentinel written in place of a numeric TrueNAS did not report.
+ *
+ * Every one of these fields used to be backfilled with `?? 0`, which is the
+ * certificate `daysRemaining` mistake wearing a different hat: 0 is a
+ * *legitimate* value for all of them. An empty pool really does have 0 bytes
+ * allocated; a box that just came up really does have near-0 uptime. So a CEL
+ * gate could not tell "TrueNAS did not say" from "TrueNAS said zero", and a
+ * pool whose `allocated`/`free` came back null was written sizeBytes: 0,
+ * usedPercent: 0 -- a capacity gate read that as plenty of room, on a pool it
+ * knew nothing about.
+ *
+ * -1 is impossible for every field it stands in for, so a consumer that never
+ * reads the companion `*Known` flag still sees an obviously-wrong number
+ * rather than a reassuring one. The flag is the supported way to ask; the
+ * sentinel is the safety net under consumers that forget, exactly as
+ * `expiryKnown` sits over `daysRemaining: -9999`.
+ */
+const UNKNOWN_NUMBER = -1;
 
 const SystemSchema = z.object({
   hostname: z.string(),
@@ -104,6 +178,13 @@ const SystemSchema = z.object({
   physmemBytes: z.number(),
   uptimeSeconds: z.number(),
   loadavg: z.array(z.number()),
+  /**
+   * False when TrueNAS omitted any of `cores`, `physmem` or `uptime_seconds`;
+   * those three are then UNKNOWN_NUMBER. Check this before comparing them --
+   * `uptimeSeconds` in particular, since a backfilled 0 makes a "rebooted in
+   * the last five minutes" gate fire on every single run.
+   */
+  metricsKnown: z.boolean(),
 });
 
 const PoolSchema = z.object({
@@ -115,6 +196,12 @@ const PoolSchema = z.object({
   sizeBytes: z.number(),
   usedPercent: z.number(),
   fragmentationPercent: z.number(),
+  /**
+   * False when TrueNAS reported no `allocated`/`free` for this pool;
+   * `allocatedBytes`, `freeBytes`, `sizeBytes` and `usedPercent` are then all
+   * UNKNOWN_NUMBER. Consumers must check this before gating on capacity.
+   */
+  capacityKnown: z.boolean(),
 });
 
 const DiskSchema = z.object({
@@ -124,6 +211,8 @@ const DiskSchema = z.object({
   sizeBytes: z.number(),
   type: z.string(),
   pool: z.string(),
+  /** False when TrueNAS reported no `size`; `sizeBytes` is UNKNOWN_NUMBER. */
+  sizeKnown: z.boolean(),
 });
 
 const AlertSchema = z.object({
@@ -159,6 +248,13 @@ const SummarySchema = z.object({
   version: z.string(),
   pools: z.number(),
   poolsUnhealthy: z.number(),
+  /**
+   * Pools whose capacity TrueNAS did not report this run. Counted here for the
+   * same reason `certificatesWithoutExpiry` is: a workflow that gates on the
+   * summary alone would otherwise have no way to see that the capacity numbers
+   * underneath it are absent rather than low.
+   */
+  poolsCapacityUnknown: z.number(),
   disks: z.number(),
   alerts: z.number(),
   alertsSilenced: z.number(),
@@ -368,13 +464,26 @@ function toIso(value: unknown): string {
 /**
  * `auth.login_with_api_key` is deprecated and scheduled for removal in
  * TrueNAS 27. `auth.login_ex` with the API_KEY_PLAIN mechanism is the
- * replacement, but it also requires a `username`, which this model does
- * not currently collect. Rather than guess at an untested auth path against
- * infrastructure this review has no access to, this caps support
- * explicitly: warn loudly once the connected host is running a version
- * where the call is expected to be gone, so the failure is diagnosable
- * instead of a bare RPC error.
+ * replacement, but it also requires a `username`, which this model does not
+ * currently collect. Rather than ship an auth path that has never been run
+ * against a real host, support is capped explicitly and the limit is stated
+ * wherever an operator can actually hit it.
+ *
+ * That last part was the defect. The hint used to live *only* in the
+ * post-connect warning below, which runs after `system.info` -- i.e. only on a
+ * run where authentication already succeeded. On the host the hint exists for,
+ * the one where the call is gone, auth is what fails, `system.info` never runs
+ * and the warning never printed. The operator got a bare RPC error and no
+ * explanation. So the hint is now attached to the auth failure itself
+ * (AUTH_REMOVAL_HINT, used in discover()), and this warning covers the other
+ * case: a 27+ host where the deprecated call still happens to work, which is a
+ * heads-up rather than a diagnosis.
  */
+const AUTH_REMOVAL_HINT =
+  "If this host is TrueNAS 27 or newer, auth.login_with_api_key has been " +
+  "removed: this model has not moved to auth.login_ex, which additionally " +
+  "requires a username it does not collect.";
+
 function warnIfVersionUnsupported(
   version: string,
   logger: { warning: (msg: string, props?: Record<string, unknown>) => void },
@@ -385,10 +494,12 @@ function warnIfVersionUnsupported(
   if (Number.isFinite(major) && major >= 27) {
     logger.warning(
       "TrueNAS reports version {version}; auth.login_with_api_key is " +
-        "scheduled for removal starting with 27 and this model has not " +
-        "moved to auth.login_ex. If authentication just failed, this is " +
-        "likely why.",
-      { version },
+        "scheduled for removal starting with 27. It still worked this run, " +
+        "but this model has not moved to auth.login_ex, so a later upgrade " +
+        "will break discovery.",
+      // Remote free text; bound it like every other remote string that
+      // reaches a log line.
+      { version: preview(version, 64) },
     );
   }
 }
@@ -425,7 +536,7 @@ class TrueNasRpc {
         // Previously silently ignored until the pending call timed out.
         // Surface it so a persistently malformed stream is diagnosable.
         this.#onProtocolError(
-          `malformed frame: ${(e as Error).message}`,
+          `malformed frame: ${preview((e as Error).message)}`,
         );
         return;
       }
@@ -446,7 +557,12 @@ class TrueNasRpc {
         // is still identified by its RPC error code + message.
         waiter.reject(
           new Error(
-            `TrueNAS RPC error ${code}: ${String(e.message ?? "(no message)")}`,
+            // `message` is remote free text of unbounded length, so it goes
+            // through preview() like every other remote string that ends up
+            // in an error a caller may log.
+            `TrueNAS RPC error ${code}: ${
+              preview(String(e.message ?? "(no message)"))
+            }`,
           ),
         );
       } else {
@@ -532,7 +648,7 @@ class TrueNasRpc {
           ((ev as unknown as { error?: Error })?.error?.message) ??
           "(runtime gave no detail)";
         failOnce(
-          new Error(`WebSocket error against ${wsUrl}: ${detail}`),
+          new Error(`WebSocket error against ${wsUrl}: ${preview(detail)}`),
         );
       };
     });
@@ -608,9 +724,18 @@ async function discover(_args: unknown, ctx: {
   };
 }) {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
-  assertBaseUrl(g.baseUrl, g.allowInsecureHttp);
-  const wsUrl = g.baseUrl.replace(/\/+$/, "").replace(/^http/i, "ws") +
-    "/api/current";
+  const base = assertBaseUrl(g.baseUrl, g.allowInsecureHttp);
+  // Built from the parsed URL's components, not by pasting "/api/current"
+  // onto the raw argument. The old concatenation swapped the scheme with a
+  // regex and appended blindly, so anything after the host that was not a
+  // plain path (a query string, a fragment) ended up in front of the path
+  // segment it was supposed to precede. assertBaseUrl now rejects those, and
+  // rebuilding here means the endpoint path is correct by construction rather
+  // than by the argument happening to be well shaped. A reverse-proxied
+  // subpath (https://nas.example.com/truenas/) still resolves.
+  const wsScheme = base.protocol === "https:" ? "wss:" : "ws:";
+  const basePath = base.pathname.replace(/\/+$/, "");
+  const wsUrl = `${wsScheme}//${base.host}${basePath}/api/current`;
   const timeoutMs = g.timeoutSec * 1000;
 
   ctx.logger.info("connecting to {url}", { url: wsUrl });
@@ -626,14 +751,28 @@ async function discover(_args: unknown, ctx: {
   let sysRaw: unknown, poolsRaw: unknown, disksRaw: unknown;
   let alertsRaw: unknown, certsRaw: unknown;
   try {
-    const authed = await rpc.call(
-      "auth.login_with_api_key",
-      [g.apiKey],
-      timeoutMs,
-    );
+    // Both auth failure paths carry AUTH_REMOVAL_HINT. The version warning
+    // further down only runs after system.info, so it is unreachable on a host
+    // where auth.login_with_api_key has been removed -- which is the single
+    // case the hint was written for. See the comment on AUTH_REMOVAL_HINT.
+    let authed: unknown;
+    try {
+      authed = await rpc.call(
+        "auth.login_with_api_key",
+        [g.apiKey],
+        timeoutMs,
+      );
+    } catch (e) {
+      const err = e as Error;
+      // Not on a cancellation. An aborted run failed for a reason that has
+      // nothing to do with the deprecated call, and pointing an operator at
+      // TrueNAS 27 when they hit Ctrl-C is worse than saying nothing.
+      if (ctx.signal.aborted) throw err;
+      throw new Error(`${err.message} ${AUTH_REMOVAL_HINT}`);
+    }
     if (authed !== true) {
       throw new Error(
-        "TrueNAS rejected the API key. Check it has not been revoked.",
+        `TrueNAS rejected the API key. Check it has not been revoked. ${AUTH_REMOVAL_HINT}`,
       );
     }
 
@@ -665,8 +804,14 @@ async function discover(_args: unknown, ctx: {
     ] as const
   ) {
     if (!Array.isArray(raw)) {
+      // The type is the diagnostic fact; the payload is a bounded preview.
+      // This used to stringify the entire unexpected response into the
+      // message, which put an unbounded amount of remote text -- hostnames,
+      // share paths, alert prose -- into whatever log caught the throw.
       throw new Error(
-        `TrueNAS ${label} returned a non-array result: ${JSON.stringify(raw)}`,
+        `TrueNAS ${label} returned a non-array result (${typeof raw}): ${
+          preview(raw)
+        }`,
       );
     }
   }
@@ -683,26 +828,47 @@ async function discover(_args: unknown, ctx: {
   const live = new Set<string>();
 
   // ---- system -------------------------------------------------------------
-  const uptimeSeconds = sys.uptime_seconds ?? 0;
+  // `?? 0` here wrote a real-looking number for a field TrueNAS never sent.
+  // uptimeSeconds was the sharp one: 0 is the value a box that just rebooted
+  // reports, so a "rebooted recently" gate fired on every run where the field
+  // was simply absent. UNKNOWN_NUMBER + metricsKnown separates the two.
+  const metricsKnown = sys.cores != null && sys.physmem != null &&
+    sys.uptime_seconds != null;
   handles.push(
     await ctx.writeResource("system", "system", {
       hostname: sys.hostname,
       version: sys.version,
       model: sys.model ?? "unknown",
-      cores: sys.cores ?? 0,
-      physmemBytes: sys.physmem ?? 0,
-      uptimeSeconds,
+      cores: sys.cores ?? UNKNOWN_NUMBER,
+      physmemBytes: sys.physmem ?? UNKNOWN_NUMBER,
+      uptimeSeconds: sys.uptime_seconds ?? UNKNOWN_NUMBER,
+      // An absent loadavg stays []. Unlike a number, an empty array is not
+      // mistakable for a reading: there is no element to compare against.
       loadavg: sys.loadavg ?? [],
-    }, { tags: { hostname: sys.hostname } }),
+      metricsKnown,
+    }, {
+      tags: {
+        hostname: sys.hostname,
+        metricsKnown: String(metricsKnown),
+      },
+    }),
   );
   live.add("system");
 
   // ---- pools --------------------------------------------------------------
   let poolsUnhealthy = 0;
+  let poolsCapacityUnknown = 0;
   for (const [i, p] of pools.entries()) {
-    const allocated = p.allocated ?? 0;
-    const free = p.free ?? 0;
-    const size = allocated + free;
+    // The worst instance of the `?? 0` class. A pool reporting neither
+    // `allocated` nor `free` was written sizeBytes: 0, usedPercent: 0, and
+    // `usedPercent > 90` then read as "plenty of room" on a pool whose fill
+    // level was in fact unknown. Both fields are needed for either number to
+    // mean anything, so they are known together or not at all.
+    const capacityKnown = p.allocated != null && p.free != null;
+    if (!capacityKnown) poolsCapacityUnknown++;
+    const allocated = capacityKnown ? p.allocated! : UNKNOWN_NUMBER;
+    const free = capacityKnown ? p.free! : UNKNOWN_NUMBER;
+    const size = capacityKnown ? allocated + free : UNKNOWN_NUMBER;
     const healthy = Boolean(p.healthy);
     if (!healthy) poolsUnhealthy++;
     const name = instanceName(
@@ -720,16 +886,33 @@ async function discover(_args: unknown, ctx: {
         allocatedBytes: allocated,
         freeBytes: free,
         sizeBytes: size,
-        usedPercent: size > 0 ? Math.round((allocated / size) * 1000) / 10 : 0,
+        usedPercent: !capacityKnown
+          ? UNKNOWN_NUMBER
+          : size > 0
+          ? Math.round((allocated / size) * 1000) / 10
+          : 0,
+        // parsePercent still defaults an absent fragmentation to 0, and that
+        // stays: unlike capacity, 0% fragmentation is not itself an alarming
+        // value, so a gate reading it cannot be lulled the way a capacity
+        // gate could. Argued rather than swept in with the rest of the class.
         fragmentationPercent: parsePercent(p.fragmentation ?? null),
+        capacityKnown,
       }, {
-        tags: { healthy: String(healthy), status: p.status ?? "" },
+        tags: {
+          healthy: String(healthy),
+          status: p.status ?? "",
+          capacityKnown: String(capacityKnown),
+        },
       }),
     );
   }
 
   // ---- disks --------------------------------------------------------------
   for (const [i, d] of disks.entries()) {
+    // Same class as the pool capacity above: a disk whose `size` TrueNAS did
+    // not report was written sizeBytes: 0, which reads as a real (and absurd)
+    // capacity rather than as an absent one.
+    const sizeKnown = d.size != null;
     const rawId = d.identifier ?? d.devname ?? "";
     const name = instanceName(
       "disk",
@@ -743,11 +926,16 @@ async function discover(_args: unknown, ctx: {
         name: d.devname ?? "",
         serial: d.serial ?? "",
         model: d.model ?? "",
-        sizeBytes: d.size ?? 0,
+        sizeBytes: sizeKnown ? d.size! : UNKNOWN_NUMBER,
         type: d.type ?? "",
         pool: d.pool ?? "",
+        sizeKnown,
       }, {
-        tags: { pool: d.pool ?? "none", type: d.type ?? "" },
+        tags: {
+          pool: d.pool ?? "none",
+          type: d.type ?? "",
+          sizeKnown: String(sizeKnown),
+        },
       }),
     );
   }
@@ -798,6 +986,13 @@ async function discover(_args: unknown, ctx: {
     if (soon) expiringSoon++;
     if (!Number.isFinite(days)) withoutExpiry++;
     const rawId = String(c.id ?? c.name ?? "");
+    // Prefix is `cert-` while the resource kind is `certificate`. Reviewed and
+    // kept: the instance name is the record's identity in the datastore, so
+    // renaming the prefix orphans every stored certificate record -- the next
+    // run prunes all of them and writes new ones, losing their history -- to
+    // buy nothing but a tidier spelling. The prefix is documented in the
+    // README instead. (Note the prune protection above keys on `pool-`/`disk-`
+    // for the same reason: prefixes here are load-bearing, not cosmetic.)
     const name = instanceName(
       "cert",
       rawId,
@@ -831,6 +1026,7 @@ async function discover(_args: unknown, ctx: {
       version: sys.version,
       pools: pools.length,
       poolsUnhealthy,
+      poolsCapacityUnknown,
       disks: disks.length,
       alerts: alerts.length,
       alertsSilenced: silenced,
@@ -842,6 +1038,7 @@ async function discover(_args: unknown, ctx: {
     }, {
       tags: {
         poolsUnhealthy: String(poolsUnhealthy),
+        poolsCapacityUnknown: String(poolsCapacityUnknown),
         certsExpiring: String(expiringSoon),
       },
     }),
@@ -930,20 +1127,27 @@ export const model = {
 
   resources: {
     system: {
-      description: "Host identity, version, CPU, memory, uptime, load.",
+      description:
+        "Host identity, version, CPU, memory, uptime, load. `metricsKnown` " +
+        "is false when TrueNAS omitted cores/memory/uptime; those read -1 " +
+        "rather than 0 so an absent uptime cannot look like a fresh reboot.",
       schema: SystemSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
     pool: {
-      description:
-        "One record per ZFS pool with status, health, capacity, fragmentation.",
+      description: "One record per ZFS pool with status, health, capacity, " +
+        "fragmentation. Check `capacityKnown` before gating on capacity: " +
+        "when TrueNAS reports no allocated/free the four capacity fields are " +
+        "-1, not 0, so an unknown pool cannot read as an empty one.",
       schema: PoolSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
     disk: {
-      description: "One record per physical disk and its pool membership.",
+      description:
+        "One record per physical disk and its pool membership. `sizeKnown` " +
+        "is false when TrueNAS reported no size; `sizeBytes` is then -1.",
       schema: DiskSchema,
       lifetime: "infinite" as const,
       garbageCollection: 20,
