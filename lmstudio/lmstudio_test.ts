@@ -540,6 +540,15 @@ Deno.test("daemon runner: output past the cap is truncated, never reported as su
     false,
     "a truncated answer must fail, not be returned as though it were whole",
   );
+  // Extended, not replaced: `success: false` was the only signal overflow
+  // had, which left observe() unable to tell it from a non-zero exit. The
+  // flag is what lets overflow reach `invalid-response` instead of being
+  // keyword-scanned into `unreachable`.
+  assertEquals(
+    result.truncated,
+    true,
+    "overflow must be reported explicitly, not inferred from success alone",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -728,4 +737,631 @@ Deno.test("embedding: a generic 4xx is still labelled no_embedding_capability", 
   assertEquals(calls, 1);
   assertEquals(written.errorKind, "no_embedding_capability");
   assertEquals(written.servesEmbeddings, false);
+});
+
+// ---------------------------------------------------------------------------
+// Shared fixtures for the gate-fix tests below.
+//
+// Built from code points rather than string escapes so the hostile characters
+// are unambiguous in the source, and so a copy/paste of this file cannot
+// silently lose them.
+// ---------------------------------------------------------------------------
+
+const ESC = String.fromCharCode(0x1b);
+const BEL = String.fromCharCode(0x07);
+const ZWSP = String.fromCharCode(0x200b);
+const RLO = String.fromCharCode(0x202e);
+/** The terminal-title escape sequence, the canonical instance of the class. */
+const TITLE_ESCAPE = `${ESC}]0;PWNED${BEL}`;
+
+/** True when a string still carries anything that can drive or hide terminal output. */
+function hasScreenableChar(value: string): boolean {
+  for (const ch of value) {
+    const cp = ch.codePointAt(0)!;
+    if (cp <= 0x1f) return true;
+    if (cp >= 0x7f && cp <= 0x9f) return true;
+    if (cp >= 0x200b && cp <= 0x200f) return true;
+    if (cp >= 0x202a && cp <= 0x202e) return true;
+    if (cp >= 0x2066 && cp <= 0x2069) return true;
+    if (cp === 0xfeff) return true;
+    if (cp >= 0xd800 && cp <= 0xdfff) return true;
+  }
+  return false;
+}
+
+function jsonResponse(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function chatBody(content: string, finishReason = "stop"): string {
+  return JSON.stringify({
+    choices: [{ finish_reason: finishReason, message: { content } }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+}
+
+/** A response whose body stream fails partway through, the way a cancelled or timed-out read does. */
+function failingBody(
+  reason: unknown,
+  onPull?: () => void,
+  status = 200,
+): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      onPull?.();
+      controller.error(reason);
+    },
+  });
+  return new Response(stream, {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** A response body larger than the reader's byte cap. */
+function oversizedBody(status = 200): Response {
+  const chunk = new TextEncoder().encode("x".repeat(64 * 1024));
+  let sent = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent >= 8) {
+        controller.close();
+        return;
+      }
+      sent++;
+      controller.enqueue(chunk);
+    },
+  });
+  return new Response(stream, {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+interface RunOutcome {
+  written?: Record<string, unknown>;
+  name?: string;
+  thrown?: Error;
+  calls: number;
+}
+
+/** Drive one probe or endpoint method against a queue of stubbed responses. */
+async function runMethod(
+  // Each method's execute() is typed to its own zod-inferred argument shape,
+  // so the seam that drives all five of them is deliberately untyped here.
+  // deno-lint-ignore no-explicit-any
+  execute: (args: any, ctx: any) => Promise<unknown>,
+  args: Record<string, unknown>,
+  queue: (() => Response)[],
+  signal: AbortSignal = new AbortController().signal,
+): Promise<RunOutcome> {
+  const originalFetch = globalThis.fetch;
+  const outcome: RunOutcome = { calls: 0 };
+  globalThis.fetch = () => {
+    outcome.calls++;
+    const next = queue.shift();
+    if (!next) return Promise.reject(new Error("unexpected extra request"));
+    return Promise.resolve(next());
+  };
+  try {
+    await execute(args, {
+      globalArgs: OK,
+      signal,
+      logger: { info: () => {}, warning: () => {} },
+      writeResource: (
+        _spec: string,
+        name: string,
+        value: Record<string, unknown>,
+      ) => {
+        outcome.written = value;
+        outcome.name = name;
+        return Promise.resolve({ name });
+      },
+    });
+  } catch (e) {
+    outcome.thrown = e as Error;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  return outcome;
+}
+
+// ---------------------------------------------------------------------------
+// A cancelled or timed-out BODY read is not an observation about the endpoint.
+//
+// The request-level distinction was already made in classifyFetchError(), but
+// everything after the response headers arrived went through
+// `.text().catch(() => "")` or a bare `.json()`. A caller who cancelled a
+// millisecond after the headers landed got "HTTP 500: " or, worse, a stored
+// `malformed_response` -- a permanent finding about an endpoint nobody
+// finished looking at.
+// ---------------------------------------------------------------------------
+
+Deno.test("completion: cancellation during the body read throws, never records malformed_response", async () => {
+  const controller = new AbortController();
+  const outcome = await runMethod(
+    probe.methods.completion.execute,
+    { model: "example/chat", prompt: "hello", maxTokens: 8, temperature: 0 },
+    [() =>
+      failingBody(
+        new DOMException("aborted", "AbortError"),
+        () => controller.abort(),
+      )],
+    controller.signal,
+  );
+  assertEquals(
+    outcome.written,
+    undefined,
+    "a cancelled run must not leave an infinite-lifetime probe result behind",
+  );
+  assertEquals(outcome.thrown?.message.startsWith("CANCELLED:"), true);
+});
+
+Deno.test("completion: a timeout during the body read is a timeout, not a malformed body", async () => {
+  const outcome = await runMethod(
+    probe.methods.completion.execute,
+    { model: "example/chat", prompt: "hello", maxTokens: 8, temperature: 0 },
+    [() => failingBody(new DOMException("timed out", "TimeoutError"))],
+  );
+  assertEquals(
+    outcome.written?.errorKind,
+    "timeout",
+    "a deadline that fires mid-body used to be stored as malformed_response",
+  );
+});
+
+Deno.test("health: cancellation after the response headers arrive writes nothing", async () => {
+  const controller = new AbortController();
+  const outcome = await runMethod(
+    endpoint.methods.health.execute,
+    {},
+    [() => {
+      // Headers arrived, so fetch() resolves and the catch block never runs;
+      // the caller pulls the plug immediately afterwards.
+      controller.abort();
+      return jsonResponse(JSON.stringify({ data: [] }));
+    }],
+    controller.signal,
+  );
+  assertEquals(
+    outcome.written,
+    undefined,
+    "a cancelled run must not record reachable/latency for the endpoint",
+  );
+  assertEquals(outcome.thrown?.message.startsWith("CANCELLED:"), true);
+});
+
+Deno.test("models: cancellation after the model list parses writes nothing", async () => {
+  const controller = new AbortController();
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() => {
+      controller.abort();
+      return jsonResponse(JSON.stringify({ data: [{ id: "example/chat" }] }));
+    }],
+    controller.signal,
+  );
+  assertEquals(outcome.written, undefined);
+  assertEquals(outcome.thrown?.message.startsWith("CANCELLED:"), true);
+});
+
+// ---------------------------------------------------------------------------
+// Untrusted response bodies reach stored `error` fields whose lifetime is
+// `infinite`. redact() only ever knew about the bearer token.
+// ---------------------------------------------------------------------------
+
+Deno.test("embedding: a hostile error body is screened and bounded before it is stored", async () => {
+  const hostile = `${TITLE_ESCAPE} no embedding model ${RLO}${ZWSP}` +
+    "z".repeat(5000);
+  const outcome = await runMethod(
+    probe.methods.embedding.execute,
+    { model: "example/embed", input: "swamp lmstudio probe" },
+    [() => new Response(hostile, { status: 400 })],
+  );
+  const stored = String(outcome.written?.error ?? "");
+  assertEquals(
+    hasScreenableChar(stored),
+    false,
+    "an endpoint error body reached stored data still able to drive a terminal",
+  );
+  assertEquals(
+    stored.length <= 400,
+    true,
+    `stored error was ${stored.length} chars -- remote text must be bounded`,
+  );
+  // The deliberate half of the trade: the endpoint's own words survive, so
+  // the probe stays diagnosable. Only its ability to be unbounded or to
+  // control a terminal is removed.
+  assertEquals(stored.includes("no embedding model"), true);
+});
+
+Deno.test("completion: the bearer token never survives an echoed error body", async () => {
+  const outcome = await runMethod(
+    probe.methods.completion.execute,
+    { model: "example/chat", prompt: "hello", maxTokens: 8, temperature: 0 },
+    [() =>
+      new Response(`upstream echoed Authorization: Bearer ${OK.apiToken}`, {
+        status: 500,
+      })],
+  );
+  const stored = String(outcome.written?.error ?? "");
+  assertEquals(stored.includes(OK.apiToken), false, "TOKEN LEAK into error");
+  assertEquals(stored.includes("[REDACTED]"), true);
+});
+
+Deno.test("models: a hostile error body is screened before it reaches the thrown error", async () => {
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() => new Response(`${TITLE_ESCAPE}gateway exploded`, { status: 502 })],
+  );
+  const message = outcome.thrown?.message ?? "";
+  assertEquals(message.startsWith("HTTP_ERROR:"), true);
+  assertEquals(
+    hasScreenableChar(message),
+    false,
+    "a thrown error is exactly the string that ends up in a log",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Response bodies had no byte bound at all. A request timeout limits how long
+// a hostile endpoint may stream, not how much it may hand over in that time.
+// ---------------------------------------------------------------------------
+
+Deno.test("models: an oversized 2xx body is refused, never parsed", async () => {
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() => oversizedBody()],
+  );
+  assertEquals(outcome.written, undefined);
+  assertEquals(outcome.thrown?.message.startsWith("MALFORMED_RESPONSE:"), true);
+  assertEquals(outcome.thrown?.message.includes("cap"), true);
+});
+
+Deno.test("completion: an oversized 2xx body is refused, never parsed", async () => {
+  const outcome = await runMethod(
+    probe.methods.completion.execute,
+    { model: "example/chat", prompt: "hello", maxTokens: 8, temperature: 0 },
+    [() => oversizedBody()],
+  );
+  assertEquals(outcome.written?.errorKind, "malformed_response");
+  assertEquals(String(outcome.written?.error).includes("cap"), true);
+});
+
+Deno.test("embedding: an oversized 2xx body is refused, never parsed", async () => {
+  const outcome = await runMethod(
+    probe.methods.embedding.execute,
+    { model: "example/embed", input: "swamp lmstudio probe" },
+    [() => oversizedBody()],
+  );
+  assertEquals(outcome.written?.errorKind, "malformed_response");
+  assertEquals(
+    outcome.written?.dimensionKnown,
+    false,
+    "an unread body must never leave a measured dimension behind",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Model ids are remote-controlled text, and they end up in an
+// infinite-lifetime resource, in a tag, in a log line, and in a storage path.
+// ---------------------------------------------------------------------------
+
+Deno.test("models: a hostile model id fails closed instead of being stored", async () => {
+  const hostile = `qwen${TITLE_ESCAPE}-7b`;
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() => jsonResponse(JSON.stringify({ data: [{ id: hostile }] }))],
+  );
+  assertEquals(outcome.written, undefined, "unscreened id reached stored data");
+  assertEquals(outcome.thrown?.message.startsWith("MALFORMED_RESPONSE:"), true);
+  assertEquals(
+    hasScreenableChar(outcome.thrown?.message ?? ""),
+    false,
+    "the rejected id must not be echoed into the error that reports it",
+  );
+
+  // Asserted against the resource schema as well, not just the parse path: a
+  // bound that lives only in extractModelIds() is one refactor from gone.
+  assertEquals(
+    endpoint.resources.models.schema.safeParse({
+      modelIds: [hostile],
+      modelCount: 1,
+      syncedAt: new Date(0).toISOString(),
+    }).success,
+    false,
+    "resource schema accepted an unscreened model id",
+  );
+});
+
+Deno.test("models: an over-long model id fails closed", async () => {
+  const long = "q".repeat(400);
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() => jsonResponse(JSON.stringify({ data: [{ id: long }] }))],
+  );
+  assertEquals(outcome.written, undefined);
+  assertEquals(outcome.thrown?.message.startsWith("MALFORMED_RESPONSE:"), true);
+  assertEquals(
+    endpoint.resources.models.schema.safeParse({
+      modelIds: [long],
+      modelCount: 1,
+      syncedAt: new Date(0).toISOString(),
+    }).success,
+    false,
+  );
+});
+
+Deno.test("models: an unbounded model list fails closed", async () => {
+  const ids = Array.from({ length: 2000 }, (_u, i) => ({ id: `m-${i}` }));
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() => jsonResponse(JSON.stringify({ data: ids }))],
+  );
+  assertEquals(outcome.written, undefined);
+  assertEquals(outcome.thrown?.message.startsWith("MALFORMED_RESPONSE:"), true);
+  assertEquals(
+    endpoint.resources.models.schema.safeParse({
+      modelIds: ids.map((e) => e.id),
+      modelCount: ids.length,
+      syncedAt: new Date(0).toISOString(),
+    }).success,
+    false,
+    "resource schema accepted an unbounded modelIds array",
+  );
+});
+
+Deno.test("probe arguments reject a hostile or over-long model id", () => {
+  for (
+    const [label, bad] of [
+      ["terminal escape", `qwen${TITLE_ESCAPE}-7b`],
+      ["bidi override", `qwen${RLO}gnp.exe-7b`],
+      ["zero width", `qwen${ZWSP}-7b`],
+      ["over long", "q".repeat(400)],
+    ] as const
+  ) {
+    for (
+      const args of [
+        probe.methods.embedding.arguments,
+        probe.methods.completion.arguments,
+        probe.methods.capabilities.arguments,
+      ]
+    ) {
+      assertEquals(
+        args.safeParse({ model: bad, prompt: "hi" }).success,
+        false,
+        `accepted a model id with a ${label}`,
+      );
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The 2xx envelope was cast, not validated. `null`, `[]`, and `7` all parse.
+// ---------------------------------------------------------------------------
+
+Deno.test("completion: a 2xx body that is not a JSON object is malformed, not a crash", async () => {
+  for (const body of ["null", "[]", "7", '"hello"']) {
+    const outcome = await runMethod(
+      probe.methods.completion.execute,
+      { model: "example/chat", prompt: "hello", maxTokens: 8, temperature: 0 },
+      [() => jsonResponse(body)],
+    );
+    assertEquals(
+      outcome.thrown,
+      undefined,
+      `a 2xx body of ${body} escaped as an unhandled exception`,
+    );
+    assertEquals(outcome.written?.errorKind, "malformed_response");
+  }
+});
+
+Deno.test("embedding: a 2xx body with no data[] is malformed, not an empty response", async () => {
+  for (const body of ["{}", "null", '{"data":"nope"}']) {
+    const outcome = await runMethod(
+      probe.methods.embedding.execute,
+      { model: "example/embed", input: "swamp lmstudio probe" },
+      [() => jsonResponse(body)],
+    );
+    assertEquals(
+      outcome.written?.errorKind,
+      "malformed_response",
+      `${body} was scored as empty_response -- claiming the endpoint answered ` +
+        "the embedding question when it never did",
+    );
+    assertEquals(outcome.written?.dimensionKnown, false);
+  }
+});
+
+Deno.test("embedding: a well-formed envelope with no vector is still empty_response", async () => {
+  // The deliberate distinction must survive the malformed_response split: the
+  // endpoint DID answer, and the answer carried no vector.
+  const outcome = await runMethod(
+    probe.methods.embedding.execute,
+    { model: "example/embed", input: "swamp lmstudio probe" },
+    [() => jsonResponse('{"data":[]}')],
+  );
+  assertEquals(outcome.written?.errorKind, "empty_response");
+  assertEquals(outcome.written?.dimensionKnown, false);
+});
+
+Deno.test("models: a 2xx body that is not an OpenAI envelope throws the documented kind", async () => {
+  for (const body of ["null", "[]", '{"models":[]}', '{"data":[{}]}']) {
+    const outcome = await runMethod(
+      endpoint.methods.models.execute,
+      {},
+      [() => jsonResponse(body)],
+    );
+    assertEquals(
+      outcome.thrown?.message.startsWith("MALFORMED_RESPONSE:"),
+      true,
+      `${body} threw outside the taxonomy the README Caveats promise: ` +
+        outcome.thrown?.message,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Instance names ARE storage paths.
+// ---------------------------------------------------------------------------
+
+Deno.test("probe instance names stay unique and path-safe for ids that slugify alike", async () => {
+  const vector = () =>
+    jsonResponse(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }));
+  const names = new Set<string>();
+  const ids = [
+    "qwen/qwen3-4b",
+    "qwen-qwen3-4b",
+    `vendor/${"a".repeat(120)}/one`,
+    `vendor/${"a".repeat(120)}/two`,
+  ];
+  for (const model of ids) {
+    const outcome = await runMethod(
+      probe.methods.embedding.execute,
+      { model, input: "swamp lmstudio probe" },
+      [vector],
+    );
+    const name = outcome.name!;
+    assertEquals(
+      name.length <= 120,
+      true,
+      `instance name was ${name.length} chars -- it is a path component`,
+    );
+    names.add(name);
+  }
+  assertEquals(
+    names.size,
+    ids.length,
+    "two distinct model ids collided onto one instance name, so one probe " +
+      "result silently overwrote another",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// honorsResponseFormat must mean the model returned a JSON OBJECT.
+// ---------------------------------------------------------------------------
+
+async function runCapabilities(formatReply: string) {
+  return await runMethod(
+    probe.methods.capabilities.execute,
+    { model: "example/chat", maxTokens: 32 },
+    [
+      () => jsonResponse(chatBody("17 * 24 = 408")),
+      () => jsonResponse(chatBody(formatReply)),
+      () => jsonResponse(chatBody("OK")),
+    ],
+  );
+}
+
+Deno.test("capabilities: a non-object JSON reply is not a honoured response_format", async () => {
+  for (const reply of ["[1,2]", "null", "42", '"ok"']) {
+    const outcome = await runCapabilities(reply);
+    assertEquals(outcome.written?.checksCompleted, 3);
+    assertEquals(
+      outcome.written?.honorsResponseFormat,
+      false,
+      `${reply} recorded a capability the model never demonstrated`,
+    );
+  }
+});
+
+Deno.test("capabilities: a JSON object still honours the format, extra keys and all", async () => {
+  // Deliberately not an exact match against {"ok":true}: honouring
+  // json_object mode and following the prose instruction are two different
+  // findings, and this flag is named for the first one.
+  for (const reply of ['{"ok": true}', '{"ok": true, "note": "sure"}', "{}"]) {
+    const outcome = await runCapabilities(reply);
+    assertEquals(outcome.written?.honorsResponseFormat, true, reply);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Daemon: absent measurements, and overflow classification.
+// ---------------------------------------------------------------------------
+
+Deno.test("daemon: a model type the daemon never reported stays null, not an empty string", async () => {
+  const value = await runDaemon(() =>
+    Promise.resolve({
+      success: true,
+      code: 0,
+      stdout: JSON.stringify([{ identifier: "example/chat" }]),
+      stderr: "",
+    })
+  );
+  const loaded = (value.loadedModels as Record<string, unknown>[])[0];
+  assertEquals(
+    loaded.type,
+    null,
+    'an absent type stored as "" is indistinguishable from a measured one',
+  );
+  assertEquals(loaded.architecture, null);
+  assertEquals(value.errorKind, "");
+
+  // The resource schema must refuse the empty string too, or the ambiguity
+  // comes straight back the next time something writes this shape by hand.
+  assertEquals(
+    daemon.resources.daemon.schema.safeParse({
+      cliAvailable: true,
+      daemonRunning: true,
+      status: "running",
+      loadedModelCount: 1,
+      loadedModels: [{
+        identifier: "example/chat",
+        type: "",
+        architecture: "",
+      }],
+      observedAt: new Date(0).toISOString(),
+      errorKind: "",
+      error: "",
+    }).success,
+    false,
+    'resource schema accepted "" as a measured type',
+  );
+});
+
+Deno.test("daemon: an overflowing ps payload is invalid-response, never unreachable", async () => {
+  // The captured megabyte is remote-controlled text; the keyword scan that
+  // produces `unreachable` must never see it. "network" here is the trap.
+  const value = await runDaemon(() =>
+    Promise.resolve({
+      success: false,
+      truncated: true,
+      code: 0,
+      stdout: "[{...network...",
+      stderr: "",
+    })
+  );
+  assertEquals(
+    value.errorKind,
+    "invalid-response",
+    "an oversized answer was recorded as a measurement about the host",
+  );
+  assertEquals(value.loadedModelCount, 0);
+  assertEquals(value.daemonRunning, false);
+});
+
+Deno.test("daemon: a truncated payload that happens to parse is still refused", async () => {
+  const value = await runDaemon(() =>
+    Promise.resolve({
+      success: true,
+      truncated: true,
+      code: 0,
+      stdout: "[]",
+      stderr: "",
+    })
+  );
+  assertEquals(
+    value.errorKind,
+    "invalid-response",
+    "a prefix that parses is a wrong answer, not a whole one",
+  );
 });
