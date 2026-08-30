@@ -98,17 +98,27 @@ Deno.test("token: required and marked sensitive", () => {
     "token must be required",
   );
   // The sensitive marker is what keeps the token out of rendered config.
+  //
+  // The presence assertion is NOT optional and must come first. This used to
+  // be `if (tokenMeta) { assertEquals(...) }` — and zod returns undefined
+  // from `.meta()` when nothing is registered, so dropping `.meta({
+  // sensitive: true })` made the guard falsy and skipped the only assertion
+  // protecting it. The test went green on exactly the regression it exists
+  // to catch.
   const shape = model.globalArguments as unknown as {
     shape?: Record<string, { meta?: () => Record<string, unknown> }>;
   };
   const tokenMeta = shape.shape?.token?.meta?.();
-  if (tokenMeta) {
-    assertEquals(
-      tokenMeta.sensitive,
-      true,
-      "token must carry sensitive: true",
-    );
-  }
+  assertEquals(
+    typeof tokenMeta,
+    "object",
+    "token must carry registered metadata; .meta() returned nothing",
+  );
+  assertEquals(
+    tokenMeta!.sensitive,
+    true,
+    "token must carry sensitive: true",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -178,4 +188,420 @@ Deno.test("the destructive-prune policy is a named, skippable check", () => {
     "policy check must exist and be nameable",
   );
   assertEquals(check!.appliesTo.includes("syncDevices"), true);
+});
+
+// ---------------------------------------------------------------------------
+// sync harness
+//
+// Exercises `model.methods.syncDevices.execute` against a recording context
+// and a stubbed fetch. Everything below is a regression lock on a defect found
+// in review, not coverage decoration:
+//   - an empty or shrunken /v2/devices response must never wipe the datastore
+//   - excludeNetworks must match the way the sibling name matcher does
+//   - the documented "online beats offline" primaryIp rule must actually fire
+//   - two same-named hosts must not collapse into one machine
+// ---------------------------------------------------------------------------
+
+type Json = Record<string, unknown>;
+
+/** A recording stand-in for the swamp model context. */
+function mockCtx(
+  globalArgs: Json,
+  opts: { stored?: Record<string, Json> } = {},
+) {
+  const written: Array<{ spec: string; name: string; data: Json }> = [];
+  const deleted: string[] = [];
+  const warnings: string[] = [];
+  const stored = opts.stored ?? {};
+  return {
+    written,
+    deleted,
+    warnings,
+    ctx: {
+      signal: new AbortController().signal,
+      globalArgs: { ...BASE, ...globalArgs },
+      modelType: "@jpisgeek/firewalla",
+      modelId: "test-model",
+      logger: {
+        info: () => {},
+        warning: (msg: string) => warnings.push(msg),
+      },
+      readResource: (name: string) => Promise.resolve(stored[name] ?? null),
+      // deno-lint-ignore no-explicit-any
+      writeResource: (spec: string, name: string, data: Json, _o?: any) => {
+        written.push({ spec, name, data });
+        return Promise.resolve({ spec, name });
+      },
+      deleteResource: (name: string) => {
+        deleted.push(name);
+        return Promise.resolve();
+      },
+      dataRepository: {
+        // The real repository lists this model's stored resources; `inventory`
+        // is seeded here only to stand in for the previous roll-up, so keep it
+        // out of the prune candidate list.
+        findAllForModel: () =>
+          Promise.resolve(
+            Object.keys(stored)
+              .filter((n) => n !== "inventory")
+              .map((name) => ({ name })),
+          ),
+      },
+    },
+  };
+}
+
+/** Stub /v2/devices with one JSON body. Returns a restore function. */
+function stubDevices(body: unknown, status = 200) {
+  const original = globalThis.fetch;
+  globalThis.fetch = (() =>
+    Promise.resolve(
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      }),
+    )) as typeof fetch;
+  return () => {
+    globalThis.fetch = original;
+  };
+}
+
+const DEV = (over: Json = {}): Json => ({
+  id: "aa:bb:cc:dd:ee:01",
+  name: "host",
+  mac: "aa:bb:cc:dd:ee:01",
+  macVendor: "Acme",
+  deviceType: "desktop",
+  network: "Root",
+  online: true,
+  ...over,
+});
+
+// deno-lint-ignore no-explicit-any
+const run = (ctx: any, args: Json = {}) =>
+  model.methods.syncDevices.execute(
+    // deno-lint-ignore no-explicit-any
+    model.methods.syncDevices.arguments.parse(args) as any,
+    ctx,
+  );
+
+const machinesWritten = (written: Array<{ spec: string; data: Json }>) =>
+  written.filter((w) => w.spec === "machine").map((w) => w.data);
+
+// ---------------------------------------------------------------------------
+// prune plausibility guards — the destructive path
+// ---------------------------------------------------------------------------
+
+Deno.test("prune: a zero-device response does not delete the stored inventory", async () => {
+  // A transient MSP fault returning `{"results": []}` used to be accepted as
+  // ground truth: every device-*/machine-* record was deleted and the SSH
+  // fleet generated from them read empty until a later sync happened to work.
+  const m = mockCtx({}, {
+    stored: {
+      "device-aabbccddee01-11111111": { name: "keep" },
+      "machine-nas-22222222": { name: "nas" },
+      inventory: { total: 2 },
+    },
+  });
+  const restore = stubDevices({ results: [] });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  assertEquals(
+    m.deleted,
+    [],
+    "an empty device list must never be treated as 'everything departed'",
+  );
+  assertEquals(
+    m.warnings.some((w) => w.includes("refusing to prune")),
+    true,
+    "declining to prune must be visible, not a silent no-op",
+  );
+});
+
+Deno.test("prune: a collapse past pruneMaxShrink does not delete", async () => {
+  // Previous run saw 10; this one sees 2. Default pruneMaxShrink 0.5 puts the
+  // floor at 5, so this looks like a truncated or partial fetch, not a real
+  // decommission of 8 hosts.
+  const m = mockCtx({}, {
+    stored: {
+      "device-gone-33333333": { name: "gone" },
+      inventory: { total: 10 },
+    },
+  });
+  const restore = stubDevices({
+    results: [
+      DEV({ id: "aa:bb:cc:dd:ee:01", name: "a" }),
+      DEV({ id: "aa:bb:cc:dd:ee:02", name: "b" }),
+    ],
+  });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  assertEquals(m.deleted, [], "a >50% collapse must not prune");
+});
+
+Deno.test("prune: still deletes departed records on a plausible full sync", async () => {
+  // The guards must not disable pruning. Previous total 3, this run writes 3,
+  // so the stale record is genuinely departed and must go.
+  const m = mockCtx({}, {
+    stored: {
+      "device-gone-33333333": { name: "gone" },
+      inventory: { total: 3 },
+    },
+  });
+  const restore = stubDevices({
+    results: [
+      DEV({ id: "aa:bb:cc:dd:ee:01", name: "a" }),
+      DEV({ id: "aa:bb:cc:dd:ee:02", name: "b" }),
+      DEV({ id: "aa:bb:cc:dd:ee:03", name: "c" }),
+    ],
+  });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  assertEquals(
+    m.deleted.includes("device-gone-33333333"),
+    true,
+    "a representative full sync must still prune departed records",
+  );
+});
+
+Deno.test("prune: forcePrune overrides the guards after a real decommission", async () => {
+  const m = mockCtx({}, {
+    stored: {
+      "device-gone-33333333": { name: "gone" },
+      inventory: { total: 10 },
+    },
+  });
+  const restore = stubDevices({ results: [] });
+  try {
+    await run(m.ctx, { forcePrune: true });
+  } finally {
+    restore();
+  }
+  assertEquals(m.deleted, ["device-gone-33333333"]);
+});
+
+Deno.test("prune: no previous roll-up leaves the shrink floor inactive", async () => {
+  // A first-ever run has no `inventory` resource. An unreadable previous
+  // total must mean "unknown", never "zero", but it must also not wedge the
+  // prune permanently — a run that wrote devices still prunes.
+  const m = mockCtx({}, { stored: { "device-gone-33333333": { name: "g" } } });
+  const restore = stubDevices({ results: [DEV()] });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  assertEquals(m.deleted, ["device-gone-33333333"]);
+});
+
+// ---------------------------------------------------------------------------
+// excludeNetworks — a scope control that silently matches nothing is worse
+// than one that errors
+// ---------------------------------------------------------------------------
+
+Deno.test("excludeNetworks: matches case- and whitespace-insensitively", async () => {
+  const m = mockCtx({ excludeNetworks: ["  GUEST "] });
+  const restore = stubDevices({
+    results: [
+      DEV({ id: "aa:bb:cc:dd:ee:01", name: "a", network: "guest" }),
+      DEV({ id: "aa:bb:cc:dd:ee:02", name: "b", network: "Root" }),
+    ],
+  });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  const devices = m.written.filter((w) => w.spec === "device");
+  assertEquals(
+    devices.length,
+    1,
+    "the guest-network device must not be stored",
+  );
+  assertEquals(devices[0].data.network, "Root");
+  const inv = m.written.find((w) => w.spec === "inventory")!.data;
+  assertEquals(inv.skippedByNetwork, 1);
+});
+
+// ---------------------------------------------------------------------------
+// primaryIp tiebreak — this is the address the SSH fleet targets
+// ---------------------------------------------------------------------------
+
+Deno.test("primaryIp: an online wired NIC displaces an offline wired one", async () => {
+  // `existingMachine.online` was OR-ed with the incoming device seven lines
+  // before the predicate read `!existingMachine.online`, so the documented
+  // "online beats offline" rule could never fire and the machine kept the
+  // offline interface's stale address.
+  const m = mockCtx({});
+  const restore = stubDevices({
+    results: [
+      DEV({
+        id: "aa:bb:cc:dd:ee:01",
+        name: "nas-eth",
+        online: false,
+        ip: "192.168.1.50",
+      }),
+      DEV({
+        id: "aa:bb:cc:dd:ee:02",
+        name: "nas-lan",
+        online: true,
+        ip: "192.168.1.51",
+      }),
+    ],
+  });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  const machines = machinesWritten(m.written);
+  assertEquals(machines.length, 1);
+  assertEquals(machines[0].primaryIp, "192.168.1.51");
+});
+
+Deno.test("primaryIp: an intervening online wireless NIC does not lock in the stale wired address", async () => {
+  // Snapshotting the machine-wide `online` flag is not enough: once any NIC
+  // is online it stays true, so the wired-vs-wired comparison has to ask
+  // whether the interface CURRENTLY HOLDING primaryIp was online.
+  const m = mockCtx({});
+  const restore = stubDevices({
+    results: [
+      DEV({
+        id: "aa:bb:cc:dd:ee:01",
+        name: "nas-eth",
+        online: false,
+        ip: "192.168.1.50",
+      }),
+      DEV({
+        id: "aa:bb:cc:dd:ee:02",
+        name: "nas-wifi",
+        online: true,
+        ip: "192.168.1.60",
+      }),
+      DEV({
+        id: "aa:bb:cc:dd:ee:03",
+        name: "nas-lan",
+        online: true,
+        ip: "192.168.1.51",
+      }),
+    ],
+  });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  const machines = machinesWritten(m.written);
+  assertEquals(machines.length, 1);
+  assertEquals(machines[0].primaryIp, "192.168.1.51");
+});
+
+// ---------------------------------------------------------------------------
+// machine key collisions — a merged machine is a host lost from the fleet
+// ---------------------------------------------------------------------------
+
+Deno.test("machines: two hosts sharing a suffixed name stay separate", async () => {
+  // A retired box the firewall still knows as `pi-eth` plus its same-named
+  // replacement both had a suffix stripped, so the old `!hadSuffix &&
+  // !collision.hadSuffix` guard never fired and they collapsed into one
+  // machine whose interface list mixed both hosts.
+  const m = mockCtx({});
+  const restore = stubDevices({
+    results: [
+      DEV({
+        id: "aa:bb:cc:dd:ee:11",
+        mac: "aa:bb:cc:dd:ee:11",
+        name: "pi-eth",
+        ip: "192.168.1.11",
+      }),
+      DEV({
+        id: "aa:bb:cc:dd:ee:22",
+        mac: "aa:bb:cc:dd:ee:22",
+        name: "pi-eth",
+        ip: "192.168.1.22",
+      }),
+    ],
+  });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  const machines = machinesWritten(m.written);
+  assertEquals(machines.length, 2, "two distinct hosts must be two machines");
+  assertEquals(
+    new Set(machines.map((x) => x.primaryIp)),
+    new Set(["192.168.1.11", "192.168.1.22"]),
+    "neither host's address may be lost to a merge",
+  );
+});
+
+Deno.test("machines: genuine multi-homing still collapses to one machine", async () => {
+  // The collision fix must not split real hosts. Different NIC names, and
+  // deliberately different macVendors (a Mac's built-in ethernet and its
+  // Wi-Fi radio routinely differ) — vendor agreement is NOT a merge
+  // precondition.
+  const m = mockCtx({});
+  const restore = stubDevices({
+    results: [
+      DEV({
+        id: "aa:bb:cc:dd:ee:11",
+        mac: "aa:bb:cc:dd:ee:11",
+        name: "nas-eth",
+        macVendor: "Apple",
+        ip: "192.168.1.11",
+      }),
+      DEV({
+        id: "aa:bb:cc:dd:ee:22",
+        mac: "aa:bb:cc:dd:ee:22",
+        name: "nas-wifi",
+        macVendor: "Broadcom",
+        ip: "192.168.1.22",
+      }),
+    ],
+  });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  const machines = machinesWritten(m.written);
+  assertEquals(machines.length, 1, "one host, one machine");
+  assertEquals(machines[0].name, "nas");
+  assertEquals(machines[0].interfaceCount, 2);
+});
+
+Deno.test("machines: two same-named unsuffixed devices stay separate", async () => {
+  // The case the original guard was written for — a pair of identical air
+  // purifiers. Must still hold after the rewrite.
+  const m = mockCtx({});
+  const restore = stubDevices({
+    results: [
+      DEV({
+        id: "aa:bb:cc:dd:ee:11",
+        mac: "aa:bb:cc:dd:ee:11",
+        name: "purifier",
+      }),
+      DEV({
+        id: "aa:bb:cc:dd:ee:22",
+        mac: "aa:bb:cc:dd:ee:22",
+        name: "purifier",
+      }),
+    ],
+  });
+  try {
+    await run(m.ctx);
+  } finally {
+    restore();
+  }
+  assertEquals(machinesWritten(m.written).length, 2);
 });

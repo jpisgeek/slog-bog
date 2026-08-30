@@ -20,13 +20,19 @@ example: |
     dependencies:
       app-server: nas
     timeoutSec: 30
+    pruneMaxShrink: 0.5
 caveats: >-
   Inventory, not control: it only reads `/v2/devices` and never writes to the
   firewall. Pruning of departed records happens only on a full, unfiltered
-  sync. A `tier`- or `network`-restricted run never deletes. Devices on
-  `excludeNetworks` are skipped before anything is written. The `machine`
-  list, not the raw `device` list, is the correct source for generating an
-  SSH fleet.
+  sync. A `tier`- or `network`-restricted run never deletes. It is also
+  skipped, with a warning, when the run looks unrepresentative: no devices
+  written at all, or a count that fell more than `pruneMaxShrink` below the
+  previous roll-up's total. Pass `forcePrune: true` after a genuine mass
+  decommission. Devices on `excludeNetworks` are skipped before anything is
+  written; network names are matched case- and whitespace-insensitively.
+  Two devices reported under the same name are kept as separate machines
+  even when both names carry a NIC suffix. The `machine` list, not the raw
+  `device` list, is the correct source for generating an SSH fleet.
 security: >-
   `mspDomain` is parsed as a URL and must be a bare `*.firewalla.net`
   hostname (no path, query, fragment, port, or userinfo) because that is
