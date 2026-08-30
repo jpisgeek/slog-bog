@@ -21,18 +21,19 @@ swamp extension pull @jpisgeek/firewalla
 
 ### Arguments
 
-| argument            | type            | required | default                                              | description                                                                                                                                                                                                                                            |
-| ------------------- | --------------- | -------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `mspDomain`         | string          | yes      |                                                      | MSP domain, e.g. example-msp.firewalla.net (scheme optional). Must resolve under firewalla.net. The token is sent here.                                                                                                                                |
-| `token`             | string          | yes      |                                                      | MSP personal access token; source it from a vault expression                                                                                                                                                                                           |
-| `deepCheckTypes`    | array of string | no       | `["desktop","nas&server","switch","goldpro","fwap"]` | deviceType values (prefix match) that belong to the deep tier                                                                                                                                                                                          |
-| `timeoutSec`        | integer         | no       | `30`                                                 | HTTP timeout for MSP API calls                                                                                                                                                                                                                         |
-| `wiredSuffixes`     | array of string | no       | `["eth","lan","en0"]`                                | Interface suffixes considered wired. A wired address wins the primaryIp race. It is the more reliable path to monitor over.                                                                                                                            |
-| `interfaceSuffixes` | array of string | no       | `["eth","wifi","wl","awg","lan","en0"]`              | Trailing name segments that denote a NIC rather than a distinct machine. 'example-host-eth' and 'example-host-wifi' collapse to one machine, 'example-host'.                                                                                           |
-| `apiManaged`        | array of string | no       | `[]`                                                 | Machines reached through their own API rather than SSH. They stay in the inventory but are never SSH fleet candidates. The Firewalla itself is handled automatically; add hosts like a TrueNAS box here.                                               |
-| `excludeNetworks`   | array of string | no       | `[]`                                                 | Firewalla networks that are off limits entirely. Devices on these are skipped before anything is written. Not collected, not counted, not stored. Use for VLANs outside the scope of this automation (a work network, a guest network you do not own). |
-| `exclude`           | array of string | no       | `[]`                                                 | Device names that must never be treated as machines, even if their deviceType lands them in the deep tier. Supports a trailing '*'. Thunderbolt docks are the motivating case: they hold a MAC and take an IP, so Firewalla reports them as 'desktop'. |
-| `dependencies`      | object          | no       | `{}`                                                 | machine -> machine it runs on or depends upon. A dependent being unreachable while its parent is down is a consequence, not a separate incident; downstream alerting can suppress on this.                                                             |
+| argument            | type            | required | default                                              | description                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------- | --------------- | -------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `mspDomain`         | string          | yes      |                                                      | MSP domain, e.g. example-msp.firewalla.net (scheme optional). Must resolve under firewalla.net. The token is sent here.                                                                                                                                                                                                                                                  |
+| `token`             | string          | yes      |                                                      | MSP personal access token; source it from a vault expression                                                                                                                                                                                                                                                                                                             |
+| `deepCheckTypes`    | array of string | no       | `["desktop","nas&server","switch","goldpro","fwap"]` | deviceType values (prefix match) that belong to the deep tier                                                                                                                                                                                                                                                                                                            |
+| `timeoutSec`        | integer         | no       | `30`                                                 | HTTP timeout for MSP API calls                                                                                                                                                                                                                                                                                                                                           |
+| `wiredSuffixes`     | array of string | no       | `["eth","lan","en0"]`                                | Interface suffixes considered wired. A wired address wins the primaryIp race. It is the more reliable path to monitor over.                                                                                                                                                                                                                                              |
+| `interfaceSuffixes` | array of string | no       | `["eth","wifi","wl","awg","lan","en0"]`              | Trailing name segments that denote a NIC rather than a distinct machine. 'example-host-eth' and 'example-host-wifi' collapse to one machine, 'example-host'.                                                                                                                                                                                                             |
+| `apiManaged`        | array of string | no       | `[]`                                                 | Machines reached through their own API rather than SSH. They stay in the inventory but are never SSH fleet candidates. The Firewalla itself is handled automatically; add hosts like a TrueNAS box here.                                                                                                                                                                 |
+| `excludeNetworks`   | array of string | no       | `[]`                                                 | Firewalla networks that are off limits entirely. Devices on these are skipped before anything is written. Not collected, not counted, not stored. Use for VLANs outside the scope of this automation (a work network, a guest network you do not own).                                                                                                                   |
+| `exclude`           | array of string | no       | `[]`                                                 | Device names that must never be treated as machines, even if their deviceType lands them in the deep tier. Supports a trailing '*'. Thunderbolt docks are the motivating case: they hold a MAC and take an IP, so Firewalla reports them as 'desktop'.                                                                                                                   |
+| `dependencies`      | object          | no       | `{}`                                                 | machine -> machine it runs on or depends upon. A dependent being unreachable while its parent is down is a consequence, not a separate incident; downstream alerting can suppress on this.                                                                                                                                                                               |
+| `pruneMaxShrink`    | number          | no       | `0.5`                                                | Largest fraction of the previous sync's device total that may vanish in one run and still be pruned. 0.5 means a run seeing fewer than half of last run's devices refuses to delete anything and warns instead, on the assumption the fetch was not representative. Set to 1 to disable the shrink guard (a zero-device response still never prunes without forcePrune). |
 
 ### Methods
 
@@ -42,12 +43,13 @@ Fetch every device from the MSP API and write one device resource per device,
 one machine resource per deduplicated host, and an inventory roll-up. Classifies
 each device into the deep or presence tier, collapses NICs onto their machine,
 and applies name exclusions. A full sync prunes departed records; a filtered
-sync does not.
+sync, or one whose device count looks unrepresentative, does not.
 
-| argument  | type                          | required | default | description                                               |
-| --------- | ----------------------------- | -------- | ------- | --------------------------------------------------------- |
-| `network` | string                        | no       |         | Only sync devices on this Firewalla network (e.g. 'Root') |
-| `tier`    | `deep` \| `presence` \| `all` | no       | `"all"` | Restrict the sync to one tier                             |
+| argument     | type                          | required | default | description                                                                                                                                                                                |
+| ------------ | ----------------------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `network`    | string                        | no       |         | Only sync devices on this Firewalla network (e.g. 'Root')                                                                                                                                  |
+| `tier`       | `deep` \| `presence` \| `all` | no       | `"all"` | Restrict the sync to one tier                                                                                                                                                              |
+| `forcePrune` | boolean                       | no       | `false` | Prune departed records even when the plausibility guards say the fetch looks unrepresentative (zero devices, or a drop larger than pruneMaxShrink). Use after a genuine mass decommission. |
 
 ### Data written
 
@@ -72,15 +74,22 @@ globalArguments:
   dependencies:
     app-server: nas
   timeoutSec: 30
+  pruneMaxShrink: 0.5
 ```
 
 ## Caveats
 
 Inventory, not control: it only reads `/v2/devices` and never writes to the
 firewall. Pruning of departed records happens only on a full, unfiltered sync. A
-`tier`- or `network`-restricted run never deletes. Devices on `excludeNetworks`
-are skipped before anything is written. The `machine` list, not the raw `device`
-list, is the correct source for generating an SSH fleet.
+`tier`- or `network`-restricted run never deletes. It is also skipped, with a
+warning, when the run looks unrepresentative: no devices written at all, or a
+count that fell more than `pruneMaxShrink` below the previous roll-up's total.
+Pass `forcePrune: true` after a genuine mass decommission. Devices on
+`excludeNetworks` are skipped before anything is written; network names are
+matched case- and whitespace-insensitively. Two devices reported under the same
+name are kept as separate machines even when both names carry a NIC suffix. The
+`machine` list, not the raw `device` list, is the correct source for generating
+an SSH fleet.
 
 ## Security
 

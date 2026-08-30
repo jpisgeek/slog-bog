@@ -107,6 +107,19 @@ const GlobalArgsSchema = z.object({
         "unreachable while its parent is down is a consequence, not a " +
         "separate incident; downstream alerting can suppress on this.",
     ),
+  pruneMaxShrink: z
+    .number()
+    .min(0)
+    .max(1)
+    .default(0.5)
+    .describe(
+      "Largest fraction of the previous sync's device total that may " +
+        "vanish in one run and still be pruned. 0.5 means a run seeing " +
+        "fewer than half of last run's devices refuses to delete anything " +
+        "and warns instead, on the assumption the fetch was not " +
+        "representative. Set to 1 to disable the shrink guard (a zero-" +
+        "device response still never prunes without forcePrune).",
+    ),
 });
 
 const SyncArgsSchema = z.object({
@@ -118,6 +131,14 @@ const SyncArgsSchema = z.object({
     .enum(["deep", "presence", "all"])
     .default("all")
     .describe("Restrict the sync to one tier"),
+  forcePrune: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Prune departed records even when the plausibility guards say the " +
+        "fetch looks unrepresentative (zero devices, or a drop larger " +
+        "than pruneMaxShrink). Use after a genuine mass decommission.",
+    ),
 });
 
 /**
@@ -275,6 +296,22 @@ function machineKey(name: string, suffixes: string[]): string {
   return suffixes.some((sfx) => sfx.toLowerCase() === tail)
     ? name.slice(0, idx)
     : name;
+}
+
+/**
+ * Fold a network name for comparison against `excludeNetworks`.
+ *
+ * This used to be a bare `g.excludeNetworks.includes(network)` -- exact,
+ * case-sensitive, untrimmed -- while the sibling name matcher `isExcluded`
+ * deliberately lowercases both sides. An operator who copied the README's
+ * `excludeNetworks: [Guest]` for a VLAN the MSP reports as `guest` (or with
+ * stray whitespace from a YAML quirk) got no match, every device on that
+ * network written to the datastore, and no signal beyond
+ * `skippedByNetwork: 0` in the roll-up. A scope control that silently
+ * matches nothing is worse than one that errors.
+ */
+function foldNetwork(name: string): string {
+  return name.trim().toLowerCase();
 }
 
 /** Name-based exclusion with optional trailing wildcard. */
@@ -467,6 +504,24 @@ async function syncDevices(
   }
   const devices = unwrapDevices(payload);
 
+  // Read the PREVIOUS roll-up before the new one overwrites it. It is the
+  // only record of how large this inventory is supposed to be, and the
+  // prune guard below needs it. A first-ever run has no `inventory`
+  // resource, and a ctx without readResource is possible in reduced
+  // harnesses, so a miss is "unknown", never "zero" -- treating a failed
+  // read as a previous total of 0 would turn the guard off exactly when it
+  // is least verifiable.
+  let previousTotal: number | null = null;
+  try {
+    const prior = await ctx.readResource?.("inventory");
+    const t = (prior as Record<string, unknown> | null | undefined)?.total;
+    if (typeof t === "number" && Number.isFinite(t) && t >= 0) {
+      previousTotal = t;
+    }
+  } catch {
+    previousTotal = null;
+  }
+
   /** Wraps writeResource failures with which resource was being written. */
   async function writeOrThrow(
     specName: string,
@@ -485,6 +540,11 @@ async function syncDevices(
       );
     }
   }
+
+  // Folded once rather than per device: the comparison is case- and
+  // whitespace-insensitive on BOTH sides, so `[Guest]` in config matches a
+  // network the MSP calls `guest ` and vice versa.
+  const excludedNetworkSet = new Set(g.excludeNetworks.map(foldNetwork));
 
   const handles = [];
   const liveNames = new Set<string>();
@@ -505,6 +565,13 @@ async function syncDevices(
     hadSuffix: boolean;
     /** True when primaryIp currently comes from a wired interface. */
     primaryWired: boolean;
+    /**
+     * True when the interface currently holding primaryIp was online. Kept
+     * separate from `online`, which is the OR across every interface: once
+     * any NIC is online the machine-wide flag is true forever, so it cannot
+     * answer "is the address we picked a live one?".
+     */
+    primaryOnline: boolean;
     networks: Set<string>;
     interfaces: Array<
       {
@@ -539,7 +606,7 @@ async function syncDevices(
     // Off-limits networks are dropped before any resource is written, so no
     // trace of them enters the datastore. Counted only so the skip is
     // reported rather than silent.
-    if (g.excludeNetworks.includes(network)) {
+    if (excludedNetworkSet.has(foldNetwork(network))) {
       skippedNetworks++;
       continue;
     }
@@ -594,14 +661,40 @@ async function syncDevices(
     // Collapse NICs onto one machine. Prefer a wired, online, reserved
     // address as the primary. That is the one worth SSH-ing.
     //
-    // Only merge when a suffix was actually stripped from at least one side.
     // Two genuinely different devices can share a name (a pair of identical
     // air purifiers, say). Those are separate machines and must not be folded
     // together just because the strings match.
+    //
+    // The test for "already taken by a different host" is whether the machine
+    // we would merge into already holds an interface with this exact device
+    // name. One host never reports two NICs under the same Firewalla name --
+    // the whole premise of suffix stripping is that the NICs differ in their
+    // trailing segment -- so an exact name repeat means a second host.
+    //
+    // The old guard was `!hadSuffix && !collision.hadSuffix`, which only
+    // separated same-named devices when NEITHER name had a NIC suffix
+    // stripped. A retired `pi-eth` still known to the firewall plus its
+    // same-named replacement both set hadSuffix, so the guard never fired and
+    // the two collapsed into one `machine` whose interface list mixed both
+    // hosts -- one host silently gone from the SSH fleet and from monitoring,
+    // which is the exact inventory loss this model exists to prevent. The
+    // interface-name test subsumes the old condition (neither side having a
+    // suffix means both names equal `stripped`, so the name is necessarily
+    // already in the collision's interface list) and additionally catches the
+    // suffixed case, so the old clause is not kept alongside it.
+    //
+    // Deliberately NOT gated on mac-vendor agreement: a multi-homed Mac's
+    // built-in ethernet and its Wi-Fi radio routinely report different
+    // vendors, so requiring agreement would split real hosts. Splitting is
+    // the safe direction of error here anyway -- a duplicated SSH target is
+    // noise, a merged one is a lost machine.
     const stripped = machineKey(device.name, g.interfaceSuffixes);
     const hadSuffix = stripped !== device.name;
     const collision = machines.get(stripped);
-    const mKey = (collision && !hadSuffix && !collision.hadSuffix)
+    const nameTaken = Boolean(
+      collision?.interfaces.some((i) => i.name === device.name),
+    );
+    const mKey = nameTaken
       ? `${stripped}-${device.mac.replace(/[^a-zA-Z0-9]/g, "").slice(-4)}`
       : stripped;
     const existingMachine = machines.get(mKey);
@@ -610,6 +703,7 @@ async function syncDevices(
         name: mKey,
         hadSuffix,
         primaryWired: isWired(device.name, g.wiredSuffixes),
+        primaryOnline: device.online,
         primaryIp: device.ip ?? "",
         deviceType: device.deviceType,
         macVendor: device.macVendor,
@@ -635,6 +729,17 @@ async function syncDevices(
       });
       existingMachine.networks.add(network);
       existingMachine.hadSuffix = existingMachine.hadSuffix || hadSuffix;
+      // Snapshot the state the primaryIp tiebreak needs BEFORE the roll-up
+      // fields are updated. `existingMachine.online` is the machine-wide OR
+      // across interfaces, but rule 2 below asks a narrower question: was the
+      // interface currently holding primaryIp online? Reading the field after
+      // the OR-assignment made `!existingMachine.online` false whenever this
+      // device was online -- which is precisely when the clause is consulted
+      // -- so the whole "online beats offline" preference was dead code. A
+      // host whose offline `nas-eth` was processed before its online
+      // `nas-lan` kept the stale interface's address as primaryIp, and that
+      // address is what the generated SSH fleet targets.
+      const primaryWasOnline = existingMachine.primaryOnline;
       existingMachine.online = existingMachine.online || device.online;
       existingMachine.sshCandidate = existingMachine.sshCandidate ||
         device.sshCandidate;
@@ -646,11 +751,12 @@ async function syncDevices(
         !existingMachine.primaryIp ||
         (wired && !existingMachine.primaryWired) ||
         (wired === existingMachine.primaryWired &&
-          device.online && !existingMachine.online)
+          device.online && !primaryWasOnline)
       );
       if (better) {
         existingMachine.primaryIp = device.ip ?? "";
         existingMachine.primaryWired = wired;
+        existingMachine.primaryOnline = device.online;
       }
     }
 
@@ -731,7 +837,56 @@ async function syncDevices(
   // listing). The actual delete then goes through `deleteResource`, the
   // documented API for removing a named resource, rather than reaching for
   // `dataRepository.delete` a second time.
-  if (args.tier === "all" && !args.network) {
+  //
+  // "Full sync" is a necessary condition, not a sufficient one. The fetch
+  // also has to look REPRESENTATIVE. A structurally valid HTTP 200 carrying
+  // zero devices -- a transient MSP backend fault, a briefly unlinked box, a
+  // token whose scope narrowed, or (if /v2/devices ever paginates) a
+  // truncated envelope -- reaches this block by exactly the same path as a
+  // genuine empty network, and the old code answered it by deleting every
+  // stored device-* and machine-* record one at a time under routine
+  // `pruned departed record` info lines. Everything generated from the
+  // `machine` resources, the SSH fleet included, then read an empty fleet
+  // until some later sync happened to succeed.
+  //
+  // Two guards, both overridable with forcePrune for a real mass
+  // decommission:
+  //   - zero devices never prunes, whatever pruneMaxShrink says;
+  //   - a live count below (previous total * (1 - pruneMaxShrink)) does not
+  //     prune either.
+  // Refusing is logged as a WARNING, not info: a run that declined to prune
+  // has to be visible, and so does the reason. The run itself still
+  // succeeds and still writes the roll-up -- failing the whole sync would
+  // discard a device list that is probably fine, and preserving data is the
+  // entire point of the guard.
+  const shrinkFloor = previousTotal === null
+    ? 0
+    : previousTotal * (1 - g.pruneMaxShrink);
+  let pruneBlockedBy: string | null = null;
+  if (!args.forcePrune) {
+    // The zero test is on what this run actually WROTE, not on the raw fetch
+    // length: a run that recorded nothing has no evidence at all about which
+    // records are departed, whether the list came back empty or every entry
+    // fell to an exclusion.
+    if (deviceCount === 0) {
+      pruneBlockedBy =
+        `this run wrote no device records (${devices.length} returned ` +
+        `by the MSP)`;
+    } else if (previousTotal !== null && deviceCount < shrinkFloor) {
+      pruneBlockedBy = `${deviceCount} device(s) is below the shrink floor ` +
+        `of ${shrinkFloor} (previous total ${previousTotal}, ` +
+        `pruneMaxShrink ${g.pruneMaxShrink})`;
+    }
+  }
+
+  if (args.tier === "all" && !args.network && pruneBlockedBy) {
+    ctx.logger.warning(
+      "refusing to prune departed records: {reason}. The fetch does not " +
+        "look representative, so stored records are kept. Re-run with " +
+        "forcePrune once you have confirmed the loss is real.",
+      { reason: pruneBlockedBy },
+    );
+  } else if (args.tier === "all" && !args.network) {
     let existing: Array<{ name: string }>;
     try {
       existing = await ctx.dataRepository.findAllForModel(
@@ -805,12 +960,15 @@ export const model = {
     "full-sync-prunes-departed-records": {
       description:
         "A full sync (no tier or network filter) deletes any stored " +
-        "device or machine record the firewall no longer reports. This " +
-        "check always passes. Its purpose is to make that destructive " +
-        "deletion policy visible before the method runs and give it a " +
-        "name that can be skipped (--skip-check) when investigating " +
-        "suspected data loss, not to gate on the specific args of a " +
-        "given call.",
+        "device or machine record the firewall no longer reports, unless " +
+        "the run looks unrepresentative: it wrote no devices at all, or " +
+        "the count fell further than pruneMaxShrink below the previous " +
+        "roll-up's total. Those runs warn and keep the records; " +
+        "forcePrune overrides. This check always passes. Its purpose is " +
+        "to make the destructive deletion policy visible before the " +
+        "method runs and give it a name that can be skipped " +
+        "(--skip-check) when investigating suspected data loss, not to " +
+        "gate on the specific args of a given call.",
       labels: ["policy"],
       appliesTo: ["syncDevices"],
       execute: () => Promise.resolve({ pass: true }),
@@ -854,8 +1012,8 @@ export const model = {
         "per device, one machine resource per deduplicated host, and an " +
         "inventory roll-up. Classifies each device into the deep or presence " +
         "tier, collapses NICs onto their machine, and applies name " +
-        "exclusions. A full sync prunes departed records; a filtered sync " +
-        "does not.",
+        "exclusions. A full sync prunes departed records; a filtered sync, " +
+        "or one whose device count looks unrepresentative, does not.",
       arguments: SyncArgsSchema,
       execute: syncDevices,
     },
