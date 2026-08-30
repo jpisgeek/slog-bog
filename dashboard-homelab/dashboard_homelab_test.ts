@@ -110,6 +110,201 @@ const firewallaInventory = () => ({
   syncedAt: now(),
 });
 
+const firewallaDevice = (extra: Json = {}) => ({
+  id: "device-a",
+  name: "device-a",
+  ip: "192.0.2.10",
+  mac: "aa:bb:cc:dd:ee:ff",
+  macVendor: "Example",
+  deviceType: "desktop",
+  network: "Synthetic",
+  online: true,
+  ipReserved: true,
+  isRouter: false,
+  isFirewalla: false,
+  totalDownload: 0,
+  totalUpload: 0,
+  tier: "deep",
+  sshCandidate: true,
+  excluded: false,
+  ...extra,
+});
+
+const firewallaMachine = (extra: Json = {}) => ({
+  name: "machine-a",
+  primaryIp: "192.0.2.10",
+  deviceType: "desktop",
+  macVendor: "Example",
+  tier: "deep",
+  sshCandidate: true,
+  online: true,
+  networks: ["Synthetic"],
+  interfaces: [],
+  interfaceCount: 1,
+  ...extra,
+});
+
+/** A TrueNAS summary describing exactly one alert and nothing else. */
+const trueNasAlertOnlySummary = (silenced: number) => ({
+  ...trueNasSummary(),
+  pools: 0,
+  poolsUnhealthy: 0,
+  disks: 0,
+  alerts: 1,
+  alertsSilenced: silenced,
+  certificates: 0,
+  certificatesExpiringSoon: 0,
+  certificatesExpired: 0,
+  certificatesWithoutExpiry: 0,
+});
+
+const trueNasAlert = (level: string, silenced: boolean) => ({
+  id: "alert-1",
+  klass: "SyntheticCondition",
+  level,
+  formatted: "Synthetic condition is active",
+  dismissed: silenced,
+  silenced,
+});
+
+async function trueNasAlertBundle(level: string, silenced: boolean) {
+  return await normalize(context("@jpisgeek/truenas", [
+    { spec: "alert", name: "alert-1", value: trueNasAlert(level, silenced) },
+    {
+      spec: "summary",
+      name: "summary",
+      value: trueNasAlertOnlySummary(silenced ? 1 : 0),
+    },
+  ]));
+}
+
+Deno.test("a dismissed TrueNAS alert still decides state", async () => {
+  // The collector sets `silenced` from the TrueNAS `dismissed` flag precisely
+  // so the dismissal does NOT hide the condition. Mapping it onto the
+  // contract's `suppressed` field put it right back: suppressed exceptions are
+  // filtered out of both the section ladder and deriveOverallState, so a
+  // dismissed CRITICAL published as a healthy bundle.
+  const bundle = await trueNasAlertBundle("CRITICAL", true);
+  assertEquals(bundle.state, "critical");
+  assertEquals(bundle.sections[0].state, "critical");
+  const alert = bundle.sections[0].exceptions.find((e) =>
+    e.source === "truenas:alert"
+  )!;
+  assertEquals(alert.severity, "critical");
+  // The property that matters: nothing about this exception may remove it from
+  // the state calculation.
+  assertEquals(alert.suppressed, false);
+  // The dismissal is still reported, just as detail rather than as state.
+  assertStringIncludes(alert.detail, "dismissed in the TrueNAS UI");
+});
+
+Deno.test("a dismissed warning still takes the section out of healthy", async () => {
+  const bundle = await trueNasAlertBundle("WARNING", true);
+  assertEquals(bundle.state, "degraded");
+});
+
+Deno.test("alert levels outside the mapped vocabulary do not vanish into info", async () => {
+  // Every one of these is reachable: truenas.ts types the raw level as
+  // `z.string().nullable().optional()` and writes `level: a.level ?? ""`, so a
+  // payload missing the key persists as "". The old fall-through classified
+  // all of them "info", and info exceptions move neither the section ladder
+  // nor the bundle state.
+  const cases: Array<[string, string, string]> = [
+    ["", "warning", "degraded"],
+    ["  ", "warning", "degraded"],
+    ["SOMETHING_NEW", "warning", "degraded"],
+    ["ERROR", "critical", "critical"],
+    ["error", "critical", "critical"],
+    ["EMERGENCY", "critical", "critical"],
+    ["WARNING", "warning", "degraded"],
+    ["CRITICAL", "critical", "critical"],
+    // These genuinely mean "not a raised condition" and must stay quiet, or
+    // every idle run reads as degraded.
+    ["INFO", "info", "healthy"],
+    ["NOTICE", "info", "healthy"],
+    ["CLEAR", "info", "healthy"],
+  ];
+  for (const [level, expectedSeverity, expectedState] of cases) {
+    const bundle = await trueNasAlertBundle(level, false);
+    const alert = bundle.sections[0].exceptions.find((e) =>
+      e.source === "truenas:alert"
+    )!;
+    const label = JSON.stringify(level);
+    assertEquals(alert.severity, expectedSeverity, `severity for ${label}`);
+    assertEquals(bundle.state, expectedState, `state for ${label}`);
+  }
+});
+
+Deno.test("an unrecognized alert level is named in the exception detail", async () => {
+  const bundle = await trueNasAlertBundle("SOMETHING_NEW", false);
+  const alert = bundle.sections[0].exceptions.find((e) =>
+    e.source === "truenas:alert"
+  )!;
+  assertStringIncludes(alert.detail, "unrecognized alert level");
+  assertStringIncludes(alert.detail, "SOMETHING_NEW");
+  // A level the report does understand must not be annotated.
+  const known = await trueNasAlertBundle("WARNING", false);
+  const knownAlert = known.sections[0].exceptions.find((e) =>
+    e.source === "truenas:alert"
+  )!;
+  assertEquals(knownAlert.detail.includes("unrecognized"), false);
+});
+
+Deno.test("device records contradicting the inventory rollup are surfaced", async () => {
+  // firewalla.ts derives inventory.total from the device handle count and
+  // increments inventory.online inside the same loop, so these two figures are
+  // exact, not approximate. A rollup that disagrees with the device records is
+  // real drift and must not be published as a verified reading.
+  const bundle = await normalize(context("@jpisgeek/firewalla", [
+    { spec: "device", name: "device-a", value: firewallaDevice() },
+    { spec: "machine", name: "machine-a", value: firewallaMachine() },
+    {
+      spec: "inventory",
+      name: "inventory",
+      value: { ...firewallaInventory(), total: 4, online: 4, offline: 0 },
+    },
+  ]));
+  assertEquals(bundle.state, "partial");
+  assertEquals(bundle.sections[0].completeness.state, "partial");
+  const metric = bundle.sections[0].metrics.find((m) =>
+    m.id === "devices.online"
+  )!;
+  assertEquals(metric.confidence, "inferred");
+  const drift = bundle.sections[0].exceptions.find((e) =>
+    e.source === "firewalla:inventory"
+  )!;
+  assertStringIncludes(drift.detail, "4/4");
+  assertStringIncludes(drift.detail, "1/1");
+});
+
+Deno.test("an inventory reporting devices with no device record is drift", async () => {
+  const bundle = await normalize(context("@jpisgeek/firewalla", [
+    { spec: "machine", name: "machine-a", value: firewallaMachine() },
+    { spec: "inventory", name: "inventory", value: firewallaInventory() },
+  ]));
+  assertEquals(bundle.state, "partial");
+  const metric = bundle.sections[0].metrics.find((m) =>
+    m.id === "devices.online"
+  )!;
+  assertEquals(metric.confidence, "inferred");
+});
+
+Deno.test("corroborated device counts keep the online metric exact", async () => {
+  // The negative control: the cross-check must stay quiet on a consistent run,
+  // otherwise it is just an always-on alarm and proves nothing above.
+  const bundle = await normalize(context("@jpisgeek/firewalla", [
+    { spec: "device", name: "device-a", value: firewallaDevice() },
+    { spec: "machine", name: "machine-a", value: firewallaMachine() },
+    { spec: "inventory", name: "inventory", value: firewallaInventory() },
+  ]));
+  assertEquals(bundle.state, "healthy");
+  assertEquals(bundle.sections[0].completeness.state, "exact");
+  const metric = bundle.sections[0].metrics.find((m) =>
+    m.id === "devices.online"
+  )!;
+  assertEquals(metric.confidence, "exact");
+});
+
 Deno.test("partial read is explicit and cannot become healthy", async () => {
   const bundle = await normalize(context("@jpisgeek/netdata", [
     { spec: "node", name: "node-a", value: netdataNode() },
@@ -242,11 +437,26 @@ Deno.test("valid synthetic signals survive normalization", async () => {
 });
 
 Deno.test("filtered Firewalla coverage declares its scope", async () => {
+  // The inventory has to report zero devices as well as zero machines. An
+  // inventory claiming devices with no device record alongside it is now
+  // coverage drift, which is the point of the device cross-check below; this
+  // fixture is about the filter declaration, so it states an empty run.
   const bundle = await normalize(context("@jpisgeek/firewalla", [
     {
       spec: "inventory",
       name: "inventory",
-      value: { ...firewallaInventory(), machines: 0 },
+      value: {
+        ...firewallaInventory(),
+        machines: 0,
+        total: 0,
+        online: 0,
+        offline: 0,
+        deep: 0,
+        presence: 0,
+        reserved: 0,
+        sshCandidates: 0,
+        deviceTypes: {},
+      },
     },
   ], { network: "Synthetic" }));
   assertEquals(bundle.state, "healthy");
@@ -261,7 +471,7 @@ Deno.test("summary counts without matching records make coverage partial", async
   assertEquals(bundle.sections[0].completeness.state, "partial");
   assertEquals(
     bundle.sections[0].exceptions[0].headline,
-    "Inventory and machine coverage differ",
+    "Inventory and record coverage differ",
   );
 });
 
