@@ -21,32 +21,71 @@
  */
 import { z } from "npm:zod@4";
 
+/**
+ * Parse and validate one node base URL, returning the CANONICAL base string
+ * swamp will actually talk to, or null if the value is not usable.
+ *
+ * ONE point of truth on purpose: the `url` refine below and pollNode() both go
+ * through this, so what was validated and what is requested cannot drift. That
+ * split is exactly how a query string got through. The refine only looked at
+ * the scheme, the userinfo and the quote; the call site then did
+ * `node.url.replace(/\/+$/, "")` and concatenated the endpoint onto it. For
+ * `http://agent:19999/?k=v` that produced
+ * `http://agent:19999/?k=v/api/v1/info` -- a GET of `/` with the endpoint
+ * smuggled into the query string. Every /api/v1 endpoint the model believed it
+ * had polled was in fact one response from one attacker-chosen resource, and
+ * `/api/v1/info` answering anything JSON-shaped made the node read reachable.
+ * A fragment did the same thing more quietly: fetch drops everything from `#`
+ * on, so all four endpoints collapsed onto `/`.
+ *
+ * Rejected, and why:
+ *  - a scheme other than http/https: Deno fetch honours `file:`, and the remote
+ *    curl honours file:, ftp:, dict:, scp: -- an SSRF and local-read footgun.
+ *  - userinfo: node.url is persisted and logged as non-sensitive data, so
+ *    `user:pass@host` would write a credential into the datastore.
+ *  - a query string or a fragment: the endpoint-construction break above, plus
+ *    the same disclosure problem -- `?api_key=...` is how agent front-ends
+ *    carry credentials in practice, and this value is persisted.
+ *  - a single quote in the canonical base: over the ssh transport the base is
+ *    interpolated into a single-quoted remote command, and `new URL()` does
+ *    NOT percent-encode an apostrophe in a path.
+ *
+ * The returned base is rebuilt from the VALIDATED components rather than being
+ * the operator's string minus its trailing slashes. `http://agent:19999?`
+ * parses with an empty `search` while still carrying the delimiter, and
+ * `new URL()` silently strips embedded tabs and newlines instead of rejecting
+ * them; rebuilding means neither reaches the wire or the datastore.
+ */
+function parseNodeUrl(v: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(v);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  if (u.username !== "" || u.password !== "") return null;
+  if (v.includes("?") || v.includes("#")) return null;
+  if (u.search !== "" || u.hash !== "") return null;
+  // u.host carries the port and the IPv6 brackets; userinfo is excluded above.
+  const base = `${u.protocol}//${u.host}${u.pathname}`.replace(/\/+$/, "");
+  if (base.includes("'")) return null;
+  return base;
+}
+
 const NodeSchema = z.object({
   name: z.string().describe("Logical node name; match the SSH fleet name"),
   url: z
     .string()
     .refine(
-      (v) => {
-        try {
-          const u = new URL(v);
-          // http/https only: Deno fetch will honour a file: URL, and the
-          // remote curl honours the file:, ftp:, dict: (etc.) schemes. An
-          // unrestricted scheme is an SSRF / local-read footgun. No userinfo
-          // (persisted verbatim, so it would leak if present). No
-          // single quote: over the ssh transport the URL is interpolated into
-          // a single-quoted remote command and a quote would break out of it.
-          return (u.protocol === "http:" || u.protocol === "https:") &&
-            u.username === "" && u.password === "" && !v.includes("'");
-        } catch {
-          return false;
-        }
-      },
+      (v) => parseNodeUrl(v) !== null,
       {
-        message:
-          "url must be a valid http(s) URL, must not embed credentials " +
-          "(user:pass@host) -- discover persists node.url verbatim as " +
-          "non-sensitive data -- and must not contain a single quote. Use " +
-          "the ssh transport for agents that require authentication.",
+        message: "url must be a valid http(s) URL with no credentials " +
+          "(user:pass@host), no query string, no fragment and no single " +
+          "quote. discover persists the node URL as non-sensitive data and " +
+          "builds every endpoint by appending to it, so a `?`/`#` both leaks " +
+          "and silently redirects every request to `/`. Use the ssh " +
+          "transport for agents that require authentication.",
       },
     )
     .describe(
@@ -56,13 +95,41 @@ const NodeSchema = z.object({
     .object({
       // host/user become the positional `user@host` argument to ssh. A value
       // starting with "-" would be parsed as an ssh option (-oProxyCommand=…).
-      host: z.string().min(1).refine((v) => !v.startsWith("-"), {
-        message: "ssh.host must not start with '-'",
-      }),
-      user: z.string().min(1).refine((v) => !v.startsWith("-"), {
-        message: "ssh.user must not start with '-'",
-      }),
-      port: z.number().int().positive().default(22),
+      //
+      // The charset bound is the other half, and it is not cosmetic. These two
+      // values are the only operator-supplied strings that end up inside a
+      // transport failure message, and a host or user containing whitespace
+      // used to change the SHAPE of that message enough to walk straight past
+      // the persisted-error classifier -- which matched `^ssh to \S+ failed:`
+      // and fell back to echoing raw text when it missed. Errors now carry a
+      // fixed class token rather than being re-parsed from prose (see
+      // NodeFailure), so that specific bypass is gone; bounding the charset
+      // keeps the values from being surprising to ssh, to argv and to a log
+      // consumer in the first place. Hostnames, IPv4/IPv6 literals and real
+      // usernames all fit.
+      host: z
+        .string()
+        .min(1)
+        .max(253)
+        .regex(/^[A-Za-z0-9._:\-\[\]]+$/, {
+          message:
+            "ssh.host may only contain letters, digits and . _ - : [ ] " +
+            "(hostname, IPv4 or bracketed IPv6)",
+        })
+        .refine((v) => !v.startsWith("-"), {
+          message: "ssh.host must not start with '-'",
+        }),
+      user: z
+        .string()
+        .min(1)
+        .max(64)
+        .regex(/^[A-Za-z0-9._-]+$/, {
+          message: "ssh.user may only contain letters, digits and . _ -",
+        })
+        .refine((v) => !v.startsWith("-"), {
+          message: "ssh.user must not start with '-'",
+        }),
+      port: z.number().int().positive().max(65535).default(22),
     })
     .optional()
     .describe(
@@ -213,17 +280,30 @@ const SummarySchema = z.object({
 });
 
 /**
- * Deterministic, non-cryptographic 32-bit FNV-1a hash, hex-encoded. Used
- * only to make instance names collision-safe -- never for anything
- * security sensitive.
+ * Deterministic, non-cryptographic 64-bit FNV-1a hash, hex-encoded. Used only
+ * to make instance names collision-resistant -- never for anything security
+ * sensitive, and never as the ONLY thing standing between two records and one
+ * name (discover() also refuses a second write to an already-claimed name).
+ *
+ * This was 32-bit. 32 bits is 4.3e9 values, so by the birthday bound a few
+ * thousand alarm and mount records across a fleet's lifetime already carry a
+ * fraction-of-a-percent chance of two identities landing on one instance name
+ * -- and the consequence of that landing is not a warning, it is the second
+ * write silently replacing the first, which can be a firing CRITICAL. 64 bits
+ * takes that from "will eventually happen in a real homelab" to "will not".
+ * BigInt rather than a two-lane Math.imul: this function decides record
+ * identity, and being obviously correct matters more than the microseconds.
  */
+const FNV64_OFFSET = 0xcbf29ce484222325n;
+const FNV64_PRIME = 0x100000001b3n;
+const U64 = 0xffffffffffffffffn;
+
 function shortHash(input: string): string {
-  let h = 0x811c9dc5;
+  let h = FNV64_OFFSET;
   for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
+    h = (h ^ BigInt(input.charCodeAt(i))) * FNV64_PRIME & U64;
   }
-  return (h >>> 0).toString(16).padStart(8, "0");
+  return h.toString(16).padStart(16, "0");
 }
 
 /**
@@ -314,6 +394,64 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 }
 
 /**
+ * Require a whole API response to be a JSON object, and treat anything else as
+ * a failed sub-fetch.
+ *
+ * asRecord() guarded the alarms/charts VALUES; the ENVELOPES around them were
+ * still `await getJson(...) as Record<string, unknown>`, a cast that checks
+ * nothing. That is not a cosmetic gap, it is the worst outcome this model can
+ * produce. An agent (or an on-path rewriter, which the README's threat model
+ * grants) answering `/api/v1/alarms` with a bare JSON string or array made
+ * `al.alarms` read `undefined` -- the documented "absent means zero alarms"
+ * path -- so the sub-fetch was marked SUCCESSFUL with an empty alarm list. A
+ * successful empty list is not protected from the prune, so every stored
+ * alarm record for that node was deleted, including a firing CRITICAL, and the
+ * node reported alarmsActive: 0 with nodesDegraded: 0. Suppressing a critical
+ * alarm fleet-wide cost one malformed four-byte body. The same cast on
+ * `/api/v1/charts` zeroed the chart count and pruned every mount record; on
+ * `/api/v1/info` it made a node reachable with no identity at all.
+ *
+ * Absence of a KEY still means zero -- that contract is unchanged and tested.
+ * What is refused is a response that is not the shape the endpoint promises,
+ * which this model already knows how to represent: a failed sub-fetch, carried
+ * forward, node marked degraded.
+ *
+ * Deliberately hand-written rather than a zod schema per response, which is
+ * what the 2026-08-30 review proposed. Three reasons, recorded here so the
+ * choice is visible rather than looking like an omission:
+ *
+ *  1. The parts of these payloads with a FIXED shape are exactly this check --
+ *     "the envelope is an object" -- plus the per-field narrowing already at
+ *     each read site (`typeof info.version === "string"`, `Array.isArray`).
+ *     Those checks carry semantics a schema default would flatten: a MISSING
+ *     identity field must stay null ("never successfully read"), never ""; a
+ *     missing alarm value must stay null, never 0. Both distinctions were
+ *     real bugs, and a `.default()` reintroduces them.
+ *  2. The rest is an open map whose KEYS are agent-chosen (alarm names, chart
+ *     ids). A schema over that validates nothing a record check does not,
+ *     because there is no known key set to validate against.
+ *  3. A zod failure message quotes the failing input. Everything downstream of
+ *     this function exists to keep agent-chosen bytes out of stored fields and
+ *     bounded in log fields; routing them through an error string built by a
+ *     library we do not control works against that. describeShape() below
+ *     names the TYPE and never the value, for the same reason.
+ *
+ * The property the review asked for -- missing or invalid required fields are
+ * a failed sub-fetch, prior state preserved, node degraded -- holds, and is
+ * tested against each envelope in netdata_test.ts section 19.
+ */
+function expectObject(v: unknown, endpoint: string): Record<string, unknown> {
+  const o = asRecord(v);
+  if (o === null) {
+    throw new NodeFailure(
+      NODE_ERROR.malformed,
+      `${endpoint}: expected a JSON object, got ${describeShape(v)}`,
+    );
+  }
+  return o;
+}
+
+/**
  * Build a collision-safe, filesystem-safe instance name. `slug()` alone is
  * not injective (`db 1` and `db-1` both slug to `db-1`), so every name here
  * also carries a short hash of the *raw*, pre-slug identity fields -- node
@@ -331,12 +469,25 @@ function instanceName(prefix: string, ...identity: unknown[]): string {
   // with no type error and no failing parse. agentText() also bounds each
   // field, so an agent cannot make `raw` arbitrarily large by naming an alarm.
   const fields = identity.map(agentText);
-  // Unit Separator, written as an escape rather than a raw control byte.
-  // The join separator must be a character that cannot occur inside an
-  // identifier, or ["a","b c"] and ["a b","c"] hash identically. truenas
-  // previously used a RAW NUL here, which achieved that but made the file
+  // Length-prefixed encoding, not a separator character.
+  //
+  // The requirement is that ["a","b c"] and ["a b","c"] cannot produce the same
+  // encoding. A separator only satisfies that if it can never occur INSIDE a
+  // field, which puts the guarantee in whatever sanitises the fields rather
+  // than in the encoding -- and when that sanitiser did not exist, an agent
+  // putting a literal U+001F in an alarm name could mint two distinct alarms
+  // that hashed to one instance name, so the second write erased the first.
+  // agentText() now replaces the whole C0 range, but a scheme whose
+  // correctness depends on a downstream filter is one edit away from being
+  // wrong again, and it still built this model's record identities around a
+  // control character -- which is what made truenas's earlier raw-NUL version
   // read as binary to grep and to any tool doing exact-text matching.
-  const raw = fields.join("\u001f");
+  //
+  // `<length>:<field>` needs no forbidden character at all: it decodes left to
+  // right, so it is injective over ARBITRARY field contents -- including a
+  // field that itself contains digits, colons or control bytes.
+  // ["a","b c"] -> "1:a3:b c"; ["a b","c"] -> "3:a b1:c".
+  const raw = fields.map((f) => `${f.length}:${f}`).join("");
   // Build the readable label from EVERY non-empty identity field, not just the
   // first. Taking only the first made the visible part non-discriminating
   // wherever the caller passes a shared scope first: netdata's alarms pass the
@@ -378,37 +529,123 @@ function instanceNamePrefix(prefix: string, scope: string): string {
 }
 
 /**
- * A node-level failure message safe to PERSIST in the `error` resource field.
- * The full detail belongs in the log line, never in stored data. That means
- * ssh `user@host`, ssh stderr (which can echo local key paths) and any HTTP
- * response body. This collapses a raw failure to a class with no transport
- * target or remote output. Keep the raw message for `logger.warning`. Store
- * this.
+ * The COMPLETE set of failure classes that may be persisted in a node's
+ * `error` resource field. If a value is not in here (or is not
+ * httpErrorClass(), whose only variable part is an integer status swamp read
+ * off the response itself), it does not reach the datastore.
+ *
+ * This is an allowlist because the previous design was a denylist and a
+ * denylist cannot win this. sanitizeNodeError() used to RE-PARSE the English
+ * failure message with regexes, and when none matched it fell through to
+ * `raw.replace(/\S+@\S+/g, "<host>").slice(0, 120)` -- i.e. it persisted
+ * arbitrary remote text with one narrow substitution applied. Two ways that
+ * bit, both reachable without any special access:
+ *
+ *  - An agent front-end answering HTML instead of JSON made JSON.parse throw
+ *    `Unexpected token '<', "<html>SECRE"... is not valid JSON`. No regex
+ *    matched, so the RESPONSE BODY PREFIX -- chosen end to end by an
+ *    unauthenticated remote, or by anyone on the path of a cleartext poll --
+ *    was written into a stored field an operator reads as swamp's own words.
+ *  - The ssh branch keyed on `^ssh to \S+ failed:`, so an ssh host or user
+ *    containing whitespace broke the anchor, dropped the whole classification
+ *    to that same fallback, and put raw ssh stderr (local key paths and all)
+ *    into the record.
+ *
+ * The fix is structural, not another regex: every failure raised on the poll
+ * path is a NodeFailure carrying a fixed class token chosen AT THE THROW SITE,
+ * where the code already knows what went wrong. Nothing is recovered by
+ * pattern-matching prose afterwards, so there is no shape for a payload to
+ * take that reaches storage. Detail still goes to the log, which is a
+ * documented operator-decision trade (see the README's Security section).
  */
-function sanitizeNodeError(raw: string): string {
-  const ssh = raw.match(/^ssh to \S+ failed: ([\s\S]*)$/);
-  if (ssh) {
-    const d = ssh[1];
-    if (/host key|known_hosts|verification failed/i.test(d)) {
-      return "ssh transport: host key verification failed";
-    }
-    if (/permission denied|load key|auth|publickey|password/i.test(d)) {
-      return "ssh transport: authentication failed";
-    }
-    const code = d.match(/exit (\d+)/i);
-    return code
-      ? `ssh transport failed (exit ${code[1]})`
-      : "ssh transport failed";
+const NODE_ERROR = {
+  sshHostKey: "ssh transport: host key verification failed",
+  sshAuth: "ssh transport: authentication failed",
+  sshFailed: "ssh transport failed",
+  redirect: "redirect refused; swamp does not follow redirects",
+  malformed: "malformed response (not the shape the endpoint promises)",
+  oversized: "response over the size cap",
+  empty: "empty response",
+  timedOut: "timed out",
+  connection: "connection failed",
+  unclassified: "unclassified failure",
+} as const;
+
+/**
+ * The one class string with a variable part. `status` is a number swamp read
+ * off the response line, so it is coerced to a bounded integer here rather
+ * than being interpolated as whatever arrived. The endpoint path is
+ * deliberately NOT included: on the /api/v1/data path it carries an
+ * agent-supplied chart id, which is the same untrusted text this function
+ * exists to keep out of stored fields.
+ */
+function httpErrorClass(status: number): string {
+  const s = Number.isFinite(status) ? Math.trunc(status) : 0;
+  return `HTTP ${s} (${classifyStatus(s)})`;
+}
+
+/**
+ * A poll failure that already knows its own persisted class. `message` holds
+ * the full diagnostic for the log; `errorClass` is the only part ever stored.
+ */
+class NodeFailure extends Error {
+  readonly errorClass: string;
+  constructor(errorClass: string, detail: string) {
+    super(detail);
+    this.name = "NodeFailure";
+    this.errorClass = errorClass;
   }
-  // "HTTP 500 (transient) on /path: <body>" -> drop the body.
-  const http = raw.match(/^(HTTP \d+ \([^)]*\) on [^:\s]+)/);
-  if (http) return http[1];
-  if (/no HTTP response|connection failure/i.test(raw)) {
-    return "connection failed";
+}
+
+/**
+ * Map ssh's stderr to a class. This is still text matching, but the difference
+ * from the old design is the failure mode: a miss here returns the fixed
+ * `sshFailed` class, never the text it just failed to classify.
+ */
+function classifySshStderr(stderr: string, exitCode: number): string {
+  if (/host key|known_hosts|verification failed/i.test(stderr)) {
+    return NODE_ERROR.sshHostKey;
   }
-  if (/timed out|timeout/i.test(raw)) return "timed out";
-  // Fallback: strip anything that looks like an ssh target, then truncate.
-  return raw.replace(/\S+@\S+/g, "<host>").slice(0, 120);
+  if (/permission denied|load key|auth|publickey|password/i.test(stderr)) {
+    return NODE_ERROR.sshAuth;
+  }
+  const code = Number.isFinite(exitCode) ? Math.trunc(exitCode) : 0;
+  return code ? `${NODE_ERROR.sshFailed} (exit ${code})` : NODE_ERROR.sshFailed;
+}
+
+/**
+ * The class safe to PERSIST in a node's `error` field. Takes the thrown value,
+ * not a message string, so nothing can be reconstructed from prose.
+ *
+ * Anything that is not a NodeFailure is something the poll path did not raise
+ * on purpose -- a fetch-level network error, or a bug of ours. Those get a
+ * class from the error's NAME (a runtime type, never content), and anything
+ * unrecognised is `unclassified failure`. Losing detail is the point: this
+ * function fails closed.
+ */
+function sanitizeNodeError(e: unknown): string {
+  if (e instanceof NodeFailure) return e.errorClass;
+  const name = typeof e === "object" && e !== null
+    ? (e as { name?: unknown }).name
+    : undefined;
+  if (name === "TimeoutError" || name === "AbortError") {
+    return NODE_ERROR.timedOut;
+  }
+  // Deno's fetch raises TypeError for DNS failures, refused connections and
+  // TLS errors -- the ordinary "node is powered off" case.
+  if (name === "TypeError") return NODE_ERROR.connection;
+  return NODE_ERROR.unclassified;
+}
+
+/**
+ * Describe an unexpected value by its TYPE, never by its content. Used in the
+ * diagnostics attached to a malformed-response failure: even the log line has
+ * no reason to echo a payload it has already refused.
+ */
+function describeShape(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "array";
+  return typeof v;
 }
 
 /**
@@ -468,6 +705,22 @@ interface NodeResult {
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 /**
+ * The endpoint path as it may appear in a DIAGNOSTIC.
+ *
+ * Every path this model requests is one of its own literals -- except
+ * /api/v1/data, whose query string carries an agent-chosen chart id. That made
+ * the failure message for a per-mount query as long as the chart id: a rewritten
+ * /api/v1/charts listing one 8 MiB `disk_space.<...>` key produced an 8 MiB
+ * `{error}` log field, with the id's escape sequences intact for whatever
+ * renders the log. Bounded through the same agentText() the stored fields use,
+ * because the reason to bound a value is where it CAME from, not where it is
+ * going.
+ */
+function pathLabel(path: string): string {
+  return agentText(path);
+}
+
+/**
  * Read a response body, refusing to buffer more than MAX_RESPONSE_BYTES.
  * Checks the declared Content-Length first (cheap), then enforces the same cap
  * against what actually arrives, because Content-Length is attacker-supplied
@@ -476,9 +729,10 @@ const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 async function readBodyBounded(res: Response, path: string): Promise<string> {
   const declared = Number(res.headers.get("content-length") ?? "");
   if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
-    throw new Error(
-      `response too large on ${path}: declared ${declared} bytes, cap is ` +
-        `${MAX_RESPONSE_BYTES}`,
+    throw new NodeFailure(
+      NODE_ERROR.oversized,
+      `response too large on ${pathLabel(path)}: declared ${declared} ` +
+        `bytes, cap is ${MAX_RESPONSE_BYTES}`,
     );
   }
   if (!res.body) return "";
@@ -491,8 +745,10 @@ async function readBodyBounded(res: Response, path: string): Promise<string> {
       if (done) break;
       total += value.byteLength;
       if (total > MAX_RESPONSE_BYTES) {
-        throw new Error(
-          `response too large on ${path}: over the ${MAX_RESPONSE_BYTES}-byte cap`,
+        throw new NodeFailure(
+          NODE_ERROR.oversized,
+          `response too large on ${pathLabel(path)}: over the ` +
+            `${MAX_RESPONSE_BYTES}-byte cap`,
         );
       }
       chunks.push(value);
@@ -509,6 +765,29 @@ async function readBodyBounded(res: Response, path: string): Promise<string> {
     off += c.byteLength;
   }
   return new TextDecoder().decode(buf);
+}
+
+/**
+ * JSON.parse with the body kept out of the thrown error.
+ *
+ * `JSON.parse("<html>SECRET</html>")` throws
+ * `Unexpected token '<', "<html>SECR"... is not valid JSON` -- V8 quotes the
+ * input back at you. Both transports called JSON.parse bare, so that message
+ * became the node's failure message, and the persisted-error classifier's old
+ * regex denylist did not recognise it and fell through to storing it. A
+ * response body is remote-chosen text (the README's threat model has an
+ * on-path party writing it on a cleartext poll), so it must not appear in a
+ * stored field OR in a log line just because a parser happened to include it.
+ */
+function parseJsonBody(body: string, path: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new NodeFailure(
+      NODE_ERROR.malformed,
+      `${pathLabel(path)}: response is not valid JSON (${body.length} bytes)`,
+    );
+  }
 }
 
 type PollLogger = {
@@ -566,7 +845,19 @@ async function pollNode(
   // fast, and the node lands in the normal degraded path -- `signal` (the
   // caller's) is untouched, so this never looks like a cancellation.
   const budget = AbortSignal.timeout(limits.nodeBudgetSec * 1000);
-  const base = node.url.replace(/\/+$/, "");
+  // Canonicalised through the SAME function the schema validates with, so the
+  // string every endpoint is appended to is the one that was checked. The old
+  // `node.url.replace(/\/+$/, "")` was an independent, weaker normalisation at
+  // the call site -- see parseNodeUrl for what a query string did to endpoint
+  // construction when the two disagreed. Unreachable in practice (the schema
+  // has already run) and loud on purpose if it ever is not.
+  const base = parseNodeUrl(node.url);
+  if (base === null) {
+    throw new Error(
+      `node '${node.name}' has an unusable url; it must be a credential-free ` +
+        "http(s) URL with no query string or fragment",
+    );
+  }
   const result: NodeResult = {
     name: node.name,
     url: base,
@@ -602,14 +893,52 @@ async function pollNode(
     // Deno.Command buffers the subprocess's whole stdout, so a multi-gigabyte
     // body has already landed in our heap by the time we could measure it.
     // Refusing it at curl means it never crosses the wire in full.
-    const remote =
-      `curl -s --max-time ${timeoutSec} --max-filesize ${MAX_RESPONSE_BYTES} -w '${STATUS_MARKER}:%{http_code}' '${base}${
-        path.replace(/'/g, "")
-      }'`;
+    //
+    // `-q` MUST be first. It is what makes curl ignore /etc/curlrc,
+    // ~/.curlrc and $CURL_HOME/.curlrc, and curl applies config-file contents
+    // in argument order, so a `-q` placed later cannot undo what an earlier
+    // config already set. Without it, every transport guarantee in this file
+    // was the REMOTE box's to revoke: a one-line `.curlrc` in the reader
+    // account's home directory saying `insecure` turned off TLS verification
+    // for an https base, `location` re-enabled redirect following (the exact
+    // https->http downgrade the direct path refuses), `proxy = ...` routed the
+    // poll through a third party, and `user = ...` attached a credential to
+    // every request. None of that would appear anywhere in swamp's config,
+    // logs or stored data.
+    //
+    // Everything security-relevant is then stated explicitly rather than left
+    // at whatever the default happens to be:
+    //   --proto '=http,https'  the URL is already scheme-checked locally; this
+    //                          is the same refusal enforced at the far end.
+    //   (no -L / --location)   redirects are never followed, on either
+    //                          transport.
+    //   --noproxy '*'          this transport exists to reach an agent on the
+    //                          node's OWN loopback. A proxy from the remote
+    //                          environment is a relocation of the request, in
+    //                          the same class as a redirect.
+    //   -g                     globbing off. Not hardening but correctness:
+    //                          curl reads the [ ] of a bracketed IPv6 base URL
+    //                          as a glob range and fails the poll.
+    const remote = `curl -q -s -g --proto '=http,https' --noproxy '*' ` +
+      `--max-time ${timeoutSec} --max-filesize ${MAX_RESPONSE_BYTES} ` +
+      `-w '${STATUS_MARKER}:%{http_code}' '${base}${path.replace(/'/g, "")}'`;
     const out = await new Deno.Command("ssh", {
       args: [
         "-o",
         "BatchMode=yes",
+        // Explicit, because BatchMode alone does NOT guarantee it. BatchMode
+        // only turns an interactive host-key PROMPT into a failure; it has no
+        // effect when the operator's ssh_config already answers the question,
+        // and `StrictHostKeyChecking no` / `accept-new` in ~/.ssh/config or
+        // /etc/ssh/ssh_config are both common and both silently accept an
+        // unknown or changed key -- i.e. a machine-in-the-middle for a
+        // transport this extension's README calls fail-closed. A command-line
+        // -o wins over both config files (ssh takes the first value obtained),
+        // so stating it here makes the README's claim true regardless of how
+        // the host running swamp is configured. `yes`, not `accept-new`: the
+        // node's key must already be in known_hosts.
+        "-o",
+        "StrictHostKeyChecking=yes",
         "-o",
         `ConnectTimeout=${Math.min(timeoutSec, 10)}`,
         "-p",
@@ -629,7 +958,12 @@ async function pollNode(
 
     if (!out.success) {
       const err = new TextDecoder().decode(out.stderr).trim();
-      throw new Error(
+      // The class is decided HERE, where the code knows this is an ssh
+      // transport failure, and travels with the error. Nothing downstream
+      // re-derives it from the message -- which is what let an ssh identity
+      // containing whitespace push raw stderr into a stored field.
+      throw new NodeFailure(
+        classifySshStderr(err, out.code),
         `ssh to ${ssh.user}@${ssh.host} failed: ${
           err.slice(0, 160) || `exit ${out.code}`
         }`,
@@ -638,14 +972,20 @@ async function pollNode(
     const raw = new TextDecoder().decode(out.stdout);
     const markerIdx = raw.lastIndexOf(`${STATUS_MARKER}:`);
     if (markerIdx === -1) {
-      throw new Error(`no HTTP status marker in ssh response for ${path}`);
+      throw new NodeFailure(
+        NODE_ERROR.sshFailed,
+        `no HTTP status marker in ssh response for ${pathLabel(path)}`,
+      );
     }
     const body = raw.slice(0, markerIdx).trim();
     const status = Number(
       raw.slice(markerIdx + STATUS_MARKER.length + 1).trim(),
     );
     if (!Number.isFinite(status) || status === 0) {
-      throw new Error(`no HTTP response (connection failure) for ${path}`);
+      throw new NodeFailure(
+        NODE_ERROR.connection,
+        `no HTTP response (connection failure) for ${pathLabel(path)}`,
+      );
     }
     // Refuse a redirect explicitly rather than letting it fall through as
     // "empty response". curl runs without -L so it never FOLLOWS one, but a
@@ -655,20 +995,27 @@ async function pollNode(
     // somewhere else". Same refusal, same wording as the direct path below,
     // so an operator reads one behaviour across both transports.
     if (status >= 300 && status < 400) {
-      throw new Error(
-        `redirect refused on ${path} (HTTP ${status}); swamp does not ` +
-          "follow redirects",
+      throw new NodeFailure(
+        NODE_ERROR.redirect,
+        `redirect refused on ${pathLabel(path)} (HTTP ${status}); ` +
+          "swamp does not follow redirects",
       );
     }
     if (status >= 400) {
-      throw new Error(
-        `HTTP ${status} (${classifyStatus(status)}) on ${path}${
+      throw new NodeFailure(
+        httpErrorClass(status),
+        `HTTP ${status} (${classifyStatus(status)}) on ${pathLabel(path)}${
           body ? `: ${body.slice(0, 200)}` : ""
         }`,
       );
     }
-    if (!body) throw new Error(`empty response over ssh for ${path}`);
-    return JSON.parse(body);
+    if (!body) {
+      throw new NodeFailure(
+        NODE_ERROR.empty,
+        `empty response over ssh for ${pathLabel(path)}`,
+      );
+    }
+    return parseJsonBody(body, path);
   };
 
   const getDirect = async (path: string): Promise<unknown> => {
@@ -709,7 +1056,7 @@ async function pollNode(
           "{location} (following it can downgrade https to cleartext)",
         {
           node: node.name,
-          endpoint: path,
+          endpoint: pathLabel(path),
           status: res.status,
           location: (res.headers.get("location") ?? "<not exposed>").slice(
             0,
@@ -717,9 +1064,10 @@ async function pollNode(
           ),
         },
       );
-      throw new Error(
-        `redirect refused on ${path} (HTTP ${res.status}); swamp does not ` +
-          "follow redirects",
+      throw new NodeFailure(
+        NODE_ERROR.redirect,
+        `redirect refused on ${pathLabel(path)} (HTTP ${res.status}); ` +
+          "swamp does not follow redirects",
       );
     }
     if (!res.ok) {
@@ -727,20 +1075,21 @@ async function pollNode(
       // status class still surfaces -- that is the useful part of the error,
       // and the body is discarded before storage anyway.
       const bodyText = await readBodyBounded(res, path).catch(() => "");
-      throw new Error(
-        `HTTP ${res.status} (${classifyStatus(res.status)}) on ${path}${
-          bodyText ? `: ${bodyText.slice(0, 200)}` : ""
-        }`,
+      throw new NodeFailure(
+        httpErrorClass(res.status),
+        `HTTP ${res.status} (${classifyStatus(res.status)}) on ${
+          pathLabel(path)
+        }${bodyText ? `: ${bodyText.slice(0, 200)}` : ""}`,
       );
     }
     // Not res.json(): that buffers an unbounded body before parsing.
-    return JSON.parse(await readBodyBounded(res, path));
+    return parseJsonBody(await readBodyBounded(res, path), path);
   };
 
   const getJson = node.ssh ? getViaSsh : getDirect;
 
   try {
-    const info = await getJson("/api/v1/info") as Record<string, unknown>;
+    const info = expectObject(await getJson("/api/v1/info"), "/api/v1/info");
     result.reachable = true;
     result.info = info;
 
@@ -749,10 +1098,10 @@ async function pollNode(
     // logged (not just swallowed) so a degraded node is diagnosable without
     // reading stored data.
     try {
-      const al = await getJson("/api/v1/alarms?active=true") as Record<
-        string,
-        unknown
-      >;
+      const al = expectObject(
+        await getJson("/api/v1/alarms?active=true"),
+        "/api/v1/alarms",
+      );
       // /api/v1/info carries no hostname. The alarms payload does.
       if (!info.hostname && typeof al.hostname === "string") {
         result.info = { ...info, hostname: al.hostname };
@@ -770,8 +1119,10 @@ async function pollNode(
         ? {}
         : asRecord(al.alarms);
       if (!alarms) {
-        throw new Error(
-          "/api/v1/alarms: 'alarms' is not an object; refusing to enumerate it",
+        throw new NodeFailure(
+          NODE_ERROR.malformed,
+          "/api/v1/alarms: 'alarms' is not an object (got " +
+            `${describeShape(al.alarms)}); refusing to enumerate it`,
         );
       }
       const entries = Object.entries(alarms);
@@ -798,7 +1149,20 @@ async function pollNode(
           // array did the same. An alarm entry that is not an object has no
           // fields to read, so read none.
           const a = asRecord(raw) ?? {};
-          return { name, ...a };
+          // The OBJECT KEY is authoritative; the payload's own `name` field is
+          // discarded. This was `{ name, ...a }`, so the spread put an
+          // agent-chosen `name` back on top of the key it came under, and two
+          // entries under two different keys could both claim one name:
+          //   {"cpu_high": {"name":"x", "status":"CRITICAL", ...},
+          //    "mem_low":  {"name":"x", "status":"WARNING", ...}}
+          // Both then hashed to one instance name and the second write
+          // replaced the first, so a firing CRITICAL disappeared and the node
+          // still reported a successful, non-degraded alarm fetch. The key is
+          // the only part of the payload Netdata guarantees to be unique, so
+          // the key wins -- and discover() additionally refuses a second write
+          // to an already-claimed instance name, because being able to reason
+          // about identity in ONE place beats trusting the whole chain.
+          return { ...a, name };
         },
       );
       result.alarmsOk = true;
@@ -823,7 +1187,10 @@ async function pollNode(
     }
 
     try {
-      const ch = await getJson("/api/v1/charts") as Record<string, unknown>;
+      const ch = expectObject(
+        await getJson("/api/v1/charts"),
+        "/api/v1/charts",
+      );
       // Same narrowing as /api/v1/alarms above, for the same reason: absent
       // is zero charts, present-but-not-an-object is a failed sub-fetch. Here
       // it also fed `chartCount` and the `disk_space.` filter, so a string
@@ -832,8 +1199,10 @@ async function pollNode(
         ? {}
         : asRecord(ch.charts);
       if (!charts) {
-        throw new Error(
-          "/api/v1/charts: 'charts' is not an object; refusing to enumerate it",
+        throw new NodeFailure(
+          NODE_ERROR.malformed,
+          "/api/v1/charts: 'charts' is not an object (got " +
+            `${describeShape(ch.charts)}); refusing to enumerate it`,
         );
       }
       result.chartCount = Object.keys(charts).length;
@@ -861,6 +1230,15 @@ async function pollNode(
       }
       for (const chart of spaceCharts.slice(0, limits.maxMountsPerNode)) {
         const mount = chart.slice("disk_space.".length);
+        // Bounded and de-controlled BEFORE it is used as a log field. The
+        // stored fields have gone through agentText() since the field-size cap
+        // landed, but the log fields never did, and a chart id is exactly as
+        // agent-chosen as an alarm name: one 8 MiB `disk_space.<...>` key
+        // produced an 8 MiB log line per warning, with raw escape sequences
+        // intact for whatever renders the log. Same rule, same function, both
+        // destinations -- a value is bounded because of where it CAME from,
+        // not because of where it is going.
+        const mountLabel = agentText(mount);
         // Stop iterating once the node's overall budget is spent rather than
         // grinding through the remaining charts one aborted call at a time.
         // The mounts not reached are unknown, not gone: mountsTruncated keeps
@@ -875,10 +1253,13 @@ async function pollNode(
           break;
         }
         try {
-          const data = await getJson(
-            `/api/v1/data?chart=${encodeURIComponent(chart)}` +
-              `&after=-60&points=1&format=json`,
-          ) as { labels?: string[]; data?: number[][] };
+          const data = expectObject(
+            await getJson(
+              `/api/v1/data?chart=${encodeURIComponent(chart)}` +
+                `&after=-60&points=1&format=json`,
+            ),
+            "/api/v1/data",
+          );
           // Array.isArray, not `?? []`: a non-array `labels` made
           // labels.indexOf() throw and a non-array `data` made [0] read a
           // character or a property. Both are the same "cast instead of
@@ -908,7 +1289,15 @@ async function pollNode(
             logger.warning(
               "netdata {node} mount {mount}: avail/used dimensions not " +
                 "found in chart data (labels: {labels}) -- keeping last known",
-              { node: node.name, mount, labels: labels.join(",") },
+              {
+                node: node.name,
+                mount: mountLabel,
+                // The label list is agent-chosen too, and there is no cap on
+                // how many labels a /data response may claim.
+                labels: agentText(
+                  labels.slice(0, 16).map((l) => agentText(l)).join(","),
+                ),
+              },
             );
             continue;
           }
@@ -922,8 +1311,8 @@ async function pollNode(
             "netdata {node} mount {mount} data query failed: {error}",
             {
               node: node.name,
-              mount,
-              endpoint: chart,
+              mount: mountLabel,
+              endpoint: agentText(chart),
               error: (e as Error).message,
             },
           );
@@ -953,8 +1342,11 @@ async function pollNode(
     // in logs, not just in stored data someone has to go query. The FULL
     // detail (ssh user@host, ssh stderr, HTTP body) goes to the log. The
     // stored `error` gets only a sanitized class, see sanitizeNodeError.
+    // sanitizeNodeError takes the THROWN VALUE, not its message: the class is
+    // read off the error object where the throw site put it, never recovered
+    // by pattern-matching prose that a remote may have contributed to.
     const rawMsg = (e as Error).message;
-    result.error = sanitizeNodeError(rawMsg);
+    result.error = sanitizeNodeError(e);
     logger.warning(
       "netdata {node} unreachable: {error}",
       { node: node.name, url: base, error: rawMsg.slice(0, 300) },
@@ -1068,6 +1460,34 @@ async function discover(
 
   const handles = [];
   const live = new Set<string>();
+  /**
+   * Every instance name this sweep generates is claimed here exactly once, and
+   * a second claim on the same name is REFUSED rather than allowed to overwrite.
+   *
+   * instanceName() is collision-resistant (64-bit hash over a length-prefixed
+   * identity), and the node instance name is collision-CHECKED at config parse
+   * above. Neither is a proof. Nothing in the alarm and mount identities is
+   * operator-controlled -- the alarm name, chart id and mount path all come
+   * off an unauthenticated agent -- so "resistant" is a probability statement
+   * about an input somebody else chooses. The consequence of losing that bet
+   * has always been the same and has never been visible: writeResource on an
+   * existing name replaces the record, so the losing write is a firing
+   * CRITICAL or an over-threshold filesystem that quietly stops existing,
+   * with no warning and no degraded flag.
+   *
+   * Refusing the second write is the direction to fail in: keeping the first
+   * record and marking the node degraded preserves data and says so, where
+   * overwriting destroys data and says nothing. The node's prefix is also
+   * protected from the prune, so neither record is deleted while the sweep is
+   * knowingly incomplete.
+   */
+  const claimedNames = new Map<string, string>();
+  const claimName = (name: string, describe: string): boolean => {
+    const first = claimedNames.get(name);
+    if (first !== undefined) return false;
+    claimedNames.set(name, describe);
+    return true;
+  };
   // Prefixes of existing resource names that must survive this round's
   // prune even though nothing new was written under them -- the node
   // answered before but a sub-fetch failed this round (or the node is
@@ -1085,6 +1505,10 @@ async function discover(
 
   for (const r of results) {
     const info = r.info;
+    // Set when two of this node's records generate one instance name. Feeds
+    // the same degraded/preserve path a failed sub-fetch takes: this round's
+    // write set is knowingly not the whole picture.
+    let nameCollision = false;
     // agentText, not String(): these counts and the `status` field stored on
     // each alarm record must be derived from the SAME string, or a node could
     // report alarmsCritical: 0 while one of its own alarm records reads
@@ -1116,6 +1540,16 @@ async function discover(
       const aChart = agentText(a.chart);
       const aStatus = agentText(a.status);
       const an = instanceName("alarm", r.name, a.name, a.chart);
+      if (!claimName(an, `alarm ${aName}`)) {
+        nameCollision = true;
+        ctx.logger.warning(
+          "netdata {node}: alarm {alarm} generated an instance name already " +
+            "claimed this sweep ({name}) -- refusing the second write so the " +
+            "first record survives, and marking the node degraded",
+          { node: r.name, alarm: aName, name: an },
+        );
+        continue;
+      }
       live.add(an);
       // An alarm value we cannot read is null, NOT 0. `Number(a.value ?? 0)`
       // turned Netdata's `"value": null` (a nan calculation -- collector gap,
@@ -1136,8 +1570,11 @@ async function discover(
             "({raw}) -- stored as null (unknown), not 0",
           {
             node: r.name,
-            alarm: String(a.name ?? ""),
-            raw: String(rawValue),
+            // agentText, not String(): same rule as the stored fields. An
+            // alarm name is agent-chosen, so it is bounded and de-controlled
+            // wherever it goes, log line included.
+            alarm: aName,
+            raw: agentText(rawValue),
           },
         );
       }
@@ -1172,13 +1609,26 @@ async function discover(
       const total = m.avail + m.used;
       const pct = total > 0 ? Math.round((m.used / total) * 1000) / 10 : 0;
       const over = pct >= g.diskWarnPercent;
-      if (over) nodeOver++;
       // Same rule as the alarm write above: the mount path comes out of an
       // agent-supplied chart id, so it is agent text like any other, and
       // instanceName() does its own normalising of the raw value.
       const mPath = agentText(m.mount);
       const mn = instanceName("mount", r.name, m.mount);
+      if (!claimName(mn, `mount ${mPath}`)) {
+        nameCollision = true;
+        ctx.logger.warning(
+          "netdata {node}: mount {mount} generated an instance name already " +
+            "claimed this sweep ({name}) -- refusing the second write so the " +
+            "first record survives, and marking the node degraded",
+          { node: r.name, mount: mPath, name: mn },
+        );
+        continue;
+      }
       live.add(mn);
+      // Counted only once the write is going ahead. Counting before the claim
+      // let a refused duplicate contribute a phantom over-threshold mount to
+      // the node total and the summary roll-up.
+      if (over) nodeOver++;
       handles.push(
         await ctx.writeResource("mount", mn, {
           node: r.name,
@@ -1219,6 +1669,14 @@ async function discover(
       // (or the reverse) would make this miss the preserved record it exists
       // to find, and the carried-forward over-threshold count would read 0.
       const fn = instanceName("mount", r.name, failedMount);
+      // Claimed like a write, because a duplicate here is the same defect
+      // wearing different clothes: two failed mounts landing on one name would
+      // read the SAME preserved record twice and count one over-threshold
+      // filesystem as two.
+      if (!claimName(fn, `mount ${agentText(failedMount)} (carried forward)`)) {
+        nameCollision = true;
+        continue;
+      }
       live.add(fn);
       const prevMount = await ctx.readResource(fn);
       if (prevMount?.overThreshold === true) carriedOver++;
@@ -1227,6 +1685,30 @@ async function discover(
     // ---- node -------------------------------------------------------------
     if (r.reachable) reachable++;
     const nn = `node-${slug(r.name)}`;
+    // The node instance name stays hash-free -- typeable in `swamp data get`,
+    // which is the whole reason it is not built like the alarm and mount names.
+    //
+    // The 2026-08-30 review asked for the alarm/mount identity scheme here
+    // instead. Declining, deliberately, because the two cases are not alike:
+    // a node name is OPERATOR-supplied and finite, so a collision can be
+    // refused at parse time with an error naming both offenders (see the
+    // slug-clash check at the top of discover()), whereas alarm and mount
+    // identities arrive from an unauthenticated agent mid-sweep and can only
+    // be made improbable. Adopting a hash here would trade a config error the
+    // operator can fix in one edit for an opaque suffix on every node record,
+    // and would rename every existing node record to do it.
+    //
+    // What the review is right about is that a check somewhere else is not a
+    // guarantee here, so the generated ID is claimed like any other: if the
+    // parse-time check is ever weakened or bypassed, this throws instead of
+    // one machine's state landing silently under another's name.
+    if (!claimName(nn, `node ${r.name}`)) {
+      throw new Error(
+        `Node '${r.name}' generated the instance name '${nn}', which another ` +
+          "node in this sweep already claimed. Node names must stay distinct " +
+          "after normalisation.",
+      );
+    }
     live.add(nn);
 
     // Identity and detail fields depend on this poll actually reaching
@@ -1310,9 +1792,19 @@ async function discover(
     // a single mount's /data call failing and a capped/truncated list are the
     // same thing at smaller scale, and used not to count -- so a node with a
     // stale mount reading looked perfectly healthy in the summary.
+    // A refused duplicate instance name belongs in the same bucket: a record
+    // this sweep observed but did not store is missing data, exactly like a
+    // sub-fetch that failed, and it must not read as a healthy full picture.
     const partial = !r.alarmsOk || !r.chartsOk ||
-      r.failedMounts.length > 0 || r.alarmsTruncated || r.mountsTruncated;
+      r.failedMounts.length > 0 || r.alarmsTruncated || r.mountsTruncated ||
+      nameCollision;
     if (r.reachable && partial) nodesDegraded++;
+    if (nameCollision) {
+      // Nothing of this node's may be pruned while we know the write set is
+      // short of what the node actually reported.
+      protectedPrefixes.push(instanceNamePrefix("alarm", r.name));
+      protectedPrefixes.push(instanceNamePrefix("mount", r.name));
+    }
 
     handles.push(
       await ctx.writeResource("node", nn, {
