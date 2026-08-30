@@ -93,6 +93,46 @@ const GlobalArgsSchema = z.object({
         "otherwise exhaust local sockets or spawn an unbounded number of " +
         "ssh processes at the same time.",
     ),
+  // The three caps below bound how much work ONE node can impose on a sweep.
+  // Everything after /api/v1/info is attacker-influenced: the README's own
+  // threat model says an on-path party can rewrite the agent's responses, and
+  // nothing here is authenticated. Before these existed, a rewritten
+  // /api/v1/charts listing 50,000 `disk_space.*` keys -- a tiny payload --
+  // drove 50,000 sequential /api/v1/data calls, each one a fresh
+  // `Deno.Command("ssh", ...)` subprocess on the ssh transport with its own
+  // full timeoutSec, holding a maxConcurrency worker slot for hours. The
+  // per-call timeoutSec bounded a call; nothing bounded a node.
+  maxMountsPerNode: z
+    .number()
+    .int()
+    .positive()
+    .default(256)
+    .describe(
+      "Maximum disk_space.* charts polled per node. Past this the extra " +
+        "mounts are skipped, the node is marked degraded, and its existing " +
+        "mount records are preserved rather than pruned.",
+    ),
+  maxAlarmsPerNode: z
+    .number()
+    .int()
+    .positive()
+    .default(512)
+    .describe(
+      "Maximum active alarms recorded per node. Past this the extra alarms " +
+        "are skipped, the node is marked degraded, and its existing alarm " +
+        "records are preserved rather than pruned.",
+    ),
+  nodeBudgetSec: z
+    .number()
+    .int()
+    .positive()
+    .default(300)
+    .describe(
+      "Wall-clock ceiling for one node's ENTIRE poll (info + alarms + " +
+        "charts + every per-mount data query). timeoutSec bounds a single " +
+        "call; this bounds the node, so one slow or hostile agent cannot " +
+        "hold a concurrency slot indefinitely.",
+    ),
 });
 
 const DiscoverArgsSchema = z.object({
@@ -133,7 +173,15 @@ const AlarmSchema = z.object({
   name: z.string(),
   chart: z.string(),
   status: z.string(),
-  value: z.number(),
+  /**
+   * Nullable for the same reason the node identity fields are: "Netdata could
+   * not calculate a value for this alarm" is a distinct state from "the value
+   * is zero". Netdata serialises a nan calculation (collector gap, freshly
+   * triggered alarm) as `null`, and the previous `Number(a.value ?? 0)` stored
+   * that as a real-looking 0 -- indistinguishable from a genuine 0% free.
+   * null means unknown. See the write site in discover().
+   */
+  value: z.number().nullable(),
   units: z.string(),
   info: z.string(),
 });
@@ -152,9 +200,11 @@ const SummarySchema = z.object({
   nodes: z.number(),
   nodesReachable: z.number(),
   nodesUnreachable: z.number(),
-  /** Reachable nodes whose alarm or chart sub-fetch failed this sweep, so
-   * their alarm/mount counts are carried-forward, not fresh. When > 0, treat
-   * the alarm/mount roll-ups as a floor, not a current total. */
+  /** Reachable nodes that did not answer completely this sweep: an alarm or
+   * chart sub-fetch failed, an individual mount's data query failed, or the
+   * alarm/mount list hit its per-node cap. Their alarm/mount counts include
+   * carried-forward values, not purely fresh ones. When > 0, treat the
+   * alarm/mount roll-ups as a floor, not a current total. */
   nodesDegraded: z.number(),
   alarmsActive: z.number(),
   alarmsCritical: z.number(),
@@ -175,6 +225,14 @@ function shortHash(input: string): string {
   }
   return (h >>> 0).toString(16).padStart(8, "0");
 }
+
+/**
+ * Cap on the readable part of an instance name. Shared by instanceName() and
+ * instanceNamePrefix() so the two can never drift -- a prefix computed with a
+ * different cap silently stops matching stored names, which is exactly how the
+ * prune-safety net broke for long node names.
+ */
+const LABEL_MAX = 48;
 
 function slug(v: string): string {
   return v.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") ||
@@ -210,8 +268,29 @@ function instanceName(prefix: string, ...identity: string[]): string {
   const parts = identity.filter((s) => s !== "").map(slug).filter((s) =>
     s !== ""
   );
-  const label = parts.length ? parts.join("-").slice(0, 48) : "unnamed";
+  const label = parts.length ? parts.join("-").slice(0, LABEL_MAX) : "unnamed";
   return `${prefix}-${label}-${shortHash(raw)}`;
+}
+
+/**
+ * The `startsWith` prefix that matches every instanceName() whose FIRST
+ * identity field is `scope`. Used by discover()'s prune-safety net.
+ *
+ * Must go through the same LABEL_MAX truncation instanceName() applies, which
+ * is why this is a shared helper and not a `${prefix}-${slug(scope)}-`
+ * template at the call site. That template was the bug: for a node whose slug
+ * ran past LABEL_MAX characters, the stored record was named
+ * `alarm-<first-48-chars>-<hash>` while the protection pushed
+ * `alarm-<full-60-char-slug>-`, so startsWith never matched and every
+ * preserved alarm record for that node -- including a firing CRITICAL whose
+ * fetch had just failed -- was deleted and logged only as "pruned {name}".
+ *
+ * Two nodes whose slugs share their first LABEL_MAX characters will protect
+ * each other's records. That over-protects (a departed record lingers one
+ * more sweep) rather than under-protects, which is the direction to fail in.
+ */
+function instanceNamePrefix(prefix: string, scope: string): string {
+  return `${prefix}-${slug(scope).slice(0, LABEL_MAX)}-`;
 }
 
 /**
@@ -248,6 +327,19 @@ function sanitizeNodeError(raw: string): string {
   return raw.replace(/\S+@\S+/g, "<host>").slice(0, 120);
 }
 
+/**
+ * Coerce an untrusted value to a finite count, falling back to 0. Every count
+ * field on NodeStateSchema is a plain z.number(), which rejects NaN -- and
+ * swamp's writeResource only warns on a schema mismatch rather than throwing,
+ * so a NaN would be stored regardless. Nothing here is a case where NaN is
+ * meaningful (unlike an alarm value or a mount dimension, where "unknown" is
+ * real and gets represented, not defaulted).
+ */
+function countOrZero(v: unknown): number {
+  const n = Number(v ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
 /** Netdata's alarm status strings; anything else counts as neither. */
 function isCritical(status: string): boolean {
   return status.toUpperCase() === "CRITICAL";
@@ -275,6 +367,64 @@ interface NodeResult {
   chartsOk: boolean;
   /** Chart names whose /data query failed individually, chartsOk otherwise true. */
   failedMounts: string[];
+  /** True when maxMountsPerNode / the node budget cut the mount sweep short. */
+  mountsTruncated: boolean;
+  /** True when maxAlarmsPerNode cut the alarm list short. */
+  alarmsTruncated: boolean;
+}
+
+/**
+ * Hard ceiling on a single API response body. Nothing about the agent API is
+ * authenticated, so response size is attacker-influenced (see the cap comments
+ * on GlobalArgsSchema): `await res.json()` on a rewritten multi-gigabyte body
+ * buffers the whole thing into the sweep's heap before any of the count caps
+ * downstream ever get a chance to look at it. 8 MiB is roughly two orders of
+ * magnitude above the largest real /api/v1/charts payload.
+ */
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Read a response body, refusing to buffer more than MAX_RESPONSE_BYTES.
+ * Checks the declared Content-Length first (cheap), then enforces the same cap
+ * against what actually arrives, because Content-Length is attacker-supplied
+ * too and may be absent or a lie.
+ */
+async function readBodyBounded(res: Response, path: string): Promise<string> {
+  const declared = Number(res.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    throw new Error(
+      `response too large on ${path}: declared ${declared} bytes, cap is ` +
+        `${MAX_RESPONSE_BYTES}`,
+    );
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        throw new Error(
+          `response too large on ${path}: over the ${MAX_RESPONSE_BYTES}-byte cap`,
+        );
+      }
+      chunks.push(value);
+    }
+  } finally {
+    // Cancel rather than releaseLock: on the over-cap throw the remote is
+    // still sending, and we want the connection torn down, not drained.
+    await reader.cancel().catch(() => {});
+  }
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    buf.set(c, off);
+    off += c.byteLength;
+  }
+  return new TextDecoder().decode(buf);
 }
 
 type PollLogger = {
@@ -317,10 +467,21 @@ async function pollNode(
     url: string;
     ssh?: { host: string; user: string; port?: number };
   },
-  timeoutSec: number,
+  limits: {
+    timeoutSec: number;
+    maxMountsPerNode: number;
+    maxAlarmsPerNode: number;
+    nodeBudgetSec: number;
+  },
   signal: AbortSignal,
   logger: PollLogger,
 ): Promise<NodeResult> {
+  const { timeoutSec } = limits;
+  // One deadline for this node's whole poll. Wired into every sub-fetch below
+  // so that when it fires the in-flight call aborts, the remaining ones fail
+  // fast, and the node lands in the normal degraded path -- `signal` (the
+  // caller's) is untouched, so this never looks like a cancellation.
+  const budget = AbortSignal.timeout(limits.nodeBudgetSec * 1000);
   const base = node.url.replace(/\/+$/, "");
   const result: NodeResult = {
     name: node.name,
@@ -334,6 +495,8 @@ async function pollNode(
     alarmsOk: false,
     chartsOk: false,
     failedMounts: [],
+    mountsTruncated: false,
+    alarmsTruncated: false,
   };
 
   const STATUS_MARKER = "__SWAMP_HTTP_STATUS__";
@@ -351,8 +514,12 @@ async function pollNode(
     // after the body with no separator, and the marker string is
     // distinctive enough that a plain concatenation is unambiguous to
     // locate and strip below.
+    // --max-filesize is the ssh transport's half of the response-size cap:
+    // Deno.Command buffers the subprocess's whole stdout, so a multi-gigabyte
+    // body has already landed in our heap by the time we could measure it.
+    // Refusing it at curl means it never crosses the wire in full.
     const remote =
-      `curl -s --max-time ${timeoutSec} -w '${STATUS_MARKER}:%{http_code}' '${base}${
+      `curl -s --max-time ${timeoutSec} --max-filesize ${MAX_RESPONSE_BYTES} -w '${STATUS_MARKER}:%{http_code}' '${base}${
         path.replace(/'/g, "")
       }'`;
     const out = await new Deno.Command("ssh", {
@@ -371,6 +538,7 @@ async function pollNode(
       stderr: "piped",
       signal: AbortSignal.any([
         signal,
+        budget,
         AbortSignal.timeout((timeoutSec + 10) * 1000),
       ]),
     }).output();
@@ -409,17 +577,25 @@ async function pollNode(
   const getDirect = async (path: string): Promise<unknown> => {
     const res = await fetch(`${base}${path}`, {
       headers: { Accept: "application/json" },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutSec * 1000)]),
+      signal: AbortSignal.any([
+        signal,
+        budget,
+        AbortSignal.timeout(timeoutSec * 1000),
+      ]),
     });
     if (!res.ok) {
-      const bodyText = await res.text().catch(() => "");
+      // Swallow a read failure here (including the size cap) so the HTTP
+      // status class still surfaces -- that is the useful part of the error,
+      // and the body is discarded before storage anyway.
+      const bodyText = await readBodyBounded(res, path).catch(() => "");
       throw new Error(
         `HTTP ${res.status} (${classifyStatus(res.status)}) on ${path}${
           bodyText ? `: ${bodyText.slice(0, 200)}` : ""
         }`,
       );
     }
-    return await res.json();
+    // Not res.json(): that buffers an unbounded body before parsing.
+    return JSON.parse(await readBodyBounded(res, path));
   };
 
   const getJson = node.ssh ? getViaSsh : getDirect;
@@ -443,12 +619,40 @@ async function pollNode(
         result.info = { ...info, hostname: al.hostname };
       }
       const alarms = (al.alarms ?? {}) as Record<string, unknown>;
-      result.alarms = Object.entries(alarms).map(([name, raw]) => {
-        const a = (raw ?? {}) as Record<string, unknown>;
-        return { name, ...a };
-      });
+      const entries = Object.entries(alarms);
+      // Cap the alarm list: every entry becomes a writeResource call, so an
+      // agent (or an on-path rewriter) returning 50,000 alarms turned one
+      // node into 50,000 sequential writes in a single sweep.
+      if (entries.length > limits.maxAlarmsPerNode) {
+        result.alarmsTruncated = true;
+        logger.warning(
+          "netdata {node} returned {count} active alarms, over the " +
+            "maxAlarmsPerNode cap of {cap} -- recording the first {cap} and " +
+            "marking the node degraded",
+          {
+            node: node.name,
+            count: entries.length,
+            cap: limits.maxAlarmsPerNode,
+          },
+        );
+      }
+      result.alarms = entries.slice(0, limits.maxAlarmsPerNode).map(
+        ([name, raw]) => {
+          const a = (raw ?? {}) as Record<string, unknown>;
+          return { name, ...a };
+        },
+      );
       result.alarmsOk = true;
     } catch (e) {
+      // Cancellation is the run being pulled out from under us, not an
+      // observation about this node. Without this the abort was absorbed
+      // here, classified as "degraded sub-fetch", and discover() went on to
+      // persist a full set of records plus a summary with a fresh syncedAt
+      // for a sweep the caller had already cancelled. Same guard as the
+      // outer catch below -- it must exist in EVERY catch on this path,
+      // because with nodes.length <= maxConcurrency no later pollNode is
+      // ever dequeued to rethrow on its behalf.
+      if (signal.aborted) throw e;
       logger.warning(
         "netdata {node} /api/v1/alarms failed: {error}",
         {
@@ -469,8 +673,37 @@ async function pollNode(
       const spaceCharts = Object.keys(charts).filter((k) =>
         k.startsWith("disk_space.")
       );
-      for (const chart of spaceCharts) {
+      // Cap the mount sweep. Each chart below costs a full /api/v1/data call
+      // -- and on the ssh transport a fresh ssh subprocess with its own
+      // timeoutSec -- so an unbounded chart list was an unbounded poll.
+      if (spaceCharts.length > limits.maxMountsPerNode) {
+        result.mountsTruncated = true;
+        logger.warning(
+          "netdata {node} listed {count} disk_space charts, over the " +
+            "maxMountsPerNode cap of {cap} -- polling the first {cap} and " +
+            "marking the node degraded",
+          {
+            node: node.name,
+            count: spaceCharts.length,
+            cap: limits.maxMountsPerNode,
+          },
+        );
+      }
+      for (const chart of spaceCharts.slice(0, limits.maxMountsPerNode)) {
         const mount = chart.slice("disk_space.".length);
+        // Stop iterating once the node's overall budget is spent rather than
+        // grinding through the remaining charts one aborted call at a time.
+        // The mounts not reached are unknown, not gone: mountsTruncated keeps
+        // their stored records from being pruned.
+        if (budget.aborted) {
+          result.mountsTruncated = true;
+          logger.warning(
+            "netdata {node} hit the {budget}s node budget with mounts still " +
+              "unpolled -- keeping their last known records",
+            { node: node.name, budget: limits.nodeBudgetSec },
+          );
+          break;
+        }
         try {
           const data = await getJson(
             `/api/v1/data?chart=${encodeURIComponent(chart)}` +
@@ -503,6 +736,9 @@ async function pollNode(
           }
           result.mounts.push({ mount, avail, used });
         } catch (e) {
+          // See the alarms catch: an abort on the CALLER's signal must not be
+          // laundered into a per-mount failure and swallowed.
+          if (signal.aborted) throw e;
           result.failedMounts.push(mount);
           logger.warning(
             "netdata {node} mount {mount} data query failed: {error}",
@@ -516,6 +752,8 @@ async function pollNode(
         }
       }
     } catch (e) {
+      // See the alarms catch.
+      if (signal.aborted) throw e;
       logger.warning(
         "netdata {node} /api/v1/charts failed: {error}",
         {
@@ -609,7 +847,18 @@ async function discover(
   const results = await mapWithConcurrency(
     targets,
     g.maxConcurrency,
-    (n) => pollNode(n, g.timeoutSec, ctx.signal, ctx.logger),
+    (n) =>
+      pollNode(
+        n,
+        {
+          timeoutSec: g.timeoutSec,
+          maxMountsPerNode: g.maxMountsPerNode,
+          maxAlarmsPerNode: g.maxAlarmsPerNode,
+          nodeBudgetSec: g.nodeBudgetSec,
+        },
+        ctx.signal,
+        ctx.logger,
+      ),
   );
 
   const handles = [];
@@ -638,11 +887,13 @@ async function discover(
       r.alarms.filter((a) => isWarning(String(a.status ?? ""))).length;
 
     // ---- alarms ---------------------------------------------------------
-    if (!r.alarmsOk) {
+    if (!r.alarmsOk || r.alarmsTruncated) {
       // Alarm fetch failed (or node unreachable, which never gets this far
-      // truthfully -- alarmsOk starts false). Preserve whatever this node's
+      // truthfully -- alarmsOk starts false), or the list was capped so we
+      // never saw the tail of it. Either way this round's write set is not a
+      // complete picture of the node's alarms, so preserve whatever the
       // existing alarm-* records already say instead of pruning them.
-      protectedPrefixes.push(`alarm-${slug(r.name)}-`);
+      protectedPrefixes.push(instanceNamePrefix("alarm", r.name));
     }
     for (const a of r.alarms) {
       const an = instanceName(
@@ -652,13 +903,37 @@ async function discover(
         String(a.chart ?? ""),
       );
       live.add(an);
+      // An alarm value we cannot read is null, NOT 0. `Number(a.value ?? 0)`
+      // turned Netdata's `"value": null` (a nan calculation -- collector gap,
+      // freshly-triggered alarm) into a stored 0, indistinguishable from a
+      // genuine "0% free" reading, so anything paging off the value could not
+      // tell unknown from critically-zero. It also let a non-numeric value
+      // through as NaN, which writeResource only warns about rather than
+      // rejecting. This is the same `?? 0` mistake already fixed for mount
+      // dimensions in pollNode -- fixed the same way, by refusing to guess.
+      const rawValue = a.value;
+      const numericValue = rawValue === null || rawValue === undefined
+        ? NaN
+        : Number(rawValue);
+      const value = Number.isFinite(numericValue) ? numericValue : null;
+      if (value === null) {
+        ctx.logger.warning(
+          "netdata {node} alarm {alarm}: value is not a finite number " +
+            "({raw}) -- stored as null (unknown), not 0",
+          {
+            node: r.name,
+            alarm: String(a.name ?? ""),
+            raw: String(rawValue),
+          },
+        );
+      }
       handles.push(
         await ctx.writeResource("alarm", an, {
           node: r.name,
           name: String(a.name ?? ""),
           chart: String(a.chart ?? ""),
           status: String(a.status ?? ""),
-          value: Number(a.value ?? 0),
+          value,
           units: String(a.units ?? ""),
           info: String(a.info ?? ""),
         }, {
@@ -670,8 +945,8 @@ async function discover(
     // after the node record is built below)
 
     // ---- mounts ---------------------------------------------------------
-    if (!r.chartsOk) {
-      protectedPrefixes.push(`mount-${slug(r.name)}-`);
+    if (!r.chartsOk || r.mountsTruncated) {
+      protectedPrefixes.push(instanceNamePrefix("mount", r.name));
     }
     let nodeOver = 0;
     for (const m of r.mounts) {
@@ -698,8 +973,27 @@ async function discover(
     // A mount whose data query failed individually (chart list was fine,
     // this one chart's /data call wasn't) keeps its own last-known record
     // rather than being dropped from this round's write set.
+    //
+    // It must also keep being COUNTED. Previously the record survived here
+    // but mountsOverThreshold was recomputed from this round's fresh mounts
+    // alone, which excludes the failed one: a mount that was over threshold
+    // last round and 500s this round dropped the node's count from 1 to 0 and
+    // the summary's with it, while the mount's own preserved record still
+    // read overThreshold:true. Nothing was marked degraded either, so the
+    // SummarySchema's documented "treat the roll-ups as a floor when
+    // nodesDegraded > 0" escape hatch never fired. It read as a disk that
+    // drained rather than a reading we do not have.
+    //
+    // Counted per failed mount from its own preserved record rather than by
+    // carrying forward the whole previous node total: carrying the total
+    // would throw away the fresh readings from the mounts that DID answer,
+    // and would report 0 whenever the previous sweep had never seen the node.
+    let carriedOver = 0;
     for (const failedMount of r.failedMounts) {
-      live.add(instanceName("mount", r.name, failedMount));
+      const fn = instanceName("mount", r.name, failedMount);
+      live.add(fn);
+      const prevMount = await ctx.readResource(fn);
+      if (prevMount?.overThreshold === true) carriedOver++;
     }
 
     // ---- node -------------------------------------------------------------
@@ -723,7 +1017,12 @@ async function discover(
         hostname: typeof info.hostname === "string" ? info.hostname : null,
         osName: typeof info.os_name === "string" ? info.os_name : null,
         osVersion: typeof info.os_version === "string" ? info.os_version : null,
-        cores: Number(info.cores_total ?? 0),
+        // countOrZero, not Number(x ?? 0): /api/v1/info is unauthenticated,
+        // so cores_total is whatever the agent (or an on-path rewriter) says.
+        // A non-numeric value made this NaN, and NaN fails NodeStateSchema's
+        // z.number() -- which writeResource only WARNS about, so the bad
+        // value reached the store anyway.
+        cores: countOrZero(info.cores_total),
         collectors: Array.isArray(info.collectors) ? info.collectors.length : 0,
         // Whether this agent streams to Netdata Cloud. Recorded because it
         // is a data-egress fact worth being able to audit per node.
@@ -736,24 +1035,26 @@ async function discover(
         hostname: (prevNode?.hostname as string | null | undefined) ?? null,
         osName: (prevNode?.osName as string | null | undefined) ?? null,
         osVersion: (prevNode?.osVersion as string | null | undefined) ?? null,
-        cores: Number(prevNode?.cores ?? 0),
-        collectors: Number(prevNode?.collectors ?? 0),
+        cores: countOrZero(prevNode?.cores),
+        collectors: countOrZero(prevNode?.collectors),
         claimedToCloud: Boolean(prevNode?.claimedToCloud ?? false),
       };
 
-    const chartsVal = r.chartsOk ? r.chartCount : Number(prevNode?.charts ?? 0);
+    const chartsVal = r.chartsOk ? r.chartCount : countOrZero(prevNode?.charts);
+    // Fresh over-threshold mounts, plus the ones we could not read this round
+    // but which were over threshold when we last could (see carriedOver).
     const mountsOverVal = r.chartsOk
-      ? nodeOver
-      : Number(prevNode?.mountsOverThreshold ?? 0);
+      ? nodeOver + carriedOver
+      : countOrZero(prevNode?.mountsOverThreshold);
     const alarmsActiveVal = r.alarmsOk
       ? r.alarms.length
-      : Number(prevNode?.alarmsActive ?? 0);
+      : countOrZero(prevNode?.alarmsActive);
     const alarmsCriticalVal = r.alarmsOk
       ? nodeAlarmsCritical
-      : Number(prevNode?.alarmsCritical ?? 0);
+      : countOrZero(prevNode?.alarmsCritical);
     const alarmsWarningVal = r.alarmsOk
       ? nodeAlarmsWarning
-      : Number(prevNode?.alarmsWarning ?? 0);
+      : countOrZero(prevNode?.alarmsWarning);
 
     // Roll up the values actually written for this node (carried-forward
     // included), so the summary can never read "0 alarms" for a node whose
@@ -761,7 +1062,14 @@ async function discover(
     alarmsActive += alarmsActiveVal;
     alarmsCritical += alarmsCriticalVal;
     overThreshold += mountsOverVal;
-    if (r.reachable && (!r.alarmsOk || !r.chartsOk)) nodesDegraded++;
+    // "Degraded" is any reachable node whose write set this round is not a
+    // complete, fresh picture. A whole sub-fetch failing is the obvious case;
+    // a single mount's /data call failing and a capped/truncated list are the
+    // same thing at smaller scale, and used not to count -- so a node with a
+    // stale mount reading looked perfectly healthy in the summary.
+    const partial = !r.alarmsOk || !r.chartsOk ||
+      r.failedMounts.length > 0 || r.alarmsTruncated || r.mountsTruncated;
+    if (r.reachable && partial) nodesDegraded++;
 
     handles.push(
       await ctx.writeResource("node", nn, {
