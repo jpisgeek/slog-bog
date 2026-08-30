@@ -20,7 +20,8 @@ caveats: >-
   reports do not expose request counts. Enterprise cost and usage are available
   only to eligible plans; grouped buckets can omit groups beyond Anthropic's
   documented top-100 cap, and recent values may be revised for 30 days. Cost
-  amounts are retained in provider minor units. This extension does not inspect
+  amounts are the Cost Report's own decimal strings in the currency's major
+  unit, so "1.25" is 1.25 USD and not 1.25 cents. This extension does not inspect
   personal subscriptions, infer remaining quota, or calculate cost from a
   mutable public price table.
 security: >-

@@ -454,8 +454,12 @@ const SnapshotSchema = z.object({
     groupedTop100Cap: z.boolean(),
   }).nullable(),
   costs: z.object({
-    totalsMinor: z.array(
-      z.object({ currency: z.string(), amountMinor: z.string() }),
+    // `amount`, not `amountMinor`: the collector stores the Cost Report's own
+    // decimal in the currency's major unit ("1.25" is 1.25 USD). The old name
+    // and the old "minor units" summary string invited a consumer to divide by
+    // 100 — a 100x underreport — because nothing ever scaled the value.
+    totals: z.array(
+      z.object({ currency: z.string(), amount: z.string() }),
     ),
     breakdowns: z.array(z.unknown()),
     groupedTop100Cap: z.boolean(),
@@ -686,7 +690,7 @@ function usageSection(s: Snapshot) {
 }
 function costSection(s: Snapshot) {
   if (!s.costs) return unavailable("costs", "Authoritative cost", s.costStatus);
-  const missing = s.costs.totalsMinor.length === 0;
+  const missing = s.costs.totals.length === 0;
   const partial = s.costStatus.state === "partial" || s.costs.groupedTop100Cap;
   const sectionState: DashboardState = s.costStatus.errorKind === "unauthorized"
     ? "unauthorized"
@@ -696,12 +700,12 @@ function costSection(s: Snapshot) {
     : partial
     ? "partial"
     : "healthy";
-  const metrics: Json[] = s.costs.totalsMinor.map((t) => ({
+  const metrics: Json[] = s.costs.totals.map((t) => ({
     id: `cost-${t.currency.toLowerCase()}`,
     label: `Cost (${t.currency})`,
     unit: "currency",
     availability: "observed",
-    value: Number(t.amountMinor),
+    value: Number(t.amount),
     confidence: partial ? "unknown" : "exact",
     sensitivity: "operational",
   }));
@@ -723,17 +727,19 @@ function costSection(s: Snapshot) {
     impact: "required",
     summary: missing
       ? "No authoritative currency total was returned"
-      : s.costs.totalsMinor.map((t) =>
-        `${t.amountMinor} ${t.currency} minor units`
-      ).join(", "),
+      // "1.25 USD", not "1.25 USD minor units". The value is a major-unit
+      // decimal; the old suffix described a conversion no code performed and
+      // sat in the same bundle as openai-usage, which emits plain dollars under
+      // the same unit:"currency" tag.
+      : s.costs.totals.map((t) => `${t.amount} ${t.currency}`).join(", "),
     coverage: {
       kind: partial ? "sample" : "exact",
       start: s.coverageStart,
       end: s.coverageEnd,
       scope: `Anthropic ${s.accountKind} organization cost`,
       notes: s.accountKind === "enterprise"
-        ? "Enterprise amounts are preserved in provider minor units; values can be revised for 30 days"
-        : "Platform cost amount semantics are retained from the Cost Report",
+        ? "Amounts are the Cost Report's decimal values in the currency's major unit; Enterprise values can be revised for 30 days"
+        : "Amounts are the Cost Report's decimal values in the currency's major unit",
     },
     freshness: {
       state: "fresh",
@@ -750,7 +756,7 @@ function costSection(s: Snapshot) {
     facts: [{
       id: "currency-count",
       label: "Currencies observed",
-      value: s.costs.totalsMinor.length,
+      value: s.costs.totals.length,
       confidence: partial ? "unknown" : "exact",
       sensitivity: "operational",
     }],
@@ -810,7 +816,11 @@ export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
       "jpisgeek/anthropic-usage": {
         accountKind: s?.accountKind ?? "unknown",
         subscriptionQuotaInferred: false,
-        groupedEnterpriseTop100Cap: s?.accountKind === "enterprise",
+        // Reports whether THIS snapshot actually hit the cap. It used to be
+        // `accountKind === "enterprise"`, which asserted truncation on every
+        // Enterprise bundle including complete ones.
+        groupedEnterpriseTop100Cap: Boolean(s?.usage?.groupedTop100Cap) ||
+          Boolean(s?.costs?.groupedTop100Cap),
       },
     },
   });
