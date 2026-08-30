@@ -68,7 +68,15 @@ The current public Swamp CLI has no standalone serve-heartbeat query. That
 interface is therefore recorded as unsupported and the bundle cannot claim
 complete health. The optional /internal/runs API is never used. Empty run,
 workflow, or report history is unknown rather than healthy. A failed historical
-execution degrades its section; stale or orphaned runs are critical.
+execution degrades its section; stale or orphaned runs are critical. Stored
+reports are judged the same way: a failed stored report degrades the inventory
+section rather than merely proving a status field exists. Statuses are matched
+as whole tokens, so a compound value such as completed_with_errors is counted as
+unrecognized and degrades the section instead of being read as a pass.
+Observations older than five minutes are reported as stale, so a report re-run
+against a stored snapshot cannot claim the data is current. A stored snapshot
+this report version cannot parse becomes a coverage gap for that one interface;
+the others still render.
 
 ## Security
 

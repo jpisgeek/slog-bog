@@ -535,6 +535,97 @@ function statusOf(value: Json): string {
   return "unknown";
 }
 
+/** Buckets a status string can land in. Never a boolean: unknown is a value. */
+type StatusBucket =
+  | "active"
+  | "succeeded"
+  | "failed"
+  | "stale"
+  | "orphaned"
+  | "unknown";
+
+/**
+ * Status vocabularies, matched whole rather than by substring.
+ *
+ * These were unanchored substring probes evaluated success-before-failure,
+ * which laundered compound statuses into passes: "completed_with_errors" and
+ * "unsuccessful" both matched /success|succeeded|completed|passed/ and were
+ * counted as succeeded, so a run that failed inflated the success count and
+ * left the section healthy. Whole-token matching cannot do that, and a status
+ * this build does not recognize falls through to "unknown", which degrades the
+ * section rather than quietly passing it.
+ */
+const STATUS_VOCABULARY: ReadonlyArray<[StatusBucket, RegExp]> = [
+  // Failure is tested first so that any future overlap resolves pessimistically.
+  [
+    "failed",
+    /^(failed|failure|failing|error|errored|errors|cancel|cancelled|canceled|cancelling|aborted|abort|timeout|timed[_ -]?out|unsuccessful|rejected|crashed|killed)$/,
+  ],
+  ["stale", /^(stale|stalled)$/],
+  ["orphaned", /^(orphan|orphaned)$/],
+  [
+    "active",
+    /^(running|active|queued|pending|starting|started|in[_ -]?progress|waiting|scheduled)$/,
+  ],
+  [
+    "succeeded",
+    /^(succeeded|success|successful|completed|complete|passed|pass|ok|done|finished)$/,
+  ],
+];
+
+/** Classify one normalized status string into exactly one bucket. */
+function classifyStatus(status: string): StatusBucket {
+  for (const [bucket, pattern] of STATUS_VOCABULARY) {
+    if (pattern.test(status)) return bucket;
+  }
+  return "unknown";
+}
+
+/**
+ * Age at which a stored interface snapshot stops speaking for the present.
+ *
+ * The collector and this report normally run in the same execution, so a
+ * healthy snapshot is seconds old.
+ */
+const MAX_OBSERVATION_AGE_SECONDS = 300;
+
+/**
+ * Derive freshness by actually comparing observedAt against now.
+ *
+ * All three available-section call sites used to emit the literal
+ * `{ state: "fresh", observedAt, maxAgeSeconds: 300 }` without ever reading
+ * observedAt, so a report re-run against a stored observation resource — which
+ * has a 30-day lifetime — published "this data is under five minutes old"
+ * over a timestamp days in the past, and no consumer could tell. "stale" and
+ * "unknown" were unreachable states for an available observation.
+ */
+function freshnessOf(observedAt: string) {
+  const observedMs = Date.parse(observedAt);
+  if (Number.isNaN(observedMs)) {
+    // ObservationSchema enforces ISO-8601, so this is defence against a future
+    // schema loosening rather than a path reachable today.
+    return {
+      state: "unknown" as const,
+      reason: "observation timestamp could not be parsed",
+    };
+  }
+  const ageSeconds = (Date.now() - observedMs) / 1000;
+  return ageSeconds > MAX_OBSERVATION_AGE_SECONDS
+    ? {
+      state: "stale" as const,
+      observedAt,
+      maxAgeSeconds: MAX_OBSERVATION_AGE_SECONDS,
+      reason: `stored observation is ${
+        Math.round(ageSeconds)
+      }s old, older than the ${MAX_OBSERVATION_AGE_SECONDS}s freshness budget`,
+    }
+    : {
+      state: "fresh" as const,
+      observedAt,
+      maxAgeSeconds: MAX_OBSERVATION_AGE_SECONDS,
+    };
+}
+
 function unavailableState(observation: Observation): DashboardState {
   return observation.errorKind === "unauthorized" ? "unauthorized" : "partial";
 }
@@ -610,14 +701,7 @@ function historySection(
       counts.orphaned++;
       continue;
     }
-    const status = statusOf(entry);
-    if (/running|active|queued|pending/.test(status)) counts.active++;
-    else if (/success|succeeded|completed|passed/.test(status)) {
-      counts.succeeded++;
-    } else if (/fail|failed|error|cancel/.test(status)) counts.failed++;
-    else if (/stale/.test(status)) counts.stale++;
-    else if (/orphan/.test(status)) counts.orphaned++;
-    else counts.unknown++;
+    counts[classifyStatus(statusOf(entry))]++;
   }
   const state: DashboardState = parsed.rejected > 0
     ? "partial"
@@ -698,11 +782,7 @@ function historySection(
       end: observation.observedAt,
       scope: `records returned by ${observation.interface}`,
     },
-    freshness: {
-      state: "fresh",
-      observedAt: observation.observedAt,
-      maxAgeSeconds: 300,
-    },
+    freshness: freshnessOf(observation.observedAt),
     completeness: parsed.rejected > 0
       ? {
         state: "partial",
@@ -732,15 +812,99 @@ function reportsSection(observation: Observation) {
   if (!observation.available) return unavailableSection(observation, title);
   const parsed = arrayFrom(observation.payload, "results", reportRecord);
   const { entries } = parsed;
+  // hasStatus is only the capability probe: does this Swamp build expose a
+  // status field on report search results at all? It answers presence, and it
+  // is the correct gate for the "status not exposed by this build" path below.
   const hasStatus = entries.length > 0 &&
     entries.every((entry) => statusOf(entry) !== "unknown");
+  // Once status is exposed, the VALUE has to be read. Every branch in this
+  // section used to key off hasStatus alone, so an inventory in which every
+  // stored report carried status "failed" rendered state "healthy", summary
+  // "N stored report(s) with status observed", coverage "exact" and an empty
+  // exceptions array — byte-identical to an inventory in which every report
+  // succeeded. Bucketing here is what makes those two cases distinguishable.
+  const counts = {
+    active: 0,
+    succeeded: 0,
+    failed: 0,
+    stale: 0,
+    orphaned: 0,
+    unknown: 0,
+  };
+  if (hasStatus) {
+    for (const entry of entries) counts[classifyStatus(statusOf(entry))]++;
+  }
+  // Anything neither finished-well nor still-running. Kept as one number so a
+  // status this build does not recognize degrades the section instead of being
+  // silently absorbed into the healthy majority.
+  const notSuccessful = counts.failed + counts.stale + counts.orphaned +
+    counts.unknown;
   const state: DashboardState = parsed.rejected > 0
     ? "partial"
     : entries.length === 0
     ? "unknown"
-    : hasStatus
-    ? "healthy"
-    : "partial";
+    : !hasStatus
+    ? "partial"
+    : notSuccessful > 0
+    ? "degraded"
+    : "healthy";
+  const exceptions = [];
+  if (parsed.rejected > 0) {
+    exceptions.push({
+      id: "swamp:stored-reports:malformed-records",
+      severity: "warning",
+      subject: title,
+      headline: "Malformed stored report records rejected",
+      detail:
+        `${parsed.rejected} malformed record(s) were excluded from counts.`,
+      source: "@jpisgeek/swamp-observability",
+      suppressed: false,
+      suppressReason: "",
+      sensitivity: "operational",
+    });
+  }
+  if (entries.length === 0 && parsed.validContainer) {
+    exceptions.push({
+      id: "swamp:stored-reports:empty",
+      severity: "info",
+      subject: title,
+      headline: "No stored reports observed",
+      detail:
+        "The interface responded successfully but returned no stored reports.",
+      source: "@jpisgeek/swamp-observability",
+      suppressed: false,
+      suppressReason: "",
+      sensitivity: "operational",
+    });
+  }
+  if (entries.length > 0 && !hasStatus) {
+    exceptions.push({
+      id: "swamp:stored-reports:status-unsupported",
+      severity: "warning",
+      subject: title,
+      headline: "Stored report status unavailable",
+      detail:
+        "The public report search result identifies artifacts but does not expose their execution status.",
+      source: "@jpisgeek/swamp-observability",
+      suppressed: false,
+      suppressReason: "",
+      sensitivity: "operational",
+    });
+  }
+  if (notSuccessful > 0) {
+    exceptions.push({
+      id: "swamp:stored-reports:failed",
+      severity: "warning",
+      subject: title,
+      headline: "Unsuccessful stored report executions observed",
+      detail:
+        `${counts.failed} failed, ${counts.stale} stale, ${counts.orphaned} orphaned and ${counts.unknown} unrecognized status value(s) among ${entries.length} stored report(s).`,
+      source: "@jpisgeek/swamp-observability",
+      suppressed: false,
+      suppressReason: "",
+      sensitivity: "operational",
+    });
+  }
   return DashboardSectionSchema.parse({
     id: "stored-reports",
     title,
@@ -750,9 +914,11 @@ function reportsSection(observation: Observation) {
       ? `${entries.length} valid and ${parsed.rejected} malformed stored report record(s) observed`
       : entries.length === 0
       ? "Report inventory is available but empty"
-      : hasStatus
-      ? `${entries.length} stored report(s) with status observed`
-      : `${entries.length} stored report(s) observed; result status is unavailable`,
+      : !hasStatus
+      ? `${entries.length} stored report(s) observed; result status is unavailable`
+      : notSuccessful > 0
+      ? `${entries.length} stored report(s) observed; ${notSuccessful} did not succeed`
+      : `${entries.length} stored report(s) with status observed`,
     coverage: {
       kind: hasStatus && parsed.rejected === 0 ? "exact" : "unknown",
       end: observation.observedAt,
@@ -761,11 +927,7 @@ function reportsSection(observation: Observation) {
         ? {}
         : { notes: "report search does not expose result status" }),
     },
-    freshness: {
-      state: "fresh",
-      observedAt: observation.observedAt,
-      maxAgeSeconds: 300,
-    },
+    freshness: freshnessOf(observation.observedAt),
     completeness: parsed.rejected > 0
       ? {
         state: "partial",
@@ -790,67 +952,37 @@ function reportsSection(observation: Observation) {
         confidence: "exact",
         sensitivity: "operational",
       },
-      hasStatus
-        ? {
-          id: "status-known",
-          label: "Reports with known status",
-          unit: "count",
-          availability: "observed",
-          value: entries.length,
-          confidence: "exact",
-          sensitivity: "operational",
-        }
-        : {
-          id: "status-known",
-          label: "Reports with known status",
-          unit: "count",
-          availability: "unsupported",
-          reason: "report search does not expose result status",
-          confidence: "unknown",
-          sensitivity: "operational",
-        },
+      // status-known, succeeded and failed all share the same gate: without an
+      // exposed status field none of them are observable, and reporting them as
+      // zero would read as "nothing failed".
+      ...([
+        ["status-known", "Reports with known status", entries.length],
+        ["succeeded", "Succeeded reports", counts.succeeded],
+        ["failed", "Failed reports", counts.failed],
+      ] as const).map(([id, label, value]) =>
+        hasStatus
+          ? {
+            id,
+            label,
+            unit: "count",
+            availability: "observed",
+            value,
+            confidence: "exact",
+            sensitivity: "operational",
+          }
+          : {
+            id,
+            label,
+            unit: "count",
+            availability: "unsupported",
+            reason: "report search does not expose result status",
+            confidence: "unknown",
+            sensitivity: "operational",
+          }
+      ),
     ],
     facts: [],
-    exceptions: parsed.rejected > 0
-      ? [{
-        id: "swamp:stored-reports:malformed-records",
-        severity: "warning",
-        subject: title,
-        headline: "Malformed stored report records rejected",
-        detail:
-          `${parsed.rejected} malformed record(s) were excluded from counts.`,
-        source: "@jpisgeek/swamp-observability",
-        suppressed: false,
-        suppressReason: "",
-        sensitivity: "operational",
-      }]
-      : entries.length === 0
-      ? [{
-        id: "swamp:stored-reports:empty",
-        severity: "info",
-        subject: title,
-        headline: "No stored reports observed",
-        detail:
-          "The interface responded successfully but returned no stored reports.",
-        source: "@jpisgeek/swamp-observability",
-        suppressed: false,
-        suppressReason: "",
-        sensitivity: "operational",
-      }]
-      : hasStatus
-      ? []
-      : [{
-        id: "swamp:stored-reports:status-unsupported",
-        severity: "warning",
-        subject: title,
-        headline: "Stored report status unavailable",
-        detail:
-          "The public report search result identifies artifacts but does not expose their execution status.",
-        source: "@jpisgeek/swamp-observability",
-        suppressed: false,
-        suppressReason: "",
-        sensitivity: "operational",
-      }],
+    exceptions,
     references: [],
     sensitivity,
   });
@@ -897,11 +1029,7 @@ function doctorSection(observation: Observation) {
         ? { notes: "run doctor did not expose every diagnostic count" }
         : {}),
     },
-    freshness: {
-      state: "fresh",
-      observedAt: observation.observedAt,
-      maxAgeSeconds: 300,
-    },
+    freshness: freshnessOf(observation.observedAt),
     completeness: incomplete
       ? {
         state: "partial",
@@ -969,22 +1097,55 @@ function doctorSection(observation: Observation) {
   });
 }
 
+/**
+ * Read every stored interface snapshot, degrading per handle rather than per run.
+ *
+ * The read/decode/parse chain used to be unguarded, and so did normalize(). One
+ * unparseable resource therefore threw all the way out of report.execute and
+ * the operator got no dashboard at all — not even the four interfaces that
+ * parsed cleanly. That is exactly the failure mode this extension exists to
+ * prevent, and it is reachable without corruption: this file carries its own
+ * inlined copy of ObservationSchema, so a collector that later adds a sixth
+ * interface name or a new errorKind emits snapshots an older report rejects.
+ * A snapshot this version cannot read is a coverage gap for that one
+ * interface, and is now surfaced as one.
+ */
 async function readObservations(ctx: ReportContext): Promise<Observation[]> {
   const observations: Observation[] = [];
   for (const handle of ctx.dataHandles) {
     if (
       handle.specName !== "observation" && !handle.name.startsWith("interface-")
     ) continue;
-    const content = await ctx.dataRepository.getContent(
-      ctx.modelType,
-      ctx.modelId,
-      handle.name,
-      handle.version,
-    );
-    if (!content) continue;
-    observations.push(
-      ObservationSchema.parse(JSON.parse(new TextDecoder().decode(content))),
-    );
+    try {
+      const content = await ctx.dataRepository.getContent(
+        ctx.modelType,
+        ctx.modelId,
+        handle.name,
+        handle.version,
+      );
+      if (!content) continue;
+      observations.push(
+        ObservationSchema.parse(JSON.parse(new TextDecoder().decode(content))),
+      );
+    } catch {
+      // The interface name lives in the handle, so an unreadable snapshot can
+      // still be attributed. When it cannot be, fall through: normalize()'s
+      // missing() fallback already renders an unavailable section for any
+      // required interface that never arrived.
+      const name = InterfaceNameSchema.safeParse(
+        handle.name.replace(/^interface-/, ""),
+      );
+      if (!name.success) continue;
+      observations.push({
+        interface: name.data,
+        available: false,
+        observedAt: new Date().toISOString(),
+        errorKind: "invalid-response",
+        error:
+          "The stored interface snapshot could not be read or parsed by this report version",
+        payload: null,
+      });
+    }
   }
   return observations;
 }
