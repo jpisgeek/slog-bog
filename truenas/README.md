@@ -72,7 +72,13 @@ Certificate expiry is computed independently of TrueNAS's own alert state. A
 Verified against SCALE 25.10. `auth.login_with_api_key` is scheduled for removal
 in TrueNAS 27 and the model warns when it connects to a host that new. If a
 scheduled run fails to connect while the same call works from a shell on the
-same Mac, suspect macOS Local Network privacy.
+same Mac, suspect macOS Local Network privacy. A run in which TrueNAS reports
+zero pools (or zero disks) does not prune the existing `pool`/`disk` records,
+because that is what a pool still importing after a reboot looks like; the run
+logs a warning instead. Records for an object that really was removed are pruned
+by the next run that reports any object of that kind, so only the removal of the
+very last pool or disk leaves a stale record to clear by hand. Alerts and
+certificates are pruned on absence as before — a resolved alert must go.
 
 ## Security
 

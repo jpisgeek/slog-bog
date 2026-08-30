@@ -201,6 +201,15 @@ const RawPoolSchema = z.object({
   fragmentation: z.union([z.string(), z.number()]).nullable().optional(),
 }).passthrough();
 
+/**
+ * The refinements on the three schemas below exist because every field in
+ * them was optional, which made the contract this block claims a no-op for
+ * them: `.parse()` could not fail, so a renamed field fell through to the
+ * `?? ""` defaults in the mapping code and was written as if it were real
+ * data. Each refinement asserts only the *identity or date* fields the model
+ * genuinely cannot work without, so a rename throws while a merely enriched
+ * payload still passes.
+ */
 const RawDiskSchema = z.object({
   devname: z.string().nullable().optional(),
   identifier: z.string().nullable().optional(),
@@ -210,7 +219,18 @@ const RawDiskSchema = z.object({
   type: z.string().nullable().optional(),
   // Only populated when disk.query is called with extra.pools: true.
   pool: z.string().nullable().optional(),
-}).passthrough();
+}).passthrough().refine(
+  // With neither field, instanceName() falls back to `idx<n>`, so the disk's
+  // instance name is its position in the response -- it changes whenever the
+  // enumeration order does, and every poll then prunes and re-creates the
+  // same disk under a new name.
+  (d) => d.identifier != null || d.devname != null,
+  {
+    message:
+      "disk.query row has neither `identifier` nor `devname`; the TrueNAS " +
+      "disk contract has changed and disks can no longer be identified",
+  },
+);
 
 const RawAlertSchema = z.object({
   uuid: z.string().optional(),
@@ -220,7 +240,17 @@ const RawAlertSchema = z.object({
   level: z.string().nullable().optional(),
   formatted: z.string().nullable().optional(),
   dismissed: z.boolean().nullable().optional(),
-}).passthrough();
+}).passthrough().refine(
+  // Same index-fallback churn as disks, and worse here: alert-* records are
+  // pruned on absence by design, so unstable names mean every run deletes
+  // and re-adds the whole alert set.
+  (a) => a.uuid != null || a.id != null || a.key != null,
+  {
+    message:
+      "alert.list row has none of `uuid`, `id`, `key`; the TrueNAS alert " +
+      "contract has changed and alerts can no longer be identified",
+  },
+);
 
 const RawCertificateSchema = z.object({
   id: z.union([z.string(), z.number()]).optional(),
@@ -229,7 +259,23 @@ const RawCertificateSchema = z.object({
   common_name: z.string().nullable().optional(),
   until: z.unknown().optional(),
   not_after: z.unknown().optional(),
-}).passthrough();
+}).passthrough().refine(
+  // Presence, not truthiness: `until: null` is a legitimate payload -- a CSR
+  // has no expiry, which is exactly what expiryKnown:false exists to record
+  // -- so requiring a non-null value here would reject valid data. What must
+  // never pass silently is the key being GONE, because toIso(undefined) is
+  // "" and every certificate would then be written notAfter:"",
+  // expiryKnown:false, daysRemaining:-9999. summary.certificatesWithoutExpiry
+  // would quietly equal certs.length on every run, including for a cert two
+  // days from lapsing -- the precise failure certificates are collected to
+  // catch (see the module header).
+  (c) => c.until !== undefined || c.not_after !== undefined,
+  {
+    message: "certificate.query row has neither `until` nor `not_after`; the " +
+      "TrueNAS certificate contract has changed and expiry can no longer " +
+      "be read",
+  },
+);
 
 /**
  * Deterministic, non-cryptographic 32-bit FNV-1a hash, hex-encoded. Used
@@ -423,6 +469,18 @@ class TrueNasRpc {
     onProtocolError: (detail: string) => void = () => {},
   ): Promise<TrueNasRpc> {
     return new Promise((resolve, reject) => {
+      // An AbortSignal that is ALREADY aborted before we get here never fires
+      // another "abort" event, so the listener registered below would never
+      // run. The old code therefore opened the socket for a run that had
+      // already been cancelled -- and the very first thing discover() does on
+      // a connected socket is send auth.login_with_api_key, i.e. it put the
+      // plaintext API key on the wire for work nobody was waiting for, then
+      // reported the eventual hang as "timed out connecting" rather than
+      // "aborted". Check the flag before anything else, socket included.
+      if (signal.aborted) {
+        reject(new Error("aborted before connecting"));
+        return;
+      }
       let settled = false;
       let ws: WebSocket;
       try {
@@ -482,6 +540,16 @@ class TrueNasRpc {
 
   call(method: string, params: unknown[], timeoutMs: number): Promise<unknown> {
     if (this.#closed) return Promise.reject(new Error("connection closed"));
+    // Same reason as connect(): addEventListener("abort", ...) on a signal
+    // that has already aborted never fires, so the old code fell straight
+    // through to #ws.send() and wrote the request -- for the auth call, the
+    // API key itself -- to a socket belonging to a cancelled run, then sat
+    // there for the full timeout waiting on a reply nobody wanted. The abort
+    // can land between connect() resolving and this call starting, so the
+    // guard has to be here as well, not only in connect().
+    if (this.#signal.aborted) {
+      return Promise.reject(new Error(`aborted before sending ${method}`));
+    }
     const id = ++this.#id;
     return new Promise((resolve, reject) => {
       const onAbort = () => {
@@ -788,15 +856,49 @@ async function discover(_args: unknown, ctx: {
   // one. This mirrors @swamp/ssh's own `apply` method (see
   // .swamp/pulled-extensions/@swamp/ssh/models/_lib/operations.ts), which
   // prunes stale host-* resources the identical way.
+  //
+  // A kind that came back COMPLETELY empty is not evidence that the kind is
+  // gone, and the validation above cannot tell the two apart: `[]` is a
+  // well-formed array, so it passes and no name of that kind enters `live`.
+  // pool.query answers `[]` while ZFS is still importing after a reboot or
+  // update, and while a pool is failing to import at all; disk.query
+  // answering `[]` has no legitimate steady state on a NAS. The old code
+  // took that single empty response as authoritative and hard-deleted every
+  // stored pool-*/disk-* record in one pass, during exactly the window a
+  // pool is missing. Protect those two prefixes when the kind is empty but
+  // the datastore still holds records for it, the way netdata.ts protects a
+  // node whose sub-fetch failed. Alerts and certificates are deliberately
+  // NOT protected: an empty alert list is the normal healthy state and a
+  // resolved alert must be pruned or it is reported forever.
+  const protectedPrefixes: string[] = [];
+  if (pools.length === 0) protectedPrefixes.push("pool-");
+  if (disks.length === 0) protectedPrefixes.push("disk-");
+
   const existing = await ctx.dataRepository.findAllForModel(
     ctx.modelType,
     ctx.modelId,
   );
+  let keptStale = 0;
   for (const rec of existing) {
-    if (!live.has(rec.name)) {
-      await ctx.dataRepository.delete(ctx.modelType, ctx.modelId, rec.name);
-      ctx.logger.info("pruned {name}", { name: rec.name });
+    if (live.has(rec.name)) continue;
+    if (protectedPrefixes.some((p) => rec.name.startsWith(p))) {
+      keptStale++;
+      continue;
     }
+    await ctx.dataRepository.delete(ctx.modelType, ctx.modelId, rec.name);
+    ctx.logger.info("pruned {name}", { name: rec.name });
+  }
+  if (keptStale > 0) {
+    ctx.logger.warning(
+      "TrueNAS reported zero pools and/or zero disks, which is what a pool " +
+        "still importing (or failing to import) looks like. Kept {kept} " +
+        "existing record(s) rather than deleting them. Note the summary " +
+        "resource still reports what the box actually said this run. Once " +
+        "any object of that kind is reported again, records that really did " +
+        "go away are pruned on that run; if the last pool or disk was " +
+        "genuinely removed, delete the stale record by hand.",
+      { kept: keptStale },
+    );
   }
 
   ctx.logger.info(
