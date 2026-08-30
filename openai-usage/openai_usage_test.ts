@@ -203,6 +203,143 @@ Deno.test("caller cancellation aborts collection instead of persisting partial d
   assertEquals(written, false);
 });
 
+// OpenAI's UsageCompletionsResult marks input_cached_tokens optional. Treating
+// its absence as a failure blacked out the whole usage dimension for a
+// spec-legal page.
+Deno.test("absent optional cached-token counter reads as zero, not a blackout", async () => {
+  const withoutCached = usage();
+  delete (withoutCached as Json).input_cached_tokens;
+  const result = await run((input) =>
+    Promise.resolve(Response.json(page(
+      String(input).includes("/costs?") ? [cost()] : [withoutCached],
+    )))
+  );
+  assertEquals((result.usageStatus as Json).state, "complete");
+  assertEquals((result.usage as Json).cachedInputTokens, 0);
+  assertEquals((result.usage as Json).inputTokens, 10);
+});
+
+// The tolerance above is for absence only. A counter that is present but
+// wrongly typed is still a protocol violation.
+Deno.test("present but wrongly typed cached-token counter still invalidates usage", async () => {
+  const result = await run((input) =>
+    Promise.resolve(Response.json(page(
+      String(input).includes("/costs?")
+        ? [cost()]
+        : [usage({ input_cached_tokens: "two" })],
+    )))
+  );
+  assertEquals((result.usageStatus as Json).errorKind, "invalid-response");
+  assertEquals(result.usage, null);
+});
+
+// CostsResult requires only `object`; amount is optional. One amount-less row
+// used to null the entire cost dimension.
+Deno.test("cost rows without an amount are dropped and marked partial, not blacked out", async () => {
+  const withoutAmount = cost();
+  delete (withoutAmount as Json).amount;
+  const result = await run((input) =>
+    Promise.resolve(Response.json(page(
+      String(input).includes("/costs?")
+        ? [cost({ amount: { value: 4, currency: "usd" } }), withoutAmount]
+        : [usage()],
+    )))
+  );
+  const costs = result.costs as Json;
+  assertEquals(costs === null, false);
+  assertEquals((costs.breakdowns as Json[]).length, 1);
+  assertEquals((costs.totals as Json[])[0].value, 4);
+  assertEquals((result.costStatus as Json).state, "partial");
+  assertStringIncludes((result.costStatus as Json).message as string, "1 cost");
+});
+
+Deno.test("cost amount present but wrongly typed still invalidates costs", async () => {
+  const result = await run((input) =>
+    Promise.resolve(Response.json(page(
+      String(input).includes("/costs?")
+        ? [cost({ amount: { value: "1.25", currency: "usd" } })]
+        : [usage()],
+    )))
+  );
+  assertEquals((result.costStatus as Json).errorKind, "invalid-response");
+  assertEquals(result.costs, null);
+});
+
+// Number.isInteger accepted 1e21, which the snapshot schema's .int() rejects,
+// so the value reached SnapshotSchema.parse and threw a ZodError out of
+// collect() — taking the healthy cost dimension down with it.
+Deno.test("token count above MAX_SAFE_INTEGER degrades usage without rejecting the run", async () => {
+  const result = await run((input) =>
+    Promise.resolve(Response.json(page(
+      String(input).includes("/costs?")
+        ? [cost()]
+        : [usage({ input_tokens: 1e21 })],
+    )))
+  );
+  assertEquals((result.usageStatus as Json).errorKind, "invalid-response");
+  assertEquals(result.usage, null);
+  assertEquals((result.costStatus as Json).state, "complete");
+  assertEquals(((result.costs as Json).totals as Json[])[0].value, 1.25);
+});
+
+// Individually safe integers can still sum past MAX_SAFE_INTEGER.
+Deno.test("token totals overflowing MAX_SAFE_INTEGER degrade usage rather than throw", async () => {
+  const big = Number.MAX_SAFE_INTEGER;
+  const result = await run((input) =>
+    Promise.resolve(Response.json(page(
+      String(input).includes("/costs?")
+        ? [cost()]
+        : [usage({ input_tokens: big }), usage({ input_tokens: big })],
+    )))
+  );
+  assertEquals((result.usageStatus as Json).errorKind, "invalid-response");
+  assertEquals(result.usage, null);
+  assertEquals((result.costStatus as Json).state, "complete");
+});
+
+// Two finite amounts near Number.MAX_VALUE sum to Infinity, which the schema's
+// .finite() rejects. Same crash, opposite dimension.
+Deno.test("cost totals overflowing to Infinity degrade costs rather than throw", async () => {
+  const result = await run((input) =>
+    Promise.resolve(Response.json(page(
+      String(input).includes("/costs?")
+        ? [
+          cost({ amount: { value: 1.7e308, currency: "usd" } }),
+          cost({ amount: { value: 1.7e308, currency: "usd" } }),
+        ]
+        : [usage()],
+    )))
+  );
+  assertEquals((result.costStatus as Json).errorKind, "invalid-response");
+  assertEquals(result.costs, null);
+  assertEquals((result.usageStatus as Json).state, "complete");
+  assertEquals((result.usage as Json).inputTokens, 10);
+});
+
+// CollectArgsSchema accepts any nonnegative integer, but Date#toISOString()
+// throws a bare "Invalid time value" past ~8.64e12 seconds.
+Deno.test("an unrepresentable window fails with a message naming the arguments", async () => {
+  setFetcherForTest(() => Promise.resolve(Response.json(page([]))));
+  try {
+    await model.methods.collect.execute({
+      startTime: 1e15,
+      endTime: 1e15 + 1,
+    }, {
+      globalArgs: { apiKey: "secret-admin-key", timeoutMs: 100 },
+      signal: new AbortController().signal,
+      writeResource: () => Promise.resolve({}),
+    });
+    throw new Error("expected rejection");
+  } catch (error) {
+    assertStringIncludes(
+      (error as Error).message,
+      "startTime and endTime must be representable Unix seconds",
+    );
+  } finally {
+    setFetcherForTest();
+  }
+});
+
 Deno.test("requests contain explicit windows and grouping dimensions", async () => {
   const urls: string[] = [];
   await run((input) => {
