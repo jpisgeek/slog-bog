@@ -382,3 +382,165 @@ Deno.test("exception records disclose truncation", async () => {
   assertEquals(row.truncated, true);
   assertEquals(String(row.headline).length, 160);
 });
+
+Deno.test("an optional section cannot hide its own stale partial evidence", async () => {
+  // deriveOverallState ignores optional sections on purpose, and the coverage
+  // pass used to filter sections on their declared state. Together that let an
+  // optional section declare "healthy" on a healthy bundle while its own
+  // freshness said stale and its completeness said partial, and reach no output
+  // path at all: green banner, zero exceptions, and the outage visible only as
+  // the word "stale" inside a collapsed <details>.
+  const input = bundle();
+  (input.sections as Json[]).push({
+    id: "observation",
+    title: "Optional observation",
+    state: "healthy",
+    impact: "optional",
+    summary: "Optional feed",
+    coverage: { kind: "exact", scope: "optional fixture" },
+    freshness: {
+      state: "stale",
+      observedAt: "2026-08-24T00:00:00Z",
+      reason: "feed down 6 days",
+    },
+    completeness: { state: "partial", rejected: 500, reason: "500 rejected" },
+    metrics: [],
+    facts: [],
+    exceptions: [],
+    references: [],
+    sensitivity: { classification: "operational", fields: [], redacted: false },
+  });
+  const rendered = await render([input]);
+  assertEquals(rendered.html.includes("Nothing needs you"), false);
+  assertStringIncludes(rendered.html, "Coverage is partial");
+  assertStringIncludes(rendered.html, "feed down 6 days");
+  assertEquals(rendered.result.exceptions, 1);
+});
+
+Deno.test("coverage exceptions carry the producer's own reason not the summary", async () => {
+  const input = bundle({ state: "stale" });
+  (input.sections[0] as Json).freshness = {
+    state: "stale",
+    observedAt: "2026-08-24T00:00:00Z",
+    reason: "collector last succeeded 2026-08-24; 3 retries timed out",
+  };
+  const rendered = await render([input]);
+  assertStringIncludes(rendered.html, "3 retries timed out");
+  const row = rendered.written.find((item) => item.spec === "exception")!.data;
+  assertStringIncludes(String(row.detail), "3 retries timed out");
+  assertEquals(
+    String(row.detail).includes("Synthetic observations are current"),
+    false,
+  );
+});
+
+Deno.test("the page shows the bundle's own generation time not only the render clock", async () => {
+  const input: Json = bundle();
+  input.generatedAt = "2026-08-24T09:15:00.000Z";
+  const rendered = await render([input]);
+  assertStringIncludes(rendered.html, "2026-08-24T09:15:00.000Z");
+});
+
+Deno.test("metric limits are rendered beside the observed value", async () => {
+  const rendered = await render([bundle({
+    metrics: [{
+      id: "requests",
+      label: "API requests",
+      unit: "requests",
+      confidence: "exact",
+      availability: "observed",
+      value: 95000,
+      sensitivity: "operational",
+      limit: { value: 100000, kind: "provider-limit", authoritative: true },
+    }],
+  })]);
+  assertStringIncludes(rendered.html, "100000");
+  assertStringIncludes(rendered.html, "provider-limit");
+});
+
+Deno.test("suppressing the only exception never renders zero things", async () => {
+  const rendered = await render([bundle({ exceptions: [exception()] })], {
+    suppress: [{
+      id: "16:synthetic-bundle13:condition:one",
+      reason: "maintenance window",
+    }],
+  });
+  assertEquals(rendered.result.exceptions, 0);
+  assertEquals(rendered.html.includes("0 thing"), false);
+  assertEquals(rendered.html.includes("Nothing needs you"), false);
+  assertStringIncludes(rendered.html, "Nothing active · bundle state degraded");
+});
+
+Deno.test("subject and source are bounded and truncation stays honest", async () => {
+  const rendered = await render([bundle({
+    exceptions: [exception({
+      subject: "s".repeat(400),
+      source: "p".repeat(400),
+    })],
+  })]);
+  const row = rendered.written.find((item) => item.spec === "exception")!.data;
+  assertEquals(String(row.subject).length, 200);
+  assertEquals(String(row.source).length, 120);
+  assertEquals(row.truncated, true);
+});
+
+Deno.test("bounded exception ids stay distinct", async () => {
+  const long = "c".repeat(400);
+  const rendered = await render([bundle({
+    exceptions: [
+      exception({ id: `${long}1` }),
+      exception({ id: `${long}2` }),
+    ],
+  })]);
+  const ids = rendered.written.filter((item) => item.spec === "exception").map(
+    (item) => String(item.data.id),
+  );
+  assertEquals(ids.length, 2);
+  assertEquals(new Set(ids).size, 2);
+  for (const id of ids) assertEquals(id.length, 256);
+});
+
+Deno.test("the bundles argument is bounded and the drop is visible", async () => {
+  const inputs = Array.from(
+    { length: 70 },
+    (_, index) => bundle({ id: `bundle-${index}` }),
+  );
+  const rendered = await render(inputs);
+  assertEquals(rendered.result.bundlesReceived, 70);
+  assertEquals(rendered.result.bundlesValid, 64);
+  assertStringIncludes(
+    rendered.html,
+    "Only the first 64 bundles were rendered",
+  );
+  assertEquals(rendered.html.includes("Nothing needs you"), false);
+});
+
+Deno.test("metric tables are bounded per section and the drop is visible", async () => {
+  const metrics = Array.from({ length: 250 }, (_, index) => ({
+    id: `metric-${index}`,
+    label: `Metric ${index}`,
+    unit: "count",
+    confidence: "exact",
+    availability: "observed",
+    value: index,
+    sensitivity: "operational",
+  }));
+  const rendered = await render([bundle({ metrics })]);
+  assertStringIncludes(rendered.html, "50 more rows not shown");
+  assertEquals(rendered.html.includes("Metric 249"), false);
+});
+
+Deno.test("the exception list is bounded and says how many were dropped", async () => {
+  const exceptions = Array.from(
+    { length: 250 },
+    (_, index) => exception({ id: `condition:${index}`, severity: "info" }),
+  );
+  const rendered = await render([bundle({ state: "healthy", exceptions })]);
+  const rows = rendered.written.filter((item) => item.spec === "exception");
+  assertEquals(rows.length, 200);
+  assertEquals(rendered.result.exceptions, 200);
+  assertStringIncludes(
+    rendered.html,
+    "51 further exceptions were not rendered",
+  );
+});
