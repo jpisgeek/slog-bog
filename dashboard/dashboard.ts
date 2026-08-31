@@ -547,7 +547,7 @@ function sectionEvidenceState(section: DashboardSection): DashboardState {
  * can say what happened. Both were validated and then dropped: the coverage
  * line printed the bare state word and the synthetic coverage exception used
  * the section's generic `summary`, so "collector last succeeded 2026-08-24; 3
- * retries timed out against 10.0.4.12" became "Freshness: stale".
+ * retries timed out against 192.0.2.10" became "Freshness: stale".
  */
 function evidenceReasons(section: DashboardSection): string[] {
   const reasons: string[] = [];
