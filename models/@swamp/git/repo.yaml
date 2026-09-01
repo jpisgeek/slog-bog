@@ -1,0 +1,8 @@
+type: '@swamp/git'
+typeVersion: 2026.08.25.1
+id: a0dd48da-b9ee-4de0-947b-64e78f71fc89
+name: repo
+version: 1
+tags: {}
+globalArguments: {}
+methods: {}

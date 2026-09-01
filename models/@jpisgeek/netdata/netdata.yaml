@@ -1,0 +1,17 @@
+type: '@jpisgeek/netdata'
+typeVersion: 2026.08.23.1
+id: 9081b676-1806-47c6-a221-fb5614c78888
+name: netdata
+version: 1
+tags: {}
+reports:
+  require:
+    - "@jpisgeek/dashboard-homelab"
+globalArguments:
+  nodes:
+    - name: anvil
+      url: 'http://localhost:19999'
+  timeoutSec: 15
+  diskWarnPercent: 85
+  maxConcurrency: 8
+methods: {}

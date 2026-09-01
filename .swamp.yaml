@@ -1,5 +1,7 @@
-swampVersion: 20260821.000337.0
+swampVersion: 20260825.201431.0
 initializedAt: "2026-08-22T23:23:54.830Z"
 repoId: a16914d4-5759-4d5e-a00e-724c1bf94412
-tools: []
+tools:
+  - codex
 gitignoreManaged: true
+upgradedAt: "2026-08-25T21:59:39.020Z"
