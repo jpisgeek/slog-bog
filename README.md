@@ -1,29 +1,31 @@
 # slog-bog
 
-Public [swamp](https://github.com/swamp-club/swamp) extensions, published to the
-registry as `@jpisgeek/*`. Thin, unopinionated building blocks for workflows
-that run over a homelab or small fleet. The opinions (thresholds, node lists,
-dashboards) belong in your own models, not here.
+Public [swamp](https://github.com/swamp-club/swamp) extension source, using the
+`@jpisgeek/*` namespace. See each extension's install instructions for its
+distribution method. Thin, unopinionated building blocks for workflows that run
+over a homelab or small fleet. The opinions (thresholds, node lists, dashboards)
+belong in your own models, not here.
 
 <!-- extensions:start -->
 
 | Extension                         | Version        | Source                                             | What it is                                                                                                                                            |
 | --------------------------------- | -------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@jpisgeek/anthropic-usage`       | `2026.08.25.2` | [`anthropic-usage/`](anthropic-usage/)             | Local Anthropic Platform and Claude Enterprise organization usage and cost collection.                                                                |
-| `@jpisgeek/dashboard`             | `2026.08.25.2` | [`dashboard/`](dashboard/)                         | Renders explicit provider-neutral dashboard bundle v1 inputs as a self-contained, exceptions-first HTML status page.                                  |
+| `@jpisgeek/anthropic-usage`       | `2026.09.05.1` | [`anthropic-usage/`](anthropic-usage/)             | Local Anthropic Platform and Claude Enterprise organization usage and cost collection.                                                                |
+| `@jpisgeek/dashboard`             | `2026.09.05.1` | [`dashboard/`](dashboard/)                         | Renders explicit provider-neutral dashboard bundle v1 inputs as a self-contained, exceptions-first HTML status page.                                  |
 | `@jpisgeek/dashboard-compose`     | `2026.08.25.1` | [`dashboard-compose/`](dashboard-compose/)         | Optional Swamp workflows that pass explicit normalized bundle data into the provider-neutral dashboard renderer.                                      |
-| `@jpisgeek/dashboard-homelab`     | `2026.08.25.2` | [`dashboard-homelab/`](dashboard-homelab/)         | Provider-neutral dashboard bundle adapter for the local Netdata, TrueNAS, and Firewalla collector contracts.                                          |
-| `@jpisgeek/dashboard-lmstudio`    | `2026.08.25.3` | [`dashboard-lmstudio/`](dashboard-lmstudio/)       | Provider-neutral dashboard adapter for @jpisgeek/lmstudio endpoint, headless daemon, and per-request probes.                                          |
-| `@jpisgeek/dashboard-swamp`       | `2026.08.25.2` | [`dashboard-swamp/`](dashboard-swamp/)             | Local Swamp operational observability.                                                                                                                |
-| `@jpisgeek/firewalla`             | `2026.08.22.2` | [`firewalla/`](firewalla/)                         | Device and machine inventory from the Firewalla MSP API.                                                                                              |
+| `@jpisgeek/dashboard-homelab`     | `2026.09.05.1` | [`dashboard-homelab/`](dashboard-homelab/)         | Provider-neutral dashboard bundle adapter for the local Netdata, TrueNAS, and Firewalla collector contracts.                                          |
+| `@jpisgeek/dashboard-lmstudio`    | `2026.09.05.1` | [`dashboard-lmstudio/`](dashboard-lmstudio/)       | Provider-neutral dashboard adapter for @jpisgeek/lmstudio endpoint, headless daemon, and per-request probes.                                          |
+| `@jpisgeek/dashboard-swamp`       | `2026.09.05.1` | [`dashboard-swamp/`](dashboard-swamp/)             | Local Swamp operational observability.                                                                                                                |
+| `@jpisgeek/firewalla`             | `2026.09.05.1` | [`firewalla/`](firewalla/)                         | Device and machine inventory from the Firewalla MSP API.                                                                                              |
 | `@jpisgeek/hyperv`                | `2026.08.29.1` | [`hyperv/`](hyperv/)                               | Read a Hyper-V host over SSH and act on its VMs.                                                                                                      |
-| `@jpisgeek/lmstudio`              | `2026.08.25.1` | [`lmstudio/`](lmstudio/)                           | Probe and validate an OpenAI-compatible inference endpoint before you trust it.                                                                       |
+| `@jpisgeek/lmstudio`              | `2026.09.05.1` | [`lmstudio/`](lmstudio/)                           | Probe and validate an OpenAI-compatible inference endpoint before you trust it.                                                                       |
 | `@jpisgeek/mise`                  | `2026.08.28.3` | [`mise/`](mise/)                                   | Read-only sweep of mise toolchain state across a fleet.                                                                                               |
-| `@jpisgeek/netdata`               | `2026.08.23.1` | [`netdata/`](netdata/)                             | Netdata standalone agent state across a set of nodes.                                                                                                 |
-| `@jpisgeek/openai-usage`          | `2026.08.25.2` | [`openai-usage/`](openai-usage/)                   | Local OpenAI organization usage and billed-cost collection through official APIs.                                                                     |
-| `@jpisgeek/proton-pass`           | `2026.08.30.1` | [`proton-pass/`](proton-pass/)                     | Proton Pass vault provider: resolves ${{ vault.get('<vault>', 'KEY') }} live through the official pass-cli at run time.                               |
-| `@jpisgeek/subscription-metadata` | `2026.08.25.2` | [`subscription-metadata/`](subscription-metadata/) | Explicit operator-supplied subscription plan metadata normalized into dashboard bundle v1 without scraping, quota inference, or fictional usage cost. |
-| `@jpisgeek/truenas`               | `2026.08.23.1` | [`truenas/`](truenas/)                             | Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket API.                                                                     |
+| `@jpisgeek/netdata`               | `2026.09.05.1` | [`netdata/`](netdata/)                             | Netdata standalone agent state across a set of nodes.                                                                                                 |
+| `@jpisgeek/openai-usage`          | `2026.09.05.1` | [`openai-usage/`](openai-usage/)                   | Local OpenAI organization usage and billed-cost collection through official APIs.                                                                     |
+| `@jpisgeek/proton-pass`           | `2026.09.05.1` | [`proton-pass/`](proton-pass/)                     | Proton Pass vault provider: resolves ${{ vault.get('<vault>', 'KEY') }} live through the official pass-cli at run time.                               |
+| `@jpisgeek/subscription-metadata` | `2026.09.05.1` | [`subscription-metadata/`](subscription-metadata/) | Explicit operator-supplied subscription plan metadata normalized into dashboard bundle v1 without scraping, quota inference, or fictional usage cost. |
+| `@jpisgeek/truenas`               | `2026.09.05.1` | [`truenas/`](truenas/)                             | Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket API.                                                                     |
+| `@jpisgeek/video-pipeline`        | `2026.09.04.1` | [`video-pipeline/`](video-pipeline/)               | Typed Swamp adapter for an operator-owned video production bridge, with content-checked stage receipts, explicit dependency checks, and cancellation. |
 
 <!-- extensions:end -->
 
@@ -33,16 +35,19 @@ for arguments, methods, and data written.
 
 ## Using one
 
+Follow the install instructions in the extension's README. Some packages have
+registry releases; source-only packages use a local source checkout. After
+installation, create a model using that extension's type:
+
 ```
-swamp extension pull @jpisgeek/<name>
 swamp model create @jpisgeek/<type> <your-model-name>
 ```
 
 ## Trust
 
-Everything here passes the same gates before publish: format and tests, registry
-quality score, a generated-README drift check, a mechanical scan for private
-identifiers, and a model-driven secrets & security review whose PASS verdict is
-committed under `reviews/` against the exact content hash that shipped. Details
-in [SECURITY.md](SECURITY.md); how to contribute in
+The release gates cover formatting and tests, Swamp quality checks, generated
+README drift, private identifier scanning, and a model-driven secrets and
+security review. Review verdicts in `reviews/` are bound to exact content
+hashes; the current checks determine whether a version is eligible for release.
+Details in [SECURITY.md](SECURITY.md); how to contribute in
 [CONTRIBUTING.md](CONTRIBUTING.md).

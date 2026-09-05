@@ -15,6 +15,10 @@
  *   - `url` must not accept file:/ftp:/userinfo (SSRF + credential leak)
  *   - a mount whose dimensions can't be resolved must not read as 0% used
  *   - stored `error` must not carry ssh user@host, ssh stderr, or an HTTP body
+ *   - a base URL must not be able to redirect every endpoint onto `/`
+ *   - a malformed envelope must not read as "zero alarms" and prune a CRITICAL
+ *   - two records must never collapse onto one instance name unnoticed
+ *   - the ssh transport must not be reconfigurable from the remote box
  */
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import { model } from "./netdata.ts";
@@ -33,11 +37,15 @@ function mockCtx(globalArgs: Json, opts: {
   const written: Array<{ spec: string; name: string; data: Json }> = [];
   const deleted: string[] = [];
   const warnings: string[] = [];
+  /** The structured props of each warning — a log destination, but still a
+   * destination agent-supplied text reaches. See test 23. */
+  const warningProps: Json[] = [];
   const stored = opts.stored ?? {};
   return {
     written,
     deleted,
     warnings,
+    warningProps,
     ctx: {
       signal: opts.signal ?? new AbortController().signal,
       globalArgs,
@@ -45,7 +53,10 @@ function mockCtx(globalArgs: Json, opts: {
       modelId: "test-model",
       logger: {
         info: () => {},
-        warning: (msg: string) => warnings.push(msg),
+        warning: (msg: string, props?: Json) => {
+          warnings.push(msg);
+          warningProps.push(props ?? {});
+        },
       },
       readResource: (name: string) => Promise.resolve(stored[name] ?? null),
       // deno-lint-ignore no-explicit-any
@@ -95,6 +106,25 @@ const json = (body: unknown, status = 200) =>
 const NODE = (over: Json = {}) => ({
   name: "nodeA",
   url: "http://agent.example.com:19999",
+  ...over,
+});
+
+/**
+ * A COMPLETE /api/v1/info body -- every field InfoResponseSchema requires.
+ *
+ * It is a fixture rather than an inline literal because "complete" is now
+ * load-bearing: a test that omits `cores_total` is no longer testing a healthy
+ * node, it is testing the malformed path, and it would have looked like a
+ * healthy node before this fixture existed. `hostname` is included for realism
+ * only -- /api/v1/info does not carry it and the schema does not ask for it.
+ */
+const INFO = (over: Json = {}): Json => ({
+  version: "2.1",
+  hostname: "h",
+  os_name: "linux",
+  os_version: "1",
+  cores_total: 4,
+  collectors: [{ plugin: "proc.plugin" }, { plugin: "diskspace.plugin" }],
   ...over,
 });
 
@@ -158,10 +188,7 @@ Deno.test("summary: a failed /alarms fetch does not read as 0 alarms", async () 
   const restore = stubFetch([
     ["/api/v1/alarms", () => json({ error: "boom" }, 500)],
     ["/api/v1/charts", () => json({ charts: {} })],
-    [
-      "/api/v1/info",
-      () => json({ version: "2.1", hostname: "h", cores_total: 4 }),
-    ],
+    ["/api/v1/info", () => json(INFO())],
   ]);
   try {
     const prior = {
@@ -207,7 +234,7 @@ Deno.test("summary: a fully healthy sweep reports zero degraded", async () => {
   const restore = stubFetch([
     ["/api/v1/alarms", () => json({ alarms: {} })],
     ["/api/v1/charts", () => json({ charts: {} })],
-    ["/api/v1/info", () => json({ version: "2.1", hostname: "h" })],
+    ["/api/v1/info", () => json(INFO())],
   ]);
   try {
     const m = mockCtx({ nodes: [NODE()] });
@@ -284,7 +311,7 @@ Deno.test("mount: missing avail/used labels are not written as 0% used", async (
     ["/api/v1/charts", () => json({ charts: { "disk_space./": {} } })],
     // labels do NOT include avail/used — a renamed/reordered dimension
     ["/api/v1/data", () => json({ labels: ["time", "other"], data: [[1, 2]] })],
-    ["/api/v1/info", () => json({ version: "2.1", hostname: "h" })],
+    ["/api/v1/info", () => json(INFO())],
   ]);
   try {
     const m = mockCtx({ nodes: [NODE()] });
@@ -309,7 +336,7 @@ Deno.test("mount: resolvable dimensions produce a correct usedPercent", async ()
       "/api/v1/data",
       () => json({ labels: ["avail", "used"], data: [[25, 75]] }),
     ],
-    ["/api/v1/info", () => json({ version: "2.1", hostname: "h" })],
+    ["/api/v1/info", () => json(INFO())],
   ]);
   try {
     const m = mockCtx({ nodes: [NODE()], diskWarnPercent: 85 });
@@ -488,7 +515,7 @@ async function sweep(opts: {
 
 const infoRoute: [string, () => Response] = [
   "/api/v1/info",
-  () => json({ version: "2.1", hostname: "h" }),
+  () => json(INFO()),
 ];
 const noAlarms: [string, () => Response] = [
   "/api/v1/alarms",
@@ -670,7 +697,6 @@ Deno.test("alarm: an uncalculable value stores null, and a real zero stays zero"
             alarms: {
               // Netdata serialises a nan calculation as null.
               gap: { chart: "c", status: "WARNING", value: null, units: "%" },
-              odd: { chart: "c", status: "CRITICAL", value: "n/a", units: "%" },
               // A genuine reading of zero, which must NOT become null.
               zero: { chart: "c", status: "WARNING", value: 0, units: "%" },
             },
@@ -684,8 +710,42 @@ Deno.test("alarm: an uncalculable value stores null, and a real zero stays zero"
     m.written.find((w) => w.spec === "alarm" && w.data.name === name)!.data
       .value;
   assertEquals(value("gap"), null, "a null value must not be stored as 0");
-  assertEquals(value("odd"), null, "a non-numeric value must not become NaN/0");
   assertEquals(value("zero"), 0, "a genuine zero reading must stay 0");
+});
+
+Deno.test("alarm: a non-numeric value fails the fetch rather than being read", async () => {
+  // `value: "n/a"` is not something /api/v1/alarms emits -- the value is a
+  // JSON number or an explicit null, and the formatted string lives in a
+  // separate field. Storing null for it would be defensible; it would also
+  // mean an agent could make every alarm's value unknown at will and still
+  // have the sub-fetch report success, which is what lets the prune run. An
+  // entry that is not what the endpoint promises makes the whole fetch failed.
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      [
+        "/api/v1/alarms",
+        () =>
+          json({
+            alarms: {
+              odd: { chart: "c", status: "CRITICAL", value: "n/a", units: "%" },
+            },
+          }),
+      ],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  assertEquals(
+    m.written.filter((w) => w.spec === "alarm").length,
+    0,
+    "an unusable alarm entry must not be written as a record",
+  );
+  assertEquals(
+    m.written.find((w) => w.spec === "summary")!.data.nodesDegraded,
+    1,
+    "an unusable alarm entry must mark the node degraded",
+  );
 });
 
 Deno.test("alarm schema represents an unknown value as null", () => {
@@ -884,28 +944,72 @@ Deno.test("prune: a departed record with no protection is still deleted", async 
 });
 
 // ---------------------------------------------------------------------------
-// 12. untrusted counts from /api/v1/info must not land as NaN
+// 12. untrusted counts from /api/v1/info must not land as NaN -- and an
+//     unusable one must not land as 0 either
+//
+// review finding 2 (2026-08-30, block): missing fields became "", null or 0.
+// `cores_total: "lots"` used to be stored as `cores: 0`, and an /info body
+// with no `cores_total` at all did exactly the same. 0 is a count -- a real
+// host with zero CPUs does not exist, so the record was reporting a
+// measurement for something never measured, on a node the sweep called
+// reachable and healthy.
 // ---------------------------------------------------------------------------
 
-Deno.test("node: a non-numeric cores_total is stored as 0, never NaN", async () => {
-  const m = await sweep({
+Deno.test("node: an unusable cores_total is never stored as 0 (or NaN)", async () => {
+  // First: the node has a real history, so there is something to destroy.
+  const healthy = await sweep({
     globalArgs: { nodes: [NODE()] },
-    routes: [
-      noAlarms,
-      ["/api/v1/charts", () => json({ charts: {} })],
-      [
-        "/api/v1/info",
-        () => json({ version: "2.1", hostname: "h", cores_total: "lots" }),
-      ],
-    ],
+    routes: [noAlarms, ["/api/v1/charts", () => json({ charts: {} })], [
+      "/api/v1/info",
+      () => json(INFO({ cores_total: 16 })),
+    ]],
   });
-  const node = m.written.find((w) => w.spec === "node")!.data;
-  assertEquals(node.cores, 0);
-  assertEquals(
-    model.resources.node.schema.safeParse(node).success,
-    true,
-    "the written record must satisfy its own schema",
-  );
+  const stored: Record<string, Json> = {};
+  for (const w of healthy.written) stored[w.name] = w.data;
+  assertEquals(stored["node-nodea"].cores, 16);
+
+  // A non-numeric count and an absent one are the same failure: the endpoint
+  // did not deliver what it promises, so nothing was measured.
+  for (
+    const bad of [
+      INFO({ cores_total: "lots" }),
+      INFO({ cores_total: undefined }),
+      INFO({ collectors: undefined }),
+      INFO({ version: undefined }),
+      INFO({ os_name: 7 }),
+    ]
+  ) {
+    const m = await sweep({
+      globalArgs: { nodes: [NODE()] },
+      stored,
+      routes: [noAlarms, ["/api/v1/charts", () => json({ charts: {} })], [
+        "/api/v1/info",
+        () => json(bad),
+      ]],
+    });
+    const node = m.written.find((w) => w.spec === "node")!.data;
+    const shape = JSON.stringify(bad);
+    assertEquals(
+      node.reachable,
+      false,
+      `${shape} read as a reachable node with a usable identity`,
+    );
+    assertEquals(
+      node.cores,
+      16,
+      `${shape} replaced a real core count with a fabricated one`,
+    );
+    assertEquals(
+      String(node.error),
+      "malformed response (not the shape the endpoint promises)",
+      `${shape} was not classified as malformed`,
+    );
+    assertEquals(
+      model.resources.node.schema.safeParse(node).success,
+      true,
+      "the written record must satisfy its own schema",
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1030,14 +1134,13 @@ function stubSshCommand(stdout: string) {
   // deno-lint-ignore no-explicit-any
   (Deno as any).Command = class {
     constructor(_cmd: string, _opts: unknown) {}
-    output() {
-      return Promise.resolve({
-        success: true,
-        code: 0,
-        signal: null,
-        stdout: new TextEncoder().encode(stdout),
-        stderr: new Uint8Array(),
-      });
+    spawn() {
+      return {
+        status: Promise.resolve({ success: true, code: 0, signal: null }),
+        stdout: new Response(stdout).body!,
+        stderr: new Response("").body!,
+        kill() {},
+      };
     }
   };
   return () => {
@@ -1045,6 +1148,85 @@ function stubSshCommand(stdout: string) {
     (Deno as any).Command = original;
   };
 }
+
+for (const stream of ["stdout", "stderr"] as const) {
+  Deno.test(`ssh: oversized ${stream} kills the child and refuses the poll`, async () => {
+    const original = Deno.Command;
+    const kills: string[] = [];
+    const cap = stream === "stdout" ? 8 * 1024 * 1024 : 8 * 1024;
+    // deno-lint-ignore no-explicit-any
+    (Deno as any).Command = class {
+      spawn() {
+        const huge = new Response("x".repeat(cap + 1)).body!;
+        const normal = new Response(
+          `${JSON.stringify(INFO())}__SWAMP_HTTP_STATUS__:200`,
+        ).body!;
+        return {
+          status: Promise.resolve({ success: true, code: 0, signal: null }),
+          stdout: stream === "stdout" ? huge : normal,
+          stderr: stream === "stderr" ? huge : new Response("").body!,
+          kill(signal: string) {
+            kills.push(signal);
+          },
+        };
+      }
+    };
+    try {
+      const m = mockCtx({
+        nodes: [NODE({
+          ssh: { host: "box.example.com", user: "example-reader", port: 22 },
+        })],
+      });
+      // deno-lint-ignore no-explicit-any
+      await model.methods.discover.execute({}, m.ctx as any);
+      assertEquals(kills.includes("SIGKILL"), true);
+      const node = m.written.find((w) => w.spec === "node")!.data;
+      assertEquals(node.reachable, false);
+      assertEquals(node.error, "response over the size cap");
+      assertEquals(m.written.some((w) => w.spec === "alarm"), false);
+    } finally {
+      // deno-lint-ignore no-explicit-any
+      (Deno as any).Command = original;
+    }
+  });
+}
+
+Deno.test("ssh: caller cancellation cannot wait on a child that keeps its pipes open", async () => {
+  const original = Deno.Command;
+  const controller = new AbortController();
+  const kills: string[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // deno-lint-ignore no-explicit-any
+  (Deno as any).Command = class {
+    spawn() {
+      timer = setTimeout(() => controller.abort(), 5);
+      return {
+        status: new Promise(() => {}),
+        stdout: new ReadableStream<Uint8Array>(),
+        stderr: new ReadableStream<Uint8Array>(),
+        kill(signal: string) {
+          kills.push(signal);
+        },
+      };
+    }
+  };
+  try {
+    const m = mockCtx({
+      nodes: [NODE({
+        ssh: { host: "box.example.com", user: "example-reader", port: 22 },
+      })],
+    }, { signal: controller.signal });
+    // deno-lint-ignore no-explicit-any
+    await assertRejects(() => model.methods.discover.execute({}, m.ctx as any));
+    assertEquals(kills.includes("SIGKILL"), true);
+    assertEquals(m.written, []);
+    assertEquals(m.deleted, []);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    // deno-lint-ignore no-explicit-any
+    (Deno as any).Command = original;
+  }
+});
 
 Deno.test("redirect: the ssh transport refuses a 3xx with the same class", async () => {
   // curl runs without -L so it never FOLLOWS a redirect, but a 3xx used to
@@ -1190,12 +1372,12 @@ Deno.test("names: no stored field or instance name carries a raw control charact
       [
         "/api/v1/info",
         () =>
-          json({
+          json(INFO({
             version: `2.1${BEL}`,
             hostname: `h${ESC}[0m`,
             os_name: `linux${CR}`,
             os_version: "1",
-          }),
+          })),
       ],
     ],
   });
@@ -1271,7 +1453,7 @@ Deno.test("bounds: one agent-supplied field cannot be arbitrarily long", async (
           }),
       ],
       ["/api/v1/charts", () => json({ charts: {} })],
-      ["/api/v1/info", () => json({ version: huge, hostname: huge })],
+      ["/api/v1/info", () => json(INFO({ version: huge, hostname: huge }))],
     ],
   });
   for (const s of writtenStrings(m.written)) {
@@ -1364,22 +1546,30 @@ Deno.test("shape: an array 'charts' payload invents no mounts and no chart count
   );
 });
 
-Deno.test("shape: an absent alarms/charts key is still zero, not a failure", async () => {
-  // The counterpart. Tightening the shape check must not turn a legitimately
-  // quiet agent into a permanently degraded node -- absence has always meant
-  // zero, and still does.
-  const m = await sweep({
+Deno.test("shape: an EMPTY alarms/charts map is zero; an ABSENT key is not", async () => {
+  // The two halves of the same distinction, and the reason this test used to
+  // assert the opposite of what it asserts now.
+  //
+  // `{"alarms": {}}` is a quiet agent: it answered the question and the answer
+  // was none. That must stay a clean, non-degraded reading, or every idle
+  // homelab node is permanently degraded.
+  //
+  // `{}` did NOT answer the question. It used to be read as the same thing,
+  // which made suppressing a fleet's alarms a two-byte body: a successful
+  // empty alarm list is not protected from the prune, so every stored alarm
+  // record went with it and the summary said nodesDegraded: 0 while it
+  // happened. Absence is now a failed sub-fetch.
+  const quiet = await sweep({
     globalArgs: { nodes: [NODE()] },
-    routes: [
-      ["/api/v1/alarms", () => json({ hostname: "h" })],
-      ["/api/v1/charts", () => json({})],
-      infoRoute,
-    ],
+    routes: [noAlarms, ["/api/v1/charts", () => json({ charts: {} })], [
+      "/api/v1/alarms",
+      () => json({ alarms: {} }),
+    ], infoRoute],
   });
-  const summary = m.written.find((w) => w.spec === "summary")!.data;
-  assertEquals(summary.alarmsActive, 0);
+  const quietSummary = quiet.written.find((w) => w.spec === "summary")!.data;
+  assertEquals(quietSummary.alarmsActive, 0);
   assertEquals(
-    summary.nodesDegraded,
+    quietSummary.nodesDegraded,
     0,
     "an empty but well-formed answer is not degradation",
   );
@@ -1485,4 +1675,983 @@ Deno.test("nodes: names that merely differ are still accepted", async () => {
     ],
   });
   assertEquals(m.written.filter((w) => w.spec === "node").length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// 17. the base URL must not be able to relocate every endpoint
+//
+// review finding 1 (2026-08-30, block): the `url` refine checked the scheme,
+// the userinfo and the quote, and nothing else. A query string or a fragment
+// was accepted, persisted, and then concatenated with the endpoint path.
+// ---------------------------------------------------------------------------
+
+/** Serve every /api/v1 endpoint, recording the exact URL asked for. */
+function recordingFetch(seen: string[]) {
+  const original = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request) => {
+    const url = String(input instanceof Request ? input.url : input);
+    seen.push(url);
+    if (url.includes("/api/v1/alarms")) return Promise.resolve(json({}));
+    if (url.includes("/api/v1/charts")) {
+      return Promise.resolve(json({ charts: {} }));
+    }
+    return Promise.resolve(json(INFO()));
+  }) as typeof fetch;
+  return () => {
+    globalThis.fetch = original;
+  };
+}
+
+Deno.test("url: rejects a query string or a fragment", () => {
+  for (
+    const url of [
+      "http://a.example.com:19999/?k=v",
+      "http://a.example.com:19999?",
+      "https://a.example.com/#frag",
+      "http://a.example.com:19999/api?token=SECRET",
+    ]
+  ) {
+    const r = model.globalArguments.safeParse({ nodes: [NODE({ url })] });
+    assertEquals(r.success, false, `expected ${url} to be REJECTED`);
+  }
+});
+
+Deno.test("url: a query string cannot smuggle the endpoint into the query", async () => {
+  // The property, not the parse result. With `http://host/?k=v` accepted,
+  // `${base}${path}` produced `http://host/?k=v/api/v1/info`: a GET of `/`
+  // with the endpoint buried in the query string. Every /api/v1 endpoint the
+  // model believed it had polled was one response from one attacker-chosen
+  // resource, and any JSON-shaped answer made the node read reachable.
+  const seen: string[] = [];
+  const restore = recordingFetch(seen);
+  try {
+    const m = mockCtx({
+      nodes: [NODE({ url: "http://agent.example.com:19999/?k=v" })],
+    });
+    let threw = false;
+    try {
+      // deno-lint-ignore no-explicit-any
+      await model.methods.discover.execute({}, m.ctx as any);
+    } catch {
+      threw = true;
+    }
+    assertEquals(threw, true, "an unusable base URL must fail the sweep");
+    assertEquals(
+      seen.length,
+      0,
+      `a request was issued from an unvalidated base: ${seen.join(", ")}`,
+    );
+    assertEquals(m.written.length, 0, "and nothing may be persisted");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("url: endpoints are built from the canonical base, not the typed string", async () => {
+  // Trailing slashes are normalised away, and the stored `url` is the
+  // canonical form swamp actually polled -- which is what the README now says
+  // rather than claiming the value is kept verbatim.
+  const seen: string[] = [];
+  const restore = recordingFetch(seen);
+  try {
+    const m = mockCtx({
+      nodes: [NODE({ url: "http://agent.example.com:19999///" })],
+    });
+    // deno-lint-ignore no-explicit-any
+    await model.methods.discover.execute({}, m.ctx as any);
+    assertEquals(seen.length > 0, true, "the node must actually be polled");
+    for (const u of seen) {
+      assertEquals(
+        u.startsWith("http://agent.example.com:19999/api/v1/"),
+        true,
+        `endpoint built from an un-normalised base: ${u}`,
+      );
+    }
+    assertEquals(
+      m.written.find((w) => w.spec === "node")!.data.url,
+      "http://agent.example.com:19999",
+      "the stored url must be the canonical base swamp actually polled",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 18. the persisted `error` field is a closed set, not filtered prose
+//
+// review finding 2 (2026-08-30, block): sanitizeNodeError re-parsed the English
+// failure message and, when no pattern matched, persisted the raw text with one
+// narrow substitution applied. Two reachable ways past it: a non-JSON response
+// body (V8 quotes the input into the SyntaxError message) and an ssh identity
+// whose shape broke the `^ssh to \S+ failed:` anchor.
+// ---------------------------------------------------------------------------
+
+/**
+ * The complete set of failure classes allowed to reach the datastore. Written
+ * out as a closed set on purpose: "nothing else may be stored" is the security
+ * contract, so adding a class has to be a deliberate edit in two places.
+ */
+const ALLOWED_STORED_ERRORS = new Set([
+  "",
+  "ssh transport: host key verification failed",
+  "ssh transport: authentication failed",
+  "ssh transport failed",
+  "redirect refused; swamp does not follow redirects",
+  "malformed response (not the shape the endpoint promises)",
+  "response over the size cap",
+  "empty response",
+  "timed out",
+  "connection failed",
+  "unclassified failure",
+]);
+
+function isAllowedStoredError(e: string): boolean {
+  return ALLOWED_STORED_ERRORS.has(e) ||
+    /^ssh transport failed \(exit \d+\)$/.test(e) ||
+    /^HTTP \d{3} \((transient|permanent)\)$/.test(e);
+}
+
+Deno.test("error: a non-JSON body never reaches the stored error field", async () => {
+  // JSON.parse('<html>…') throws `Unexpected token '<', "<html>SECR"... is not
+  // valid JSON` -- the parser quotes the remote's own bytes back. No classifier
+  // pattern matched that, so the fallback persisted them as swamp's own words.
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      noAlarms,
+      ["/api/v1/charts", () => json({ charts: {} })],
+      [
+        "/api/v1/info",
+        () =>
+          new Response("<html>SECRET-BODY-CONTENT-should-not-persist</html>", {
+            status: 200,
+            headers: { "content-type": "text/html" },
+          }),
+      ],
+    ],
+  });
+  const node = m.written.find((w) => w.spec === "node")!.data;
+  const err = String(node.error ?? "");
+  assertEquals(
+    err.includes("SECRET-BODY-CONTENT"),
+    false,
+    `the response body reached the stored error: ${err}`,
+  );
+  assertEquals(
+    err.includes("<html"),
+    false,
+    `remote markup reached the stored error: ${err}`,
+  );
+  assertEquals(
+    isAllowedStoredError(err),
+    true,
+    `stored error is outside the allowed set: ${JSON.stringify(err)}`,
+  );
+  assertEquals(node.reachable, false, "an unparseable body is a failed poll");
+});
+
+Deno.test("error: every failure mode stores a class from the closed set", async () => {
+  // The class, not the instance. Each of these took a different route through
+  // the old regex denylist, and the ones that missed persisted text the remote
+  // chose.
+  const MARK = "MARKER-REMOTE-CHOSE-THIS";
+  const cases: Array<[string, () => Response]> = [
+    ["http-error", () => new Response(MARK, { status: 503 })],
+    ["not-json", () => new Response(`${MARK} not json`, { status: 200 })],
+    ["wrong-shape", () => json(MARK)],
+    [
+      "redirect",
+      () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: `http://${MARK}.example.com/` },
+        }),
+    ],
+    [
+      "oversized",
+      () =>
+        new Response(MARK, {
+          status: 200,
+          headers: { "content-length": String(64 * 1024 * 1024) },
+        }),
+    ],
+  ];
+  for (const [label, respond] of cases) {
+    const m = await sweep({
+      globalArgs: { nodes: [NODE()] },
+      routes: [
+        noAlarms,
+        ["/api/v1/charts", () => json({ charts: {} })],
+        ["/api/v1/info", respond],
+      ],
+    });
+    const err = String(m.written.find((w) => w.spec === "node")!.data.error);
+    assertEquals(
+      err.includes(MARK),
+      false,
+      `${label}: remote-chosen text reached the stored error: ${err}`,
+    );
+    assertEquals(
+      isAllowedStoredError(err),
+      true,
+      `${label}: stored error is outside the allowed set: ${
+        JSON.stringify(err)
+      }`,
+    );
+  }
+});
+
+Deno.test("ssh: host and user are bounded to an identifier charset", () => {
+  // Whitespace in either value used to change the SHAPE of the failure message
+  // enough to walk past the ssh branch of the old classifier and drop raw ssh
+  // stderr into the record. Errors now carry a class token instead of being
+  // re-parsed from prose; this closes the input side as well.
+  for (
+    const ssh of [
+      { host: "box example.com", user: "reader" },
+      { host: "box.example.com", user: "read er" },
+      { host: "box.example.com\nProxyCommand=x", user: "reader" },
+      { host: "box.example.com", user: "reader@elsewhere" },
+      { host: "box.example.com", user: "../../etc/passwd" },
+    ]
+  ) {
+    const r = model.globalArguments.safeParse({ nodes: [NODE({ ssh })] });
+    assertEquals(
+      r.success,
+      false,
+      `expected ${JSON.stringify(ssh)} to be REJECTED`,
+    );
+  }
+  // …and the ordinary shapes still parse, bracketed IPv6 literal included.
+  for (
+    const ssh of [
+      { host: "box.example.com", user: "netdata-reader" },
+      { host: "192.0.2.10", user: "svc_netdata" },
+      { host: "[2001:db8::1]", user: "n.reader" },
+    ]
+  ) {
+    const r = model.globalArguments.safeParse({ nodes: [NODE({ ssh })] });
+    assertEquals(
+      r.success,
+      true,
+      `expected ${JSON.stringify(ssh)} to be accepted`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 19. a malformed ENVELOPE is a failed sub-fetch, not a healthy empty reading
+//
+// review finding 3 (2026-08-30, block): asRecord() guarded the alarms/charts
+// VALUES, but the responses around them were still blind casts. A bare string
+// or array made the `alarms` key read undefined -- the documented "absent means
+// zero alarms" path -- so the sub-fetch was marked SUCCESSFUL with an empty
+// list, and a successful empty list is not protected from the prune.
+// ---------------------------------------------------------------------------
+
+const CRITICAL_ALARM = {
+  alarms: {
+    diskfull: { chart: "disk_space./", status: "CRITICAL", value: 99 },
+  },
+};
+
+Deno.test("envelope: a non-object /alarms response must not prune a firing CRITICAL", async () => {
+  const healthy = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      ["/api/v1/alarms", () => json(CRITICAL_ALARM)],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  const critical = healthy.written.find((w) => w.spec === "alarm")!;
+  assertEquals(critical.data.status, "CRITICAL");
+
+  const stored: Record<string, Json> = {};
+  for (const w of healthy.written) stored[w.name] = w.data;
+
+  for (const bogus of ["not an object", ["alarms"], 42] as unknown[]) {
+    const m = await sweep({
+      globalArgs: { nodes: [NODE()] },
+      stored,
+      routes: [
+        ["/api/v1/alarms", () => json(bogus)],
+        ["/api/v1/charts", () => json({ charts: {} })],
+        infoRoute,
+      ],
+    });
+    const shape = JSON.stringify(bogus);
+    assertEquals(
+      m.deleted.includes(critical.name),
+      false,
+      `${shape} pruned a firing CRITICAL alarm record`,
+    );
+    const summary = m.written.find((w) => w.spec === "summary")!.data;
+    assertEquals(
+      summary.nodesDegraded,
+      1,
+      `${shape} read as a complete, healthy answer`,
+    );
+    assertEquals(
+      summary.alarmsCritical,
+      1,
+      `${shape} reported the node's CRITICAL count as cleared`,
+    );
+  }
+});
+
+Deno.test("envelope: a non-object /charts response must not prune mounts or zero the count", async () => {
+  const charts = { charts: { "disk_space./": {} } };
+  const healthy = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      noAlarms,
+      ["/api/v1/charts", () => json(charts)],
+      [
+        "/api/v1/data",
+        () => json({ labels: ["avail", "used"], data: [[2, 98]] }),
+      ],
+      infoRoute,
+    ],
+  });
+  const mount = healthy.written.find((w) => w.spec === "mount")!;
+  assertEquals(mount.data.overThreshold, true);
+
+  const stored: Record<string, Json> = {};
+  for (const w of healthy.written) stored[w.name] = w.data;
+
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    stored,
+    routes: [
+      noAlarms,
+      ["/api/v1/charts", () => json(["disk_space./"])],
+      infoRoute,
+    ],
+  });
+  assertEquals(
+    m.deleted.includes(mount.name),
+    false,
+    "a top-level array response pruned a real mount record",
+  );
+  const node = m.written.find((w) => w.spec === "node")!.data;
+  assertEquals(node.charts, 1, "the last known chart count must carry forward");
+  assertEquals(
+    node.mountsOverThreshold,
+    1,
+    "an over-threshold filesystem must not read as drained",
+  );
+  assertEquals(
+    m.written.find((w) => w.spec === "summary")!.data.nodesDegraded,
+    1,
+  );
+});
+
+Deno.test("envelope: a non-object /info response is unreachable, not an empty host", async () => {
+  for (const bogus of ["2.1", [1, 2], 7] as unknown[]) {
+    const m = await sweep({
+      globalArgs: { nodes: [NODE()] },
+      routes: [
+        noAlarms,
+        ["/api/v1/charts", () => json({ charts: {} })],
+        ["/api/v1/info", () => json(bogus)],
+      ],
+    });
+    const node = m.written.find((w) => w.spec === "node")!.data;
+    assertEquals(
+      node.reachable,
+      false,
+      `${JSON.stringify(bogus)} made a node read as reachable`,
+    );
+    assertEquals(node.version, null);
+    assertEquals(node.hostname, null);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 19b. a MISSING required key, and a malformed ENTRY, are failed sub-fetches
+//
+// review finding 2 (2026-08-30, block): "Missing or null alarms/charts are
+// treated as successful empty collections, malformed alarm entries become
+// empty objects... A malformed response can therefore appear healthy and allow
+// existing alarm or mount records to be pruned."
+//
+// 19 above only covered a non-object ENVELOPE. These are the payloads that ARE
+// objects and still say nothing, which is the cheaper attack by a mile: `{}`
+// is two bytes and it used to take the documented "absent means zero alarms"
+// path, so the sub-fetch reported SUCCESS, the prune ran, and a firing
+// CRITICAL was deleted with nodesDegraded: 0 on the summary.
+//
+// Each case is run against a node with a real, stored history, because the
+// harm is not the bad write -- it is the good record that disappears.
+// ---------------------------------------------------------------------------
+
+/** Poll once with a healthy fleet state, and hand back what it stored. */
+async function storedFromHealthySweep(
+  routes: Array<[string, () => Response | Promise<Response>]>,
+) {
+  const healthy = await sweep({ globalArgs: { nodes: [NODE()] }, routes });
+  const stored: Record<string, Json> = {};
+  for (const w of healthy.written) stored[w.name] = w.data;
+  return { healthy, stored };
+}
+
+Deno.test("envelope: an alarms payload with no 'alarms' key must not clear a CRITICAL", async () => {
+  const { healthy, stored } = await storedFromHealthySweep([
+    ["/api/v1/alarms", () => json(CRITICAL_ALARM)],
+    ["/api/v1/charts", () => json({ charts: {} })],
+    infoRoute,
+  ]);
+  const critical = healthy.written.find((w) => w.spec === "alarm")!;
+  assertEquals(critical.data.status, "CRITICAL");
+
+  for (
+    const payload of [
+      {}, // the two-byte alarm-suppression body
+      { hostname: "h" }, // an object, just not this endpoint's object
+      { alarms: null }, // present and explicitly nothing
+      { alarms: { diskfull: "CRITICAL" } }, // entry is a bare string
+      { alarms: { diskfull: { chart: "disk_space./" } } }, // entry has no status
+      { alarms: { diskfull: { status: "CRITICAL" } } }, // entry has no chart
+    ] as unknown[]
+  ) {
+    const m = await sweep({
+      globalArgs: { nodes: [NODE()] },
+      stored,
+      routes: [
+        ["/api/v1/alarms", () => json(payload)],
+        ["/api/v1/charts", () => json({ charts: {} })],
+        infoRoute,
+      ],
+    });
+    const shape = JSON.stringify(payload);
+    assertEquals(
+      m.deleted.includes(critical.name),
+      false,
+      `${shape} pruned a firing CRITICAL alarm record`,
+    );
+    const summary = m.written.find((w) => w.spec === "summary")!.data;
+    assertEquals(
+      summary.nodesDegraded,
+      1,
+      `${shape} read as a complete, healthy answer`,
+    );
+    assertEquals(
+      summary.alarmsCritical,
+      1,
+      `${shape} reported the node's CRITICAL count as cleared`,
+    );
+    assertEquals(
+      m.written.filter((w) => w.spec === "alarm").length,
+      0,
+      `${shape} minted an alarm record out of an unusable entry`,
+    );
+  }
+});
+
+Deno.test("envelope: a charts payload with no 'charts' key must not drain a full disk", async () => {
+  const { healthy, stored } = await storedFromHealthySweep([
+    noAlarms,
+    ["/api/v1/charts", () => json({ charts: { "disk_space./": {} } })],
+    [
+      "/api/v1/data",
+      () => json({ labels: ["avail", "used"], data: [[2, 98]] }),
+    ],
+    infoRoute,
+  ]);
+  const mount = healthy.written.find((w) => w.spec === "mount")!;
+  assertEquals(mount.data.overThreshold, true);
+
+  for (
+    const payload of [
+      {},
+      { charts: null },
+      { charts: { "disk_space./": "a chart" } }, // map value is not a chart
+    ] as unknown[]
+  ) {
+    const m = await sweep({
+      globalArgs: { nodes: [NODE()] },
+      stored,
+      routes: [noAlarms, ["/api/v1/charts", () => json(payload)], infoRoute],
+    });
+    const shape = JSON.stringify(payload);
+    assertEquals(
+      m.deleted.includes(mount.name),
+      false,
+      `${shape} pruned a real mount record`,
+    );
+    const node = m.written.find((w) => w.spec === "node")!.data;
+    assertEquals(
+      node.charts,
+      1,
+      `${shape} replaced the chart count with a fictional zero`,
+    );
+    assertEquals(
+      node.mountsOverThreshold,
+      1,
+      `${shape} made an over-threshold filesystem read as drained`,
+    );
+    assertEquals(
+      m.written.find((w) => w.spec === "summary")!.data.nodesDegraded,
+      1,
+      `${shape} read as a complete, healthy answer`,
+    );
+  }
+});
+
+// A regression pin rather than a bug demonstrator, and worth saying so: every
+// case below ALREADY landed in failedMounts before DataResponseSchema existed,
+// because indexOf() on an empty label list returns -1 and the code refuses to
+// index a row at -1. That is correctness held up by a guard three steps
+// downstream of the payload. The schema states it at the boundary; this test
+// makes sure both keep agreeing.
+Deno.test("envelope: a /data payload missing labels or rows keeps the last reading", async () => {
+  const { healthy, stored } = await storedFromHealthySweep([
+    noAlarms,
+    ["/api/v1/charts", () => json({ charts: { "disk_space./": {} } })],
+    [
+      "/api/v1/data",
+      () => json({ labels: ["avail", "used"], data: [[2, 98]] }),
+    ],
+    infoRoute,
+  ]);
+  const mount = healthy.written.find((w) => w.spec === "mount")!;
+
+  for (
+    const payload of [
+      { data: [[2, 98]] }, // no labels: which column is which?
+      { labels: ["avail", "used"] }, // no rows at all
+      { labels: ["avail", "used"], data: ["2,98"] }, // rows are not arrays
+      { labels: [1, 2], data: [[2, 98]] }, // labels are not names
+    ] as unknown[]
+  ) {
+    const m = await sweep({
+      globalArgs: { nodes: [NODE()] },
+      stored,
+      routes: [
+        noAlarms,
+        ["/api/v1/charts", () => json({ charts: { "disk_space./": {} } })],
+        ["/api/v1/data", () => json(payload)],
+        infoRoute,
+      ],
+    });
+    const shape = JSON.stringify(payload);
+    assertEquals(
+      m.written.filter((w) => w.spec === "mount").length,
+      0,
+      `${shape} fabricated a capacity reading`,
+    );
+    assertEquals(
+      m.deleted.includes(mount.name),
+      false,
+      `${shape} pruned the last known mount record`,
+    );
+    assertEquals(
+      m.written.find((w) => w.spec === "summary")!.data.nodesDegraded,
+      1,
+      `${shape} read as a complete, healthy answer`,
+    );
+  }
+});
+
+Deno.test("envelope: a malformed payload never puts agent text in the stored error", async () => {
+  // requireShape() builds its message from the schema's own vocabulary, but
+  // one part of the issue path -- a map key -- is agent-chosen. The stored
+  // error must still be the fixed class and nothing else, and the log field
+  // must be bounded like any other agent text.
+  const evil = "X".repeat(4000) + "[2J";
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      ["/api/v1/alarms", () => json({ alarms: { [evil]: "not an entry" } })],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  const node = m.written.find((w) => w.spec === "node")!.data;
+  assertEquals(String(node.error ?? ""), "");
+  for (const w of m.written) {
+    for (const v of Object.values(w.data)) {
+      assertEquals(
+        typeof v === "string" && v.includes("XXXXX"),
+        false,
+        "agent-chosen bytes reached a stored field via a schema error",
+      );
+    }
+  }
+  for (const props of m.warningProps) {
+    const line = JSON.stringify(props);
+    assertEquals(
+      line.includes(""),
+      false,
+      "a raw escape sequence reached a log field",
+    );
+    assertEquals(
+      line.length < 2000,
+      true,
+      `an unbounded agent key reached a log field (${line.length} chars)`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 20. an alarm payload cannot rename itself onto another alarm's record
+//
+// review finding 4 (2026-08-30, block): `{ name, ...a }` spread the payload
+// over the object key, so an agent-chosen `name` field overrode the one part
+// of the entry Netdata guarantees to be unique.
+// ---------------------------------------------------------------------------
+
+Deno.test("alarm: the object key is authoritative over a payload 'name'", async () => {
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      [
+        "/api/v1/alarms",
+        () =>
+          json({
+            alarms: {
+              cpu_high: {
+                name: "collide",
+                chart: "c",
+                status: "CRITICAL",
+                value: 99,
+              },
+              mem_low: {
+                name: "collide",
+                chart: "c",
+                status: "WARNING",
+                value: 1,
+              },
+            },
+          }),
+      ],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  const alarms = m.written.filter((w) => w.spec === "alarm");
+  assertEquals(
+    new Set(alarms.map((a) => a.name)).size,
+    2,
+    `two alarms collapsed onto one record name: ${
+      alarms.map((a) => a.name).join(" == ")
+    }`,
+  );
+  assertEquals(
+    alarms.filter((a) => a.data.status === "CRITICAL").length,
+    1,
+    "the firing CRITICAL must not be overwritten by the benign alarm",
+  );
+  assertEquals(
+    new Set(alarms.map((a) => a.data.name)),
+    new Set(["cpu_high", "mem_low"]),
+    "the stored name must be the object key, not the payload's claim",
+  );
+  assertEquals(
+    m.written.find((w) => w.spec === "node")!.data.alarmsCritical,
+    1,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 21. identity encoding, and refusing a second write to a claimed name
+//
+// review finding 6 (2026-08-30, block): a 32-bit hash over a control-character
+// join. The join is now length-prefixed -- injective without needing any
+// character to be forbidden inside a field -- and the hash is 64-bit. Neither
+// is a proof, and none of an alarm's identity fields are operator-controlled,
+// so a second write to an already-claimed name is REFUSED rather than allowed
+// to replace the first record silently.
+// ---------------------------------------------------------------------------
+
+Deno.test("names: identity fields are encoded unambiguously without a separator", async () => {
+  // The pair has to defeat BOTH halves of an instance name, or the test proves
+  // nothing: `${prefix}-${label}-${hash}`, where the label is the slugged
+  // fields joined with "-". ("nodeA","ab-","c") and ("nodeA","ab","-c") are
+  // distinct identities that
+  //   * concatenate to the same string        -> one hash, and
+  //   * slug to the same label ("nodea-ab-c") -> because slug() strips the
+  //     boundary dash either side of the move.
+  // So under a separator-free join they are one instance name and one record.
+  // Length-prefixing ("5:nodeA3:ab-1:c" vs "5:nodeA2:ab2:-c") separates them
+  // without depending on any character being banned from a field -- including
+  // fields that themselves contain the digits and colon the encoding uses.
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    routes: [
+      [
+        "/api/v1/alarms",
+        () =>
+          json({
+            alarms: {
+              "ab-": { chart: "c", status: "CRITICAL", value: 9 },
+              ab: { chart: "-c", status: "WARNING", value: 1 },
+              "2:xy": { chart: "z", status: "WARNING", value: 1 },
+              "2": { chart: "xyz", status: "WARNING", value: 1 },
+            },
+          }),
+      ],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  const alarms = m.written.filter((w) => w.spec === "alarm");
+  assertEquals(alarms.length, 4, "all four alarms must be written");
+  assertEquals(
+    new Set(alarms.map((a) => a.name)).size,
+    4,
+    `distinct identities collapsed onto one name: ${
+      alarms.map((a) => a.name).join(", ")
+    }`,
+  );
+  assertEquals(
+    alarms.filter((a) => a.data.status === "CRITICAL").length,
+    1,
+    "the firing CRITICAL must survive",
+  );
+});
+
+Deno.test("names: a second record on an already-claimed name is refused, not overwritten", async () => {
+  // A REAL, reachable collision rather than a contrived one. agentText() caps
+  // each field at 512 characters -- a documented trade -- so two alarm names
+  // agreeing in their first 511 characters normalise to the same value and
+  // generate one instance name. Under a plain writeResource the second entry
+  // replaced the first; here the first is a firing CRITICAL, and it vanished
+  // with no warning, no degraded flag, and a summary reading alarmsCritical: 0.
+  const stem = "A".repeat(600);
+  const m = await sweep({
+    globalArgs: { nodes: [NODE()] },
+    stored: { "alarm-nodea-stale": { node: "nodeA" } },
+    routes: [
+      [
+        "/api/v1/alarms",
+        () =>
+          json({
+            alarms: {
+              [`${stem}1`]: { chart: "c", status: "CRITICAL", value: 99 },
+              [`${stem}2`]: { chart: "c", status: "WARNING", value: 1 },
+            },
+          }),
+      ],
+      ["/api/v1/charts", () => json({ charts: {} })],
+      infoRoute,
+    ],
+  });
+  const alarms = m.written.filter((w) => w.spec === "alarm");
+  assertEquals(
+    alarms.length,
+    1,
+    "the colliding second write must be refused, not performed",
+  );
+  assertEquals(
+    alarms[0].data.status,
+    "CRITICAL",
+    "the record that survives must be the first written, not the last",
+  );
+  const summary = m.written.find((w) => w.spec === "summary")!.data;
+  assertEquals(
+    summary.nodesDegraded,
+    1,
+    "a record observed but not stored is an incomplete sweep, so: degraded",
+  );
+  assertEquals(
+    m.deleted.includes("alarm-nodea-stale"),
+    false,
+    "and nothing of that node's may be pruned while the write set is short",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 22. the ssh transport must not be reconfigurable from the remote box
+//
+// review findings 8 and 9 (2026-08-30, block): BatchMode=yes does not pin the
+// host-key policy (an ssh_config saying `StrictHostKeyChecking no` wins), and
+// curl read /etc/curlrc and ~/.curlrc ON THE NODE -- where `insecure`,
+// `location`, `proxy` or `user` each undo a guarantee this extension states.
+// ---------------------------------------------------------------------------
+
+/** Capture the argv of the ssh subprocess and answer with a canned body. */
+function captureSshCommand(body: unknown) {
+  const original = Deno.Command;
+  const calls: Array<{ cmd: string; args: string[] }> = [];
+  // deno-lint-ignore no-explicit-any
+  (Deno as any).Command = class {
+    constructor(cmd: string, opts: { args?: string[] }) {
+      calls.push({ cmd, args: opts.args ?? [] });
+    }
+    spawn() {
+      return {
+        status: Promise.resolve({ success: true, code: 0, signal: null }),
+        stdout: new Response(
+          `${JSON.stringify(body)}__SWAMP_HTTP_STATUS__:200`,
+        ).body!,
+        stderr: new Response("").body!,
+        kill() {},
+      };
+    }
+  };
+  return {
+    calls,
+    restore: () => {
+      // deno-lint-ignore no-explicit-any
+      (Deno as any).Command = original;
+    },
+  };
+}
+
+async function sshSweepArgs() {
+  const cap = captureSshCommand(INFO());
+  try {
+    const m = mockCtx({
+      nodes: [
+        NODE({
+          url: "http://127.0.0.1:19999",
+          ssh: { host: "box.example.com", user: "netdata-reader", port: 22 },
+        }),
+      ],
+    });
+    // deno-lint-ignore no-explicit-any
+    await model.methods.discover.execute({}, m.ctx as any);
+  } finally {
+    cap.restore();
+  }
+  assertEquals(cap.calls.length > 0, true, "no ssh subprocess was spawned");
+  return cap.calls;
+}
+
+Deno.test("ssh: the host-key policy is pinned on the command line", async () => {
+  // BatchMode only turns an interactive PROMPT into a failure. It has no say
+  // once ~/.ssh/config or /etc/ssh/ssh_config has answered the question, and
+  // `StrictHostKeyChecking no` / `accept-new` there silently accept an unknown
+  // or changed key -- a machine-in-the-middle on a transport the README calls
+  // fail-closed. A command-line -o wins over both files.
+  for (const call of await sshSweepArgs()) {
+    assertEquals(call.cmd, "ssh");
+    const opts: string[] = [];
+    for (let i = 0; i < call.args.length - 1; i++) {
+      if (call.args[i] === "-o") opts.push(call.args[i + 1]);
+    }
+    assertEquals(
+      opts.includes("StrictHostKeyChecking=yes"),
+      true,
+      `host-key policy left to the host's ssh_config: ${opts.join(" ")}`,
+    );
+    assertEquals(
+      opts.includes("BatchMode=yes"),
+      true,
+      "BatchMode must stay: no prompt may ever block a sweep",
+    );
+  }
+});
+
+Deno.test("ssh: curl ignores remote configuration files and states its own policy", async () => {
+  for (const call of await sshSweepArgs()) {
+    // The remote command is the last argv element.
+    const remote = call.args[call.args.length - 1];
+    assertEquals(
+      remote.startsWith("curl -q "),
+      true,
+      "curl must be invoked with -q FIRST -- curl applies config-file " +
+        `contents in argument order, so a later -q cannot undo them: ${remote}`,
+    );
+    assertEquals(
+      / -L\b|--location\b/.test(remote),
+      false,
+      `redirect following must stay off on the ssh transport: ${remote}`,
+    );
+    assertEquals(
+      / -k\b|--insecure\b/.test(remote),
+      false,
+      `TLS verification must never be disabled: ${remote}`,
+    );
+    assertEquals(
+      remote.includes("--proto '=http,https'"),
+      true,
+      `the scheme restriction must be stated at the far end too: ${remote}`,
+    );
+    assertEquals(
+      remote.includes("--noproxy '*'"),
+      true,
+      `a remote proxy relocates the request just as a redirect does: ${remote}`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 23. agent text is bounded because of where it CAME from, not where it goes
+//
+// The field-size cap was applied at the write sites and nowhere else, so the
+// log fields kept the property the stored fields had lost: an alarm name or a
+// `disk_space.<…>` chart id chosen by an unauthenticated remote went into
+// logger.warning() at whatever length it arrived, escape sequences intact, for
+// whatever renders the log. Logging full diagnostics is a documented
+// operator-decision trade (README, Security); logging an unbounded remote
+// string is not part of that trade.
+// ---------------------------------------------------------------------------
+
+Deno.test("bounds: agent-supplied text is bounded in log fields too, not only stored ones", async () => {
+  const huge = "B".repeat(100_000);
+  const ESC2 = String.fromCharCode(27);
+  const restore = stubFetch([
+    [
+      "/api/v1/alarms",
+      () =>
+        json({
+          alarms: {
+            // a non-numeric value logs a warning naming the alarm
+            [`${huge}${ESC2}[31m`]: {
+              chart: "c",
+              status: "WARNING",
+              value: "n/a",
+            },
+          },
+        }),
+    ],
+    // a chart id past the cap, whose /data call then fails
+    ["/api/v1/charts", () => json({ charts: { [`disk_space.${huge}`]: {} } })],
+    ["/api/v1/data", () => json({ error: "boom" }, 500)],
+    infoRoute,
+  ]);
+  try {
+    const m = mockCtx({ nodes: [NODE()] });
+    // deno-lint-ignore no-explicit-any
+    await model.methods.discover.execute({}, m.ctx as any);
+    assertEquals(
+      m.warningProps.length > 0,
+      true,
+      "this sweep must actually produce warnings, or it proves nothing",
+    );
+    for (const props of m.warningProps) {
+      for (const [key, value] of Object.entries(props)) {
+        if (typeof value !== "string") continue;
+        // The property is that no AGENT-SUPPLIED string reaches a log field
+        // except in bounded form -- not that every field is under 512, since a
+        // composed diagnostic legitimately concatenates a few bounded parts
+        // (`HTTP 500 (permanent) on <bounded path>: <bounded body prefix>`).
+        // A 100_000-character run of the marker is the thing that must not
+        // survive, whether it arrives as a field or embedded in a message.
+        assertEquals(
+          /B{513,}/.test(value),
+          false,
+          `log field {${key}} carried an unbounded run of agent text ` +
+            `(${value.length} chars total)`,
+        );
+        assertEquals(
+          value.length <= 2048,
+          true,
+          `log field {${key}} carried ${value.length} characters; a ` +
+            "diagnostic is a few bounded parts, not a remote-sized payload",
+        );
+        assertEquals(
+          hasControlChar(value),
+          false,
+          `log field {${key}} carried a raw control character`,
+        );
+      }
+    }
+  } finally {
+    restore();
+  }
 });

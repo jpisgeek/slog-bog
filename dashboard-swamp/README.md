@@ -8,26 +8,30 @@ provider-neutral dashboard bundle used by every other domain. Each interface is
 collected independently, so one failure cannot erase the evidence from the
 others. Missing is not zero and empty history is not healthy.
 
-**Version** `2026.08.25.2` · **License** MIT · **Source**
+**Version** `2026.09.05.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/dashboard-swamp
 
 ## Install
 
+Clone this GitHub repository and register this extension's source in your Swamp
+repo. Replace the example path with the canonical location of your clone:
+
+```sh
+swamp extension source add /example/slog-bog/dashboard-swamp --only models,reports
 ```
-swamp extension pull @jpisgeek/dashboard-swamp
-```
+
+This repaired version is distributed through GitHub source, not a registry
+release.
 
 ## `@jpisgeek/swamp-observability`
 
 ### Arguments
 
-| argument      | type    | required | default   | description                                                                                               |
-| ------------- | ------- | -------- | --------- | --------------------------------------------------------------------------------------------------------- |
-| `repoDir`     | string  | yes      |           | Swamp repository to observe                                                                               |
-| `swampBinary` | string  | no       | `"swamp"` | Swamp executable path or name                                                                             |
-| `server`      | string  | no       |           | Optional HTTPS swamp serve URL without userinfo, query, or fragment; omit to observe the local repository |
-| `token`       | string  | no       |           | Optional serve token; use a vault expression. Passed only in the child environment.                       |
-| `timeoutMs`   | integer | no       | `15000`   |                                                                                                           |
+| argument      | type    | required | default   | description                                                                                              |
+| ------------- | ------- | -------- | --------- | -------------------------------------------------------------------------------------------------------- |
+| `repoDir`     | string  | yes      |           | Swamp repository to observe                                                                              |
+| `swampBinary` | string  | no       | `"swamp"` | Swamp executable: a bare program name resolved on PATH, or an absolute path. Relative paths are refused. |
+| `timeoutMs`   | integer | no       | `15000`   |                                                                                                          |
 
 ### Methods
 
@@ -40,15 +44,15 @@ No arguments.
 
 ### Data written
 
-| resource      | lifetime | fields                                                                  | description                                                                                                                                     |
-| ------------- | -------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `observation` | 30d      | `interface`, `available`, `observedAt`, `errorKind`, `error`, `payload` | One verbatim JSON snapshot per documented Swamp operational interface; errors are sanitized and unavailable interfaces are retained explicitly. |
+| resource      | lifetime | fields                                                                  | description                                                                                                                                                                                                                                                 |
+| ------------- | -------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `observation` | 30d      | `interface`, `available`, `observedAt`, `errorKind`, `error`, `payload` | One projected snapshot per documented local Swamp operational interface: counts, booleans, and statuses drawn from a fixed vocabulary. Response text and identifiers are dropped, errors are sanitized, and unavailable interfaces are retained explicitly. |
 
 ## Example
 
 ```yaml
 models:
-  swamp-ops:
+  example-swamp-observer:
     type: "@jpisgeek/swamp-observability"
 globalArguments:
   repoDir: /srv/swamp/example-repo
@@ -59,7 +63,7 @@ reports:
     - "@jpisgeek/dashboard-swamp"
 
 # Pass the report artifact explicitly to the renderer:
-# ${{ data.latest("swamp-ops", "report-jpisgeek-dashboard-swamp-json").attributes }}
+# ${{ data.latest("example-swamp-observer", "report-jpisgeek-dashboard-swamp-json").attributes }}
 ```
 
 ## Caveats
@@ -71,25 +75,59 @@ workflow, or report history is unknown rather than healthy. A failed historical
 execution degrades its section; stale or orphaned runs are critical. Stored
 reports are judged the same way: a failed stored report degrades the inventory
 section rather than merely proving a status field exists. Statuses are matched
-as whole tokens, so a compound value such as completed_with_errors is counted as
-unrecognized and degrades the section instead of being read as a pass.
-Observations older than five minutes are reported as stale, so a report re-run
-against a stored snapshot cannot claim the data is current. A stored snapshot
-this report version cannot parse becomes a coverage gap for that one interface;
-the others still render.
+as whole tokens and then reduced to one of active, succeeded, failed, stale,
+orphaned or unknown, so a compound value such as completed_with_errors is
+counted as unrecognized and degrades the section instead of being read as a
+pass. Observations older than five minutes are reported as stale, so a report
+re-run against a stored snapshot cannot claim the data is current. A stored
+snapshot this report version cannot parse becomes a coverage gap for that one
+interface; the others still render. Because only the projection is stored, a
+response that is not the documented shape — or whose run doctor counts are not
+nonnegative integers — is recorded as an invalid response instead of being kept,
+and a response larger than the 4 MiB stdout cap is recorded as oversized rather
+than parsed in part. Report normalization inspects at most the first 16
+execution data handles, before any repository read or parsing. Additional
+handles produce a required partial coverage section naming the omitted count;
+they never vanish silently. There is no remote mode: observing a `swamp serve`
+instance over HTTPS, and the serve token that went with it, were removed rather
+than documented, so the `server`, `token` and `allowedServerHosts` arguments no
+longer exist and a configuration that still sets them fails instead of silently
+observing the local repository in their place.
 
 ## Security
 
-The collector launches only the configured Swamp executable with a fixed argv
-array and never invokes a shell or command/shell model. A serve token is
-optional, marked sensitive, and passed to the child only as SWAMP_SERVER_TOKEN;
-it is never placed in argv, logs, stored errors, or bundle output. Command
-stderr and stdout on failure are classified and discarded. Swamp's built-in
-method summary records non-sensitive global arguments such as repoDir, server,
-and swampBinary, so treat those values as operational metadata and protect the
-repository's stored reports accordingly. Remote server URLs must use HTTPS and
-cannot contain URL credentials. Successful command payloads are stored verbatim;
-only failure text is sanitized.
+This extension holds no credential and opens no network connection. It launches
+only the configured Swamp executable with a fixed argv array against the local
+repository, and never invokes a shell or command/shell model. Remote observation
+was removed rather than guarded: the serve token had to be handed to the
+executable, whose HTTP client decides on its own whether to follow a redirect,
+so a first-hop host allowlist could not stop the token being carried to another
+host or onto cleartext. With no URL and no token there is no redirect boundary
+to forward authentication across. swampBinary must be a bare program name or an
+absolute path; a relative path would resolve against the observed repository and
+is refused. Symlinks and parent-directory segments are resolved before checking
+that the executable is outside the observed repository. The child runs with a
+cleared environment: it receives PATH, HOME and TMPDIR and nothing else, so a
+replaced or malicious executable cannot read the credentials other extensions
+leave in the parent environment, and an ambient SWAMP_SERVER_TOKEN is not
+forwarded. Child output is read through hard caps — 4 MiB of stdout and 64 KiB
+of stderr — and a command that exceeds either is killed and its output
+discarded, so the memory this extension allocates is never chosen by the process
+it launched. Command stderr and stdout on failure are classified into fixed
+messages and discarded. Successful responses are not stored verbatim: each is
+projected through a strict per-interface schema down to counts, booleans, and
+statuses drawn from a six-word vocabulary, so report names, paths, identifiers
+and response text are dropped before anything is written; an unrecognized status
+is stored as `unknown` with its text discarded. The report bundle names the
+producing extension but not the operator's model instance: no model name and no
+model ID are written into stored report output. Bundle, section, and exception
+identities include a SHA-256 namespace derived from the source model ID without
+emitting that ID. Duplicate or mismatched interface snapshots become coverage
+gaps, and stored snapshots over 4 MiB are refused before JSON decoding. Swamp's
+built-in method summary records the non-sensitive global arguments repoDir and
+swampBinary, so treat those values as operational metadata and protect the
+repository's stored reports accordingly.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the release gates every version passes before it reaches the registry.
+for the repository's security review requirements. This version is shared as
+GitHub source and is not published to the Swamp registry.

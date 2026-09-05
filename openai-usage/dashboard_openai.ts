@@ -194,9 +194,14 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
+  // Evidence links are persisted and rendered; reject embedded credentials.
   url: z.string().url().refine(
-    (value) => new URL(value).protocol === "https:",
-    "evidence URLs must use https",
+    (value) => {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" && parsed.username === "" &&
+        parsed.password === "";
+    },
+    "evidence URLs must use https and must not carry credentials",
   ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
@@ -456,6 +461,8 @@ const SnapshotSchema = z.object({
     inputTokens: z.number().int().nonnegative(),
     outputTokens: z.number().int().nonnegative(),
     cachedInputTokens: z.number().int().nonnegative(),
+    inputAudioTokens: z.number().int().nonnegative(),
+    outputAudioTokens: z.number().int().nonnegative(),
     requests: z.number().int().nonnegative(),
     breakdowns: z.array(z.object({
       projectId: z.string().nullable(),
@@ -463,6 +470,8 @@ const SnapshotSchema = z.object({
       inputTokens: z.number().int().nonnegative(),
       outputTokens: z.number().int().nonnegative(),
       cachedInputTokens: z.number().int().nonnegative(),
+      inputAudioTokens: z.number().int().nonnegative(),
+      outputAudioTokens: z.number().int().nonnegative(),
       requests: z.number().int().nonnegative(),
     })),
   }).nullable(),
@@ -509,6 +518,31 @@ const sensitivity = {
   fields: ["projectId", "model", "lineItem"],
   redacted: false,
   note: "Breakdown dimensions can reveal internal project names and workloads",
+};
+
+/**
+ * Bundle-level sensitivity has to cover the producer block as well as the
+ * sections. `producer.modelName` is the operator's own Swamp model name and
+ * `producer.modelId` its instance ID; both are local infrastructure naming,
+ * and neither is derived from OpenAI. They were emitted into the JSON report
+ * while the sensitivity metadata listed only the OpenAI breakdown dimensions,
+ * so an operator deciding what was safe to publish read a field list that did
+ * not mention the two identifiers naming their own host's model. The contract
+ * requires modelName, so the fix is disclosure, not omission: an operator who
+ * must redact now knows exactly which paths to strip.
+ */
+const bundleSensitivity = {
+  classification: "operational" as const,
+  fields: [
+    "projectId",
+    "model",
+    "lineItem",
+    "producer.modelName",
+    "producer.modelId",
+  ],
+  redacted: false,
+  note:
+    "Breakdown dimensions can reveal internal project names and workloads; the producer block additionally names the local Swamp model and its instance ID",
 };
 
 async function readSnapshot(ctx: ReportContext): Promise<Snapshot | null> {
@@ -603,8 +637,12 @@ function usageSection(snapshot: Snapshot) {
     title: "API usage",
     state: sectionState,
     impact: "required",
+    // Text and audio counters are disjoint in OpenAI's usage contract, so the
+    // headline total sums both modalities. Cached input tokens stay out of it:
+    // they are a subset of inputTokens, not an addition to it.
     summary: `${snapshot.usage.requests} requests used ${
-      snapshot.usage.inputTokens + snapshot.usage.outputTokens
+      snapshot.usage.inputTokens + snapshot.usage.outputTokens +
+      snapshot.usage.inputAudioTokens + snapshot.usage.outputAudioTokens
     } tokens`,
     coverage: {
       kind: partial ? "sample" : "exact",
@@ -626,6 +664,18 @@ function usageSection(snapshot: Snapshot) {
         "cached-input-tokens",
         "Cached input tokens",
         snapshot.usage.cachedInputTokens,
+        "tokens",
+      ],
+      [
+        "input-audio-tokens",
+        "Input audio tokens",
+        snapshot.usage.inputAudioTokens,
+        "tokens",
+      ],
+      [
+        "output-audio-tokens",
+        "Output audio tokens",
+        snapshot.usage.outputAudioTokens,
         "tokens",
       ],
       ["requests", "Requests", snapshot.usage.requests, "requests"],
@@ -745,6 +795,21 @@ function costSection(snapshot: Snapshot) {
   });
 }
 
+/** Stable producer namespace; a full digest avoids raw model IDs in bundle IDs. */
+async function bundleId(modelId: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      `@jpisgeek/openai-usage\0bundle-id\0${modelId}`,
+    ),
+  );
+  const hex = Array.from(
+    new Uint8Array(digest),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `openai-organization-${hex}`;
+}
+
 export async function normalize(
   ctx: ReportContext,
 ): Promise<DashboardBundleV1> {
@@ -763,12 +828,12 @@ export async function normalize(
     ];
   return DashboardBundleV1Schema.parse({
     schemaVersion: DASHBOARD_BUNDLE_VERSION,
-    id: "openai-organization",
+    id: await bundleId(ctx.modelId),
     title: "OpenAI organization usage",
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/openai-usage",
-      extensionVersion: "2026.08.25.2",
+      extensionVersion: "2026.09.05.1",
       modelType: String(ctx.modelType),
       modelName: ctx.definition.name,
       modelId: ctx.modelId,
@@ -778,7 +843,7 @@ export async function normalize(
     state: deriveOverallState(sections),
     sections,
     exceptions: [],
-    sensitivity,
+    sensitivity: bundleSensitivity,
     extensions: {
       "jpisgeek/openai-usage": {
         usageEndpoint: "/v1/organization/usage/completions",

@@ -192,9 +192,14 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
+  // Evidence links are persisted and rendered; reject embedded credentials.
   url: z.string().url().refine(
-    (value) => new URL(value).protocol === "https:",
-    "evidence URLs must use https",
+    (value) => {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" && parsed.username === "" &&
+        parsed.password === "";
+    },
+    "evidence URLs must use https and must not carry credentials",
   ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {

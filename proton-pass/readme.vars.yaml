@@ -1,82 +1,304 @@
+publicationNote: >-
+  for the repository's security review requirements. This version is shared as
+  GitHub source and is not published to the Swamp registry.
+install: |
+  Clone this GitHub repository and register this extension's source in your Swamp repo.
+  Replace the example path with the canonical location of your clone:
+
+  ```sh
+  swamp extension source add /example/slog-bog/proton-pass --only vaults
+  ```
+
+  This repaired version is distributed through GitHub source, not a registry release.
 package: "@jpisgeek/proton-pass"
 types: []
 purpose: >-
   Proton Pass as a swamp vault provider. `${{ vault.get('<vault>', 'KEY') }}`
-  resolves live through the official `pass-cli` at run time. Secrets stay in
-  Proton Pass and are never copied into swamp storage, this repository, or
-  disk. For people who keep their lives in the Proton ecosystem and want
+  resolves live through the official `pass-cli` at run time. This provider
+  copies no secret into swamp storage, into this repository, or into any file
+  — it writes no files at all, and caches no value between calls. It cannot
+  make that promise for the whole host: `pass-cli` keeps its own local
+  database, which is where Proton Pass data lives on this machine (its key is
+  in the login Keychain on macOS), and the CLI is an ordinary process with
+  ordinary filesystem access. For people who keep their lives in the Proton ecosystem and want
   swamp to read credentials from the same place everything else does.
+# NOTE ON THE EXAMPLE BELOW: do not add a commented-out `binary:` line inside
+# `config:`. gen-readme.ts runs `deno fmt` over the rendered markdown, and the
+# YAML formatter dedents a trailing comment that is followed by a blank line to
+# column 0 -- which lifted `binary` OUT of `config` in the published README and
+# gave anyone who uncommented it the wrong configuration shape. Re-indenting
+# here does not survive; the option is documented in the Arguments table and in
+# Caveats instead.
 example: |
   # vaults/proton.yaml
   type: "@jpisgeek/proton-pass"
   name: proton
   config:
-    vaultName: <your-vault>        # the Proton Pass vault to read from
+    vaultName: <your-vault>   # the Proton Pass vault to read from
     defaultField: password    # field used when a key names none
-    # binary: /opt/homebrew/bin/pass-cli   # optional; resolved on PATH + known prefixes otherwise
 
   # Then in any model:
   #   apiKey: ${{ vault.get('proton', 'Example Service/API Key') }}
   # Key forms:
   #   "Item Title"                 -> that item, field = defaultField
   #   "Item Title/fieldname"       -> explicit field on that item
-  #   "pass://SHARE_ID/ITEM_ID"    -> stable URI; survives item renames (preferred for anything long-lived)
 caveats: >-
   Requires the Proton Pass CLI (`brew install proton-pass-cli`) and a usable
   session (`pass-cli login`, or a personal access token for unattended runs).
   On macOS the CLI's database key lives in the login Keychain, so `get()` works
   from a GUI login session or a LaunchAgent in that session, not over plain
-  ssh, from a LaunchDaemon, or from cron. Item titles can be edited in the
-  Proton Pass UI; item IDs cannot, so prefer `pass://` URIs for anything that
-  must not break when someone renames an item. `put()` creates a new login
-  item each call (no update-in-place) and passes the value as a CLI argument,
-  which is visible in the process list to other local users for the duration
-  of the call. Prefer creating items in the Proton Pass UI and reading them
-  with `get()`.
+  ssh, from a LaunchDaemon, or from cron. Add the optional `binary` key under
+  `config` — an absolute path to `pass-cli` — when the CLI is not on the PATH
+  the swamp process sees; left unset it is resolved against PATH and then the
+  usual Homebrew prefixes. THIS PROVIDER IS READ-ONLY. There is no `put()`:
+  create items in the Proton Pass UI and read them here. Writing was removed
+  deliberately — it accounted for 10 of 39 review blocks across six rounds, and
+  every one was a way for a non-idempotent write to be misreported. There is
+  also no `pass://SHARE_ID/ITEM_ID` addressing; it accounted for 14 more. Items
+  are addressed by TITLE, so renaming an item in the Proton Pass UI breaks any
+  key naming it. That is the cost of the smaller surface, and it is the whole
+  of it.
 security: >-
   Every `get()` is a live lookup; no value is cached, logged, or persisted.
-  pass-cli is invoked with `Deno.Command` (never a shell), so there is no
-  argv injection. Error messages carry pass-cli's stderr or its `Error:`
-  lines only. Raw stdout (which for `item view` is the whole item, secret
-  included) is never placed in an exception. Written data: none.
+  pass-cli is invoked with `Deno.Command` (never a shell), so there is no argv
+  injection. This provider writes nothing at all — not to swamp
+  storage, and not to Proton. It reads.
 
   **Secret keys appear in errors; remote text does not.** A failed lookup says
   which key failed — `Secret 'x/y' not found in vault 'z'` — and that is
-  deliberate. The key is what YOU passed in; it is already in the model
-  definition that asked for it, and an error that will not say which lookup
-  failed makes a secrets provider undiagnosable. What is NOT forwarded is
-  anything pass-cli or Proton said: stderr is reduced to a fixed verdict
-  (`session-not-usable`, `vault-not-found`, `item-not-found`,
-  `field-not-found`, `permission-denied`, `network-failure`, or
-  `unclassified`), because that text can echo the arguments it was given and
-  whatever the server returned. Nothing pass-cli or Proton wrote is forwarded
-  verbatim — earlier versions of this document said otherwise and the code no
-  longer does.
-  Exception strings from here reach swamp run logs and reports.
+  deliberate. The key and the vault name are what YOU passed in; they are
+  already in the model definition that asked for the secret, and an error that
+  will not say which lookup failed makes a secrets provider undiagnosable.
+  Every such string is length-bounded before it enters an exception, so a
+  pathological key cannot flood a run log, and control characters in it are
+  escaped rather than printed: a key containing a newline would otherwise write
+  a second, forged line into the run log, and an ESC sequence would drive the
+  terminal reading it. Control characters are refused outright in `vaultName`,
+  `defaultField`, `binary` and in any secret key — before pass-cli is invoked
+  with them. The pass-cli executable path is never named in an error either,
+  neither the value you configured in `binary` nor the install prefix it
+  resolved to: run logs and reports are the wrong place to publish the
+  filesystem layout of the host swamp runs on. What is NOT forwarded is anything
+  pass-cli or Proton said. Its stdout is never placed in an exception at all —
+  for `item view` that stdout is the whole item, secret included. Its stderr
+  and its `Error:` lines are read only to classify, and what escapes is one
+  fixed verdict from a closed set: `session-not-usable`, `vault-not-found`,
+  `item-not-found`, `field-not-found`, `permission-denied`, `network-failure`,
+  or `unclassified`, which alone carries the process exit code appended in
+  parentheses — a small integer, the only part of any verdict that varies, and
+  never text from pass-cli or from Proton. One further fixed diagnostic escapes
+  outside that set: a macOS login-Keychain failure (`errSecInteractionNotAllowed`)
+  is reported in its own words, because "this works from a GUI session but not
+  over ssh" is the whole of the fix and no verdict name conveys it. It is
+  likewise fixed text, containing nothing pass-cli or Proton said. No CLI or server text is forwarded verbatim, in any error
+  path. Exception strings from here reach swamp run logs and reports.
 
   **A key splits at the FIRST `/`.** `Example Service/API Key` means the item
   `Example Service`, field `API Key`. An item title containing `/` therefore
-  cannot be addressed this way — use a `pass://SHARE_ID/ITEM_ID/FIELD` URI for
-  those. The URI form is checked for liveness too.
+  cannot be addressed at all, and a key beginning `pass://` is refused outright
+  rather than quietly treated as a title. Titles containing `/` are also
+  omitted from `list()`: offering one would hand back a string that resolves to
+  a different item's field, and `get()` refuses such a key outright when an
+  item genuinely carries that title.
 
-  **Deleted means deleted.** Proton Pass moves an item to the trash rather than
-  purging it, and `state` has always been in the item list. This provider now
-  reads it: a trashed item is not listed and is not resolvable, so deleting a
-  secret actually stops it being handed out. Previously it did not — the item
-  stayed visible as an available key and `--item-title` would resolve to it.
+  **Vault names and ids are joined to their options.** Both are untrusted —
+  the vault name is operator input, the ids come off the wire — and either can
+  begin with `-`. Passed as its own argument, pass-cli's option parser is free
+  to read one as a flag; using `--option=value` leaves nothing to reinterpret.
+  Avoiding a shell prevents shell injection, which is a different problem. Ids taken from the item listing must
+  be canonical base64url before being sent as an address: the alphabet
+  `A-Z a-z 0-9 _ -`, a length that can actually encode bytes, `=` only as
+  trailing padding and only in the amount that length requires, and no bits in
+  the final character that a decoder would discard. Padding is normalised
+  before any id is compared, because `TQ` and `TQ==` are one value to a decoder
+  and comparing spellings would check one id while pass-cli executed another.
+  Every id a real vault returns is 86 base64url characters plus `==`. Earlier
+  versions of this provider documented base64url while accepting impossible
+  lengths and padding; the code now means what this paragraph says. The address sent
+  to pass-cli and the address checked for liveness have to be the same string,
+  and `%2F` is one character to a CLI that decodes it and five to a check that
+  does not. Vault scope itself is enforced by pass-cli: `--vault-name=` is
+  passed on every call. The binding below is a different, weaker thing and is
+  worth stating precisely — the expected ids come from the item LISTING, so
+  comparing them against the item view proves that two responses agree, not
+  that either describes an item in your configured vault. It catches a confused
+  CLI, not a hostile one. A lookup is bound to the id, the share, the vault and
+  the title it resolved
+  to, and the response must agree with all three. The title matters because
+  resolution reads the listing and then views the item by id: rename the item
+  between those two calls and the id still resolves, so without the check the
+  secret would come back under a title that no longer names it.
 
-  **A title must identify exactly one live item.** `put()` creates a NEW item
-  on every call rather than updating in place, so real vaults accumulate items
-  sharing a title. `pass-cli --item-title` silently picks one of them. A
-  lookup that matches more than one active item is now refused by name, and a
-  successful lookup is re-addressed by item ID so the value returned is the
-  one that was chosen deliberately. Use a `pass://` URI to name a specific
-  item when duplicates are intentional.
+  **Deleted means deleted, WHEN `state` is present.** Proton Pass moves an item
+  to the trash rather than purging it. This provider reads `state` from both
+  the listing and the item body: a row it reports as `Trashed` is not listed
+  and not resolvable, so deleting a secret stops it being handed out.
+  Previously it did not — the item stayed visible as an available key and
+  `--item-title` would resolve to it. The qualifier is real and is the
+  operator-decision below: a row with NO `state` field is treated as live,
+  because older pass-cli builds omit it and hiding every secret from them would
+  be worse. Against such a build, deletion is not a reliable revocation
+  signal.
+
+  **A title must identify exactly one live item, addressed by id.** Real vaults
+  accumulate items sharing a title, and `pass-cli --item-title` silently picks
+  one of them. A lookup that matches more than one active item is refused
+  by name; a lookup that matches one is re-addressed by that item's id.
+  `--item-title` is never sent. If the item list gives no id for the matching
+  row, the lookup FAILS rather than falling back to title selection. When a
+  title matches more than one live item, remove the duplicates: with URI
+  addressing gone there is no way to name one of several same-titled items,
+  and guessing is exactly what this refusal exists to prevent.
+
+  Titles are compared TWICE, and deliberately not the same way both times.
+  Ambiguity is judged on a folded form — NFC-normalised, variation selectors
+  in both the BMP and supplementary ranges removed, trimmed — so that two items
+  which RENDER identically collide and refuse instead of each matching one
+  request and returning a confidently wrong secret. Selection is then exact:
+  the single surviving item must carry byte-for-byte the title you asked for.
+  A title that merely renders the same as the stored one is refused with a
+  message saying so, because folding is there to catch collisions, not to
+  guess which item you meant. Copy titles from `list()`.
+
+  **Responses are read at named locations only.** The value returned by `get()`
+  comes from exactly three places in `item view --output json`, and nowhere
+  else: a value slot inside the typed block at `content.content` — a tagged
+  union keyed by item type, `{"Login":{…}}`, `{"Note":{…}}` and so on, from
+  which only `password`, `username`, `email`, `totp_uri` and `note` are
+  readable by name — the item's own `content.note`, which is where a note
+  lives when the key asks for one — or a custom field in
+  `content.extra_fields`, looked up by its name. The earlier wording said two
+  and named the third in passing. The item
+  is NOT searched for a key matching whatever field you asked for, which is how
+  an arbitrary string in a response (a share id, an error message) could
+  previously be retrieved as a secret just by naming it. A block naming two
+  item types at once is refused rather than chosen between, and a slot holding
+  an empty string counts as absent: pass-cli writes `""` for a field that was
+  never filled in, and returning that would hand back an empty credential and
+  call it success. Inside a field's `content`, only the `Hidden`,
+  `Text` and `Totp` wrappers hold a value; an unrecognised wrapper is refused
+  rather than skimmed for the first string in it, which used to return the
+  field's LABEL as the secret. The item body is parsed against an explicit key
+  list with no catchall, so a response this provider cannot fully account for —
+  an error envelope, a diagnostics blob, an unrecognised key — is refused
+  rather
+  than read. So is an ambiguous one: two documented locations offering
+  different values for the same field, a field named twice, or two populated
+  content wrappers all fail the lookup instead of resolving by precedence. This
+  is fail-closed by design; a pass-cli that grows a new response key will need
+  this provider updated rather than quietly handing back a guess. Item listings
+  are held to the same rule and not a weaker one: NO key beyond the set a real
+  `item list` emits — `id`, `share_id`, `vault_id`, `state`, `flags`,
+  `create_time`, `modify_time`, `title` and `item_type`, plus `name` as a
+  tolerated alias for `title` — and the wrapped form carries `items` and
+  nothing else. Of those, `id`, `share_id`, `vault_id`, `title`, `item_type`
+  and `state` are READ and compared; the rest are recognised so a real response
+  parses and are never used as a value.
+
+  Every one of them is OPTIONAL, and that is a real limit rather than an
+  oversight. A row that omits `share_id` is accepted, and the share binding
+  then has nothing to compare against — identity is verified WHEN PRESENT,
+  because older pass-cli builds emit less than 2.3.2 does and refusing them
+  outright would hide every secret rather than the wrong one. What is never
+  accepted is a key nobody recognises, a value of the wrong type, or a `state`
+  that is present and is not exactly `Active` or `Trashed`. A response can
+  therefore be thin, but it cannot be surprising. An unrecognised state is REFUSED rather than filed under trashed —
+  quietly dropping such a row shortens the inventory, and a short inventory is
+  how the duplicate-title refusal below stops seeing the duplicate and hands
+  back one of several items without saying which. Every non-blank row must
+  parse, an unrecognised shape is an error, and empty output is an error rather
+  than "this vault has no secrets".
+
+  **Where the strictness stops, precisely.** The OUTER shapes are closed: the
+  response envelope, the item body, `content`, each listing row and each custom
+  field entry list their keys exactly and refuse any other. Two places are
+  deliberately OPEN records, and saying "unknown keys are refused" without
+  naming them would overstate the guarantee. `content.content` is a union
+  keyed by item type — `Login`, `Note`, `CreditCard` and whatever Proton adds
+  next — so enumerating it would refuse a whole item type the day one appears;
+  it is held to naming exactly ONE type instead, and that type must agree with
+  the row's `item_type`. A custom field's `content` wrapper is open for the
+  same reason, and only the documented `Hidden`, `Text` and `Totp` wrappers are
+  ever read from it. In both cases the keys are unconstrained; what is read
+  from them is not.
+
+  Two arrays are accepted with their ELEMENTS unexamined, for the same reason
+  and with the same limit: `flags` on a listing row or an item body, and
+  `attachments` on the response envelope. Both must be arrays — a string or an
+  object where an array belongs is refused — but what is inside them is not
+  inspected, because nothing here reads either one. They are recognised so a
+  real response parses. If a future pass-cli puts something meaningful in them,
+  this provider passes it over rather than refusing it, which is the one place
+  the fail-closed rule bends to keep real responses working.
+
+  A response must also be ABOUT the item that was requested. `item view` is
+  invoked by id, and when the body carries an id it must be that id; when it
+  carries a state it must not be a trashed one. A field that is PRESENT but of
+  the wrong type — a numeric id, an object state — is refused rather than
+  treated as absent: absence is tolerated because older builds genuinely omit
+  these fields, and letting a wrong-typed value read as absent would make the
+  one shape a confused response actually takes the one shape that skips the
+  check. Liveness read from the listing
+  and liveness claimed by the response are two separate claims, and a cache or
+  a race can make them disagree. Responses are decoded with strict UTF-8 —
+  invalid bytes are refused rather than silently rewritten to U+FFFD, which
+  could repair a malformed response into well-formed JSON and alter a title,
+  an id, or the secret itself on the way in. And an object that names the same
+  key twice is refused: `JSON.parse` keeps the last and discards the first
+  before any check can run, so `{"state":"Trashed","state":"Active"}` would
+  otherwise reach the liveness test as unambiguously live.
+
+  **pass-cli gets a named environment and a named path.** The CLI is spawned
+  with a cleared environment and only these variables: `PATH`, `HOME`, `USER`,
+  `LOGNAME`, `TMPDIR`, `LANG`, `LC_ALL`, `LC_CTYPE`, `XDG_CONFIG_HOME`,
+  `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` — enough for
+  PATH lookup, the macOS login Keychain, and a Linux secret store. It does not
+  inherit swamp's environment, which is shared with every other extension in
+  the run and can hold unrelated API tokens and proxy or TLS overrides.
+  `SSH_AUTH_SOCK` is deliberately excluded. The VALUES are checked too, not
+  just the names: the directory-valued variables must be absolute paths and
+  `DBUS_SESSION_BUS_ADDRESS` must name `unix:` sockets and nothing else — a
+  D-Bus address is a semicolon-separated LIST and a client may use any element
+  of it, so every element is checked, not just the first. That variable selects
+  a transport and accepts `tcp:host=…`, which would point the secret store
+  somewhere else entirely with no TLS involved. `PATH` is filtered to its
+  absolute entries before the child sees it, so a `.` or empty component cannot
+  select a helper from the working directory. A value failing
+  its rule is dropped rather than corrected, so the child sees the variable
+  unset — a state it already has to handle. If pass-cli needs a variable not on
+  this list on your host, it will not see it. `binary` must be either the bare
+  name `pass-cli` or an ABSOLUTE path: a relative path like `./pass-cli` is
+  refused, because it would resolve against whatever directory the swamp
+  process happens to be in.
 
   **What this provider does not promise.** An item whose `state` field is
   absent is treated as live, because older pass-cli builds omit it and hiding
   every secret from them would be worse than the bug that reading `state`
-  fixes. A `pass://` URI naming an item this vault does not list is passed
-  through untouched, since it may address a different vault. And every call is
-  a live lookup with a bounded timeout: nothing is cached, so a Proton outage
-  is a failure rather than a stale success.
+  fixes. The pass-cli
+  executable itself is trusted on identity: whichever binary answers
+  `--version` first — the first `pass-cli` on an absolute PATH entry, one of
+  the Homebrew prefixes, or whatever absolute path `binary` names, which is
+  taken on trust without a probe — receives your item titles, vault
+  name, and nothing verifies its ownership, signature or
+  digest. Titles that differ only by CONFUSABLE characters across scripts — a
+  Cyrillic `А` in `EXAMPLE-А-KEY` against a Latin `A` — are not detected as
+  duplicates: catching those needs Unicode's confusables table, which is large,
+  versioned, and not something this provider vendors. Composition, trailing
+  whitespace and variation selectors ARE caught; cross-script lookalikes are
+  not. Pinning a digest would break on every CLI release, so the lever is
+  yours: set `binary` to an absolute path in a directory you control if PATH is
+  not trustworthy on that host. And every call is a live lookup with a bounded
+  timeout: nothing is cached, so a Proton outage is a failure rather than a
+  stale success. `timeoutSec` bounds the WHOLE call, locating the executable
+  included, and a wedged candidate used to burn its own five-second probe
+  timeout after the deadline you set had already passed.
+
+  **How the executable is chosen, exactly.** An ABSOLUTE `binary` path is used
+  as given and is NOT probed — you named a specific file, and this provider
+  runs that file. A bare name must be `pass-cli`; anything else is refused
+  rather than resolved. Resolving the bare name walks the absolute entries of
+  `PATH` in order, probing each with `--version`, and then the standard install
+  prefixes. The candidate count therefore depends on the length of your `PATH`
+  and is not fixed. Relative `PATH` entries are skipped: what resolution
+  returns is always an absolute path, so that the file which answered the probe
+  is the file that later receives your item titles.

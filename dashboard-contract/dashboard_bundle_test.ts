@@ -7,6 +7,7 @@ import {
   DASHBOARD_BUNDLE_VERSION,
   DashboardBundleV1Schema,
   deriveOverallState,
+  EvidenceReferenceSchema,
   parseDashboardBundle,
   UnsupportedBundleVersionError,
 } from "./dashboard_bundle.ts";
@@ -232,4 +233,25 @@ Deno.test("freshness and completeness evidence can never derive healthy", () => 
     reason: "missing record",
   };
   assertEquals(deriveOverallState([input] as never), "partial");
+});
+
+Deno.test("evidence references reject credential-bearing HTTPS authorities", () => {
+  const reference = (url: string) => ({ kind: "url", label: "evidence", url });
+  assertEquals(
+    EvidenceReferenceSchema.safeParse(reference("https://example.com/report"))
+      .success,
+    true,
+  );
+  for (
+    const url of [
+      "https://user:pass@example.com/report",
+      "https://user@example.com/report",
+      "http://example.com/report",
+    ]
+  ) {
+    assertEquals(
+      EvidenceReferenceSchema.safeParse(reference(url)).success,
+      false,
+    );
+  }
 });

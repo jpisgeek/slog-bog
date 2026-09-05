@@ -1,3 +1,15 @@
+publicationNote: >-
+  for the repository's security review requirements. This version is shared as
+  GitHub source and is not published to the Swamp registry.
+install: |
+  Clone this GitHub repository and register this extension's source in your Swamp repo.
+  Replace the example path with the canonical location of your clone:
+
+  ```sh
+  swamp extension source add /example/slog-bog/subscription-metadata --only models,reports
+  ```
+
+  This repaired version is distributed through GitHub source, not a registry release.
 package: "@jpisgeek/subscription-metadata"
 purpose: >-
   Persists explicit operator-supplied plan name, billing cadence, recurring
@@ -26,16 +38,34 @@ caveats: >-
   priceMinor is the recurring plan price in currency minor units and never API
   usage cost. Limits whose name, unit, or period declares remaining quota,
   availability, or per-token price are rejected, and that check folds
-  zero-width characters and homoglyphs first. Currency uses three uppercase
-  letters; price and currency must be supplied together; priceMinor carries at
-  most fifteen integer digits and four decimals, so it survives the report's
-  numeric conversion without loss; renewal timestamps use ISO datetime values;
-  limit units use lowercase letters, digits, dot, underscore, or hyphen. This
-  package performs no account-dashboard scraping.
+  zero-width characters and homoglyphs first. Declared limits must be distinct
+  in name, unit, and period: the dashboard metric id is derived from that
+  identity rather than from array position, so it stays attached to the same
+  limit when the list is reordered, and two limits that share an identity are
+  rejected. Currency uses three uppercase letters; price and currency must be
+  supplied together; priceMinor carries at most fifteen integer digits and four
+  decimals and is rejected unless the exact value survives the report's
+  numeric conversion, so a published price is always the declared one; renewal
+  timestamps use ISO datetime values; limit units use lowercase letters,
+  digits, dot, underscore, or hyphen. This package performs no
+  account-dashboard scraping.
 security: >-
   This package performs no network, process, environment, or vault operations.
-  Plan, price, renewal, and seat metadata can be commercially sensitive, so
-  protect stored Swamp data and rendered dashboards accordingly. Do not put
-  credentials, private account URLs, or bearer query parameters in
-  sourceReference. References must use HTTPS and cannot contain credentials,
-  query parameters, or fragments.
+  Provider, plan, price, currency, renewal window, seats, declared limits, and
+  the source reference are commercially sensitive, so the dashboard bundle, its
+  section, and every fact, metric, and reference carrying one of them are
+  classified `sensitive` rather than `operational`, and the bundle enumerates
+  each of those fields; a publication-aware renderer should treat the whole
+  section as unpublishable. The Swamp model id is withheld from the bundle, and
+  the model name it does carry is operator-chosen private identity. The bundle
+  id is a hash of the Swamp model id, so it is distinct per model instance
+  without carrying that id. Protect stored Swamp data and rendered dashboards
+  accordingly. A source reference cannot carry a credential in any part of the
+  URL: besides requiring HTTPS and rejecting credentials, query parameters, and
+  fragments, it must be one of the public vendor origins listed in the source
+  (`https://www.anthropic.com`, `https://openai.com`, `https://proton.me`,
+  `https://github.com`) with one of the paths `/`, `/pricing`, or `/plans`, and
+  both source-reference arguments are marked sensitive. Resource tags carry only
+  the constant `provenance` marker; no subscription value is tagged. The
+  rendered Markdown carries no subscription value at all, because it cannot
+  carry the sensitivity classification the JSON bundle does.

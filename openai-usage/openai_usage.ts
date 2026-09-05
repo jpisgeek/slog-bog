@@ -40,6 +40,8 @@ const UsageBreakdownSchema = z.object({
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
+  inputAudioTokens: z.number().int().nonnegative(),
+  outputAudioTokens: z.number().int().nonnegative(),
   requests: z.number().int().nonnegative(),
 });
 
@@ -61,6 +63,8 @@ const SnapshotSchema = z.object({
     inputTokens: z.number().int().nonnegative(),
     outputTokens: z.number().int().nonnegative(),
     cachedInputTokens: z.number().int().nonnegative(),
+    inputAudioTokens: z.number().int().nonnegative(),
+    outputAudioTokens: z.number().int().nonnegative(),
     requests: z.number().int().nonnegative(),
     breakdowns: z.array(UsageBreakdownSchema),
   }).nullable(),
@@ -87,14 +91,19 @@ interface ModelContext {
     data: z.infer<typeof SnapshotSchema>,
     options?: { tags?: Record<string, string> },
   ): Promise<unknown>;
-}
-
-export type Fetcher = typeof fetch;
-let fetcher: Fetcher = fetch;
-
-/** Test seam; production uses the platform fetch implementation. */
-export function setFetcherForTest(value?: Fetcher): void {
-  fetcher = value ?? fetch;
+  /**
+   * Transport override, supplied per call by the caller that already holds the
+   * credential. Absent in production, where the platform `fetch` is used.
+   *
+   * This replaced an exported `setFetcherForTest` that mutated module-level
+   * state. That seam shipped in the published package, so ANY importer could
+   * install a transport and receive the live Authorization header of a
+   * legitimate collection running in the same process -- defeating the fixed
+   * host, HTTPS and no-redirect guarantees this file otherwise makes. Injection
+   * per call cannot do that: a caller can only route its own request, using a
+   * key it already supplied in globalArgs.
+   */
+  fetch?: typeof fetch;
 }
 
 function classifyStatus(status: number): DimensionStatus["errorKind"] {
@@ -116,69 +125,236 @@ function safeMessage(kind: DimensionStatus["errorKind"]): string {
   return messages[kind];
 }
 
-interface PageResult {
-  pages: Record<string, unknown>[];
+/**
+ * Endpoint-specific result rows, validated at the boundary where the bytes
+ * arrive rather than field by field further in.
+ *
+ * These used to be `z.record(z.string(), z.unknown())` inside a passthrough
+ * bucket: every row was an arbitrary bag, the `object` discriminator that says
+ * which shape a row even claims to be went unchecked, and any field OpenAI
+ * sent survived into the code that aggregates. Nothing downstream could tell a
+ * completions result from a costs result, or from an unrelated object that
+ * happened to carry an `input_tokens` key.
+ *
+ * `strictObject` is the point of the fix, not an accident of it: a row is
+ * accepted only if every one of its keys is a field this version models and
+ * has validated. An unmodelled key is an unvalidated key, so the row does not
+ * parse and the dimension degrades — the same treatment every other
+ * off-contract payload in this file gets, and never a silent partial total.
+ *
+ * The optional fields below are optional because OpenAI's contract makes them
+ * so; requiring them would black out a legitimate response. `.optional()` and
+ * `.nullable()` are deliberately not interchangeable here. An absent key is
+ * the contract's own "no value". An explicit null is a value OpenAI chose to
+ * send, so it is accepted only on the group-by identifiers OpenAI genuinely
+ * nulls out on an ungrouped row — the same dimensions SnapshotSchema declares
+ * nullable — and rejected on every counter, which the contract types as a
+ * plain integer.
+ *
+ * `.int()` also draws the upper bound: it rejects 1e21, which Number.isInteger
+ * would have accepted, so an absurd token count is refused here instead of
+ * reaching SnapshotSchema.parse at the end of collect() and throwing a ZodError
+ * out of the method — which used to discard the other, healthy dimension too.
+ */
+const UsageResultSchema = z.strictObject({
+  object: z.literal("organization.usage.completions.result"),
+  input_tokens: z.number().int().nonnegative(),
+  output_tokens: z.number().int().nonnegative(),
+  num_model_requests: z.number().int().nonnegative(),
+  input_cached_tokens: z.number().int().nonnegative().optional(),
+  input_audio_tokens: z.number().int().nonnegative().optional(),
+  output_audio_tokens: z.number().int().nonnegative().optional(),
+  project_id: z.string().nullable().optional(),
+  user_id: z.string().nullable().optional(),
+  api_key_id: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  batch: z.boolean().nullable().optional(),
+  service_tier: z.string().nullable().optional(),
+});
+
+/**
+ * CostsResult requires only `object`. The `amount` wrapper and both fields
+ * inside it are optional, and a row can legally carry no attributable amount
+ * at all — costsFrom() drops and counts those rather than inventing a zero.
+ *
+ * The value bounds live here now, at the boundary, so a negative or non-finite
+ * amount is refused before anything sums it. `currency` is pinned to the
+ * lowercase ISO-4217 form SnapshotSchema stores, so a row cannot introduce a
+ * currency key the snapshot schema would later reject and turn into a throw.
+ */
+const CostResultSchema = z.strictObject({
+  object: z.literal("organization.costs.result"),
+  amount: z.strictObject({
+    value: z.number().nonnegative().finite().optional(),
+    currency: z.string().regex(/^[a-z]{3}$/).optional(),
+  }).optional(),
+  line_item: z.string().nullable().optional(),
+  project_id: z.string().nullable().optional(),
+  organization_id: z.string().nullable().optional(),
+});
+
+type UsageResult = z.infer<typeof UsageResultSchema>;
+type CostResult = z.infer<typeof CostResultSchema>;
+
+/**
+ * The page envelope around one endpoint's rows, built per endpoint so a costs
+ * row can never be counted as usage or the reverse.
+ *
+ * Pagination used to be read as `object.has_more === true`, which collapsed
+ * "the flag says false", "the flag is missing" and "the flag is the string
+ * 'true'" into the single answer that both ends pagination and marks the
+ * dimension complete. A truncated or off-contract response therefore became an
+ * authoritative-looking total: a healthy usage figure missing every page after
+ * the first. `has_more` must now be an actual boolean, so a page that cannot
+ * state its own completeness invalidates the dimension instead of quietly
+ * finishing it. `next_page` stays optional because OpenAI omits it on the last
+ * page; when `has_more` is true the caller still demands a usable cursor.
+ */
+function pageSchema<T extends z.ZodTypeAny>(result: T) {
+  return z.strictObject({
+    object: z.literal("page"),
+    has_more: z.boolean(),
+    next_page: z.string().min(1).nullable().optional(),
+    data: z.array(z.strictObject({
+      object: z.literal("bucket"),
+      start_time: z.number().int(),
+      end_time: z.number().int(),
+      results: z.array(result),
+    })),
+  });
+}
+
+const UsagePageSchema = pageSchema(UsageResultSchema);
+const CostPageSchema = pageSchema(CostResultSchema);
+
+/**
+ * What a dimension actually got: rows that have already been parsed against
+ * their endpoint's schema, and how many pages they came from.
+ *
+ * This used to hand back the raw page objects for a second, untyped pass to
+ * pick apart later. Nothing downstream can now reach an unvalidated field,
+ * because no unvalidated field is carried out of this function.
+ */
+interface PageResult<T> {
+  rows: T[];
+  pagesRead: number;
   status: DimensionStatus;
 }
 
-async function readPages(
+async function readPages<T>(
   g: GlobalArgs,
   path: string,
   params: URLSearchParams,
+  pageSchemaForPath: z.ZodType<{
+    has_more: boolean;
+    next_page?: string | null;
+    data: { results: T[] }[];
+  }>,
   callerSignal: AbortSignal,
-): Promise<PageResult> {
-  const pages: Record<string, unknown>[] = [];
+  doFetch: typeof fetch,
+): Promise<PageResult<T>> {
+  const rows: T[] = [];
+  let pagesRead = 0;
   let page: string | null = null;
   const cursors = new Set<string>();
+  const startedAt = Date.now();
+  const maxPages = 500;
+  const maxElapsedMs = 300_000;
   while (true) {
+    callerSignal.throwIfAborted();
+    const remaining = maxElapsedMs - (Date.now() - startedAt);
+    if (pagesRead >= maxPages || remaining <= 0) {
+      return {
+        rows,
+        pagesRead,
+        status: {
+          state: pagesRead ? "partial" : "unavailable",
+          pagesRead,
+          errorKind: remaining <= 0 ? "timeout" : "invalid-response",
+          message: remaining <= 0
+            ? safeMessage("timeout")
+            : "OpenAI pagination exceeded the 500-page observation limit",
+        },
+      };
+    }
     const query = new URLSearchParams(params);
     if (page) query.set("page", page);
-    const timeout = AbortSignal.timeout(g.timeoutMs);
+    const timeout = AbortSignal.timeout(Math.min(g.timeoutMs, remaining));
     const signal = AbortSignal.any([callerSignal, timeout]);
     try {
-      const response = await fetcher(`https://api.openai.com${path}?${query}`, {
+      const response = await doFetch(`https://api.openai.com${path}?${query}`, {
         headers: { Authorization: `Bearer ${g.apiKey}` },
+        // fetch defaults to redirect: "follow", which would re-send the
+        // request to a destination outside the configured HTTPS origin. The README promises requests stay on the official
+        // HTTPS origin; only this setting makes that true. "manual" rather
+        // than "error" because "error" collapses a redirect into the same
+        // untyped TypeError a DNS failure throws, and an attempt to walk the
+        // credential off-origin must not be recorded as "unreachable".
+        redirect: "manual",
         signal,
       });
+      // A 3xx is a refusal, not a response. Runtimes disagree on what a manual
+      // redirect looks like — some return the real 3xx status, some an opaque
+      // filtered response whose status reads 0 — so both shapes are checked.
+      // The Location header is attacker-influenced text and never reaches the
+      // status message; only our own literals do.
+      if (
+        response.type === "opaqueredirect" ||
+        (response.status >= 300 && response.status < 400)
+      ) {
+        return {
+          rows,
+          pagesRead,
+          status: {
+            state: pagesRead ? "partial" : "unavailable",
+            pagesRead,
+            errorKind: "http-error",
+            message:
+              "OpenAI returned a redirect; the redirect was not followed",
+          },
+        };
+      }
       if (!response.ok) {
         const kind = classifyStatus(response.status);
         return {
-          pages,
+          rows,
+          pagesRead,
           status: {
-            state: pages.length ? "partial" : "unavailable",
-            pagesRead: pages.length,
+            state: pagesRead ? "partial" : "unavailable",
+            pagesRead,
             errorKind: kind,
             message: safeMessage(kind),
           },
         };
       }
       const body: unknown = await response.json();
-      if (
-        !body || typeof body !== "object" ||
-        !Array.isArray((body as Record<string, unknown>).data)
-      ) {
+      // The one place a response turns into values. A page that does not parse
+      // in full contributes nothing: its rows are never appended, so a
+      // half-understood page cannot leave a partial total behind that looks
+      // like a whole one.
+      const envelope = pageSchemaForPath.safeParse(body);
+      if (!envelope.success) {
         return {
-          pages,
+          rows,
+          pagesRead,
           status: {
-            state: pages.length ? "partial" : "unavailable",
-            pagesRead: pages.length,
+            state: pagesRead ? "partial" : "unavailable",
+            pagesRead,
             errorKind: "invalid-response",
             message: safeMessage("invalid-response"),
           },
         };
       }
-      const object = body as Record<string, unknown>;
-      pages.push(object);
-      const hasMore = object.has_more === true;
-      const next = typeof object.next_page === "string"
-        ? object.next_page
-        : null;
-      if (!hasMore) {
+      pagesRead++;
+      for (const bucket of envelope.data.data) rows.push(...bucket.results);
+      const next = envelope.data.next_page ?? null;
+      if (!envelope.data.has_more) {
         return {
-          pages,
+          rows,
+          pagesRead,
           status: {
             state: "complete",
-            pagesRead: pages.length,
+            pagesRead,
             errorKind: "",
             message: "",
           },
@@ -186,10 +362,11 @@ async function readPages(
       }
       if (!next || cursors.has(next)) {
         return {
-          pages,
+          rows,
+          pagesRead,
           status: {
             state: "partial",
-            pagesRead: pages.length,
+            pagesRead,
             errorKind: "invalid-response",
             message: safeMessage("invalid-response"),
           },
@@ -205,10 +382,11 @@ async function readPages(
         ? "invalid-response"
         : "unreachable";
       return {
-        pages,
+        rows,
+        pagesRead,
         status: {
-          state: pages.length ? "partial" : "unavailable",
-          pagesRead: pages.length,
+          state: pagesRead ? "partial" : "unavailable",
+          pagesRead,
           errorKind: kind,
           message: safeMessage(kind),
         },
@@ -217,80 +395,46 @@ async function readPages(
   }
 }
 
-function records(
-  pages: Record<string, unknown>[],
-): Record<string, unknown>[] | null {
-  const output: Record<string, unknown>[] = [];
-  for (const page of pages) {
-    if (!Array.isArray(page.data)) return null;
-    for (const bucket of page.data) {
-      if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) {
-        return null;
-      }
-      const results = (bucket as Record<string, unknown>).results;
-      if (!Array.isArray(results)) return null;
-      for (const result of results) {
-        if (!result || typeof result !== "object" || Array.isArray(result)) {
-          return null;
-        }
-        output.push(result as Record<string, unknown>);
-      }
-    }
-  }
-  return output;
-}
-
 /**
- * Only accepts values SnapshotSchema will also accept. Number.isInteger() is
- * not a tight enough guard: it says yes to 1e21, which zod's .int() rejects
- * because it sits above MAX_SAFE_INTEGER. While the two disagreed, an absurd
- * token count passed this check, reached SnapshotSchema.parse at the end of
- * collect(), and threw a ZodError out of the method instead of degrading the
- * dimension the way every other malformed-input path in this file does.
+ * Rows arrive already validated against UsageResultSchema, so this only
+ * renames fields into the snapshot's own vocabulary. Nothing here inspects an
+ * unvalidated value, because none reaches it.
+ *
+ * `input_cached_tokens` reads as zero when absent: OpenAI's contract marks it
+ * optional and simply omits it when no caching applied, and requiring it once
+ * blacked out the whole usage dimension for a response the published contract
+ * explicitly permits. The schema is what refuses a cached counter that is
+ * present but null or wrongly typed, so the `?? 0` here can only ever stand in
+ * for a key OpenAI legitimately left out — never for a value it got wrong.
+ *
+ * The identifiers keep their null. OpenAI sends project_id or model as null on
+ * a row it did not group that way; that null is real data, which is why
+ * SnapshotSchema declares those fields nullable and the counters not. A
+ * wrongly typed identifier can no longer reach this point and be flattened
+ * into the same null, which used to make a garbage row indistinguishable from
+ * a legitimately ungrouped one.
  */
-function nonnegativeInteger(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-    ? value
-    : null;
-}
-
-/**
- * Reads a counter OpenAI's contract marks optional. UsageCompletionsResult
- * requires only object, input_tokens, output_tokens and num_model_requests;
- * input_cached_tokens is simply absent when no caching applied. Requiring it
- * blacked out the entire usage dimension — usage written as null, the status
- * overwritten to invalid-response — for a response the published contract
- * explicitly permits, so an absent counter now reads as the zero it means. A
- * counter that is present but wrongly typed is still a protocol violation and
- * still invalidates the dimension.
- */
-function optionalCounter(value: unknown): number | null {
-  if (value === undefined || value === null) return 0;
-  return nonnegativeInteger(value);
-}
-
-function usageFrom(pages: Record<string, unknown>[]): UsageBreakdown[] | null {
-  const output: UsageBreakdown[] = [];
-  const items = records(pages);
-  if (!items) return null;
-  for (const item of items) {
-    const input = nonnegativeInteger(item.input_tokens);
-    const outputTokens = nonnegativeInteger(item.output_tokens);
-    const cached = optionalCounter(item.input_cached_tokens);
-    const requests = nonnegativeInteger(item.num_model_requests);
-    if ([input, outputTokens, cached, requests].some((v) => v === null)) {
-      return null;
-    }
-    output.push({
-      projectId: typeof item.project_id === "string" ? item.project_id : null,
-      model: typeof item.model === "string" ? item.model : null,
-      inputTokens: input!,
-      outputTokens: outputTokens!,
-      cachedInputTokens: cached!,
-      requests: requests!,
-    });
-  }
-  return output;
+function usageFrom(rows: UsageResult[]): UsageBreakdown[] {
+  return rows.map((row) => ({
+    projectId: row.project_id ?? null,
+    model: row.model ?? null,
+    inputTokens: row.input_tokens,
+    outputTokens: row.output_tokens,
+    cachedInputTokens: row.input_cached_tokens ?? 0,
+    // OpenAI counts audio separately from text: `input_tokens` and
+    // `output_tokens` are the text counters, and audio tokens are reported
+    // only in these two fields. They used to be accepted by the row schema and
+    // then dropped here, so an audio-bearing response produced a snapshot that
+    // called itself complete while its token totals silently omitted every
+    // audio token the organization was billed for. They are carried through and
+    // aggregated like any other counter; absent reads as zero for the same
+    // reason `input_cached_tokens` does — the contract omits the key when the
+    // modality did not apply, and the schema is what refuses a present-but-
+    // wrong value.
+    inputAudioTokens: row.input_audio_tokens ?? 0,
+    outputAudioTokens: row.output_audio_tokens ?? 0,
+    requests: row.num_model_requests,
+  }));
 }
 
 interface CostRows {
@@ -301,50 +445,36 @@ interface CostRows {
 
 /**
  * OpenAI's CostsResult contract requires only `object`. The `amount` wrapper,
- * and `value` and `currency` inside it, are all optional. This used to return
- * null — blacking out the whole cost dimension, costs written as null — the
- * moment a single row on a single page omitted any one of them.
+ * and `value` and `currency` inside it, are all optional. This used to blank
+ * the whole cost dimension the moment a single row on a single page omitted
+ * any one of them.
  *
- * Absence is now tolerated, garbage is not. A row with no amount carries no
- * spend attributable to a currency, so it is dropped and counted, and collect()
- * downgrades the dimension to partial so the drop stays visible instead of
- * quietly lowering the total. A field that is present but wrongly typed,
- * negative, non-finite, or not a lowercase ISO-4217 code is a real protocol
- * violation and still invalidates the dimension.
+ * A row with no amount carries no spend attributable to a currency, so it is
+ * dropped and counted, and collect() downgrades the dimension to partial — the
+ * drop stays visible instead of quietly lowering the total. That tolerance is
+ * for absence only: a present-but-wrong amount, an explicit null, a negative
+ * or non-finite value, or a currency that is not a lowercase ISO-4217 code is
+ * refused by CostResultSchema at the response boundary and never arrives here
+ * to be mistaken for an honest omission.
  */
-function costsFrom(pages: Record<string, unknown>[]): CostRows | null {
-  const rows: CostBreakdown[] = [];
+function costsFrom(rows: CostResult[]): CostRows {
+  const output: CostBreakdown[] = [];
   let dropped = 0;
-  const items = records(pages);
-  if (!items) return null;
-  for (const item of items) {
-    const amount = item.amount;
-    if (amount === undefined || amount === null) {
+  for (const row of rows) {
+    const value = row.amount?.value;
+    const currency = row.amount?.currency;
+    if (value === undefined || currency === undefined) {
       dropped++;
       continue;
     }
-    if (typeof amount !== "object" || Array.isArray(amount)) return null;
-    const value = (amount as Record<string, unknown>).value;
-    const currency = (amount as Record<string, unknown>).currency;
-    if (
-      value === undefined || value === null ||
-      currency === undefined || currency === null
-    ) {
-      dropped++;
-      continue;
-    }
-    if (
-      typeof value !== "number" || !Number.isFinite(value) || value < 0 ||
-      typeof currency !== "string" || !/^[a-z]{3}$/.test(currency)
-    ) return null;
-    rows.push({
-      projectId: typeof item.project_id === "string" ? item.project_id : null,
-      lineItem: typeof item.line_item === "string" ? item.line_item : null,
+    output.push({
+      projectId: row.project_id ?? null,
+      lineItem: row.line_item ?? null,
       value,
       currency,
     });
   }
-  return { rows, dropped };
+  return { rows: output, dropped };
 }
 
 async function collect(
@@ -352,6 +482,9 @@ async function collect(
   ctx: ModelContext,
 ) {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  // Bound once here so both dimensions share one transport, and so production
+  // -- which never sets ctx.fetch -- always lands on the platform fetch.
+  const doFetch = ctx.fetch ?? globalThis.fetch;
   const parsed = CollectArgsSchema.parse(args);
   const endTime = parsed.endTime ?? Math.floor(Date.now() / 1000);
   if (endTime <= parsed.startTime) {
@@ -378,13 +511,30 @@ async function collect(
   const costParams = new URLSearchParams(common);
   costParams.append("group_by", "project_id");
   costParams.append("group_by", "line_item");
+  // Each dimension is read against its own page schema, so a costs row can
+  // never be summed as usage or the reverse even if OpenAI answered one path
+  // with the other's body.
   const [usageResult, costResult] = await Promise.all([
-    readPages(g, "/v1/organization/usage/completions", usageParams, ctx.signal),
-    readPages(g, "/v1/organization/costs", costParams, ctx.signal),
+    readPages(
+      g,
+      "/v1/organization/usage/completions",
+      usageParams,
+      UsagePageSchema,
+      ctx.signal,
+      doFetch,
+    ),
+    readPages(
+      g,
+      "/v1/organization/costs",
+      costParams,
+      CostPageSchema,
+      ctx.signal,
+      doFetch,
+    ),
   ]);
-  let usageRows = usageFrom(usageResult.pages);
-  const costData = costsFrom(costResult.pages);
-  let costRows = costData?.rows ?? null;
+  let usageRows: UsageBreakdown[] | null = usageFrom(usageResult.rows);
+  const costData = costsFrom(costResult.rows);
+  let costRows: CostBreakdown[] | null = costData.rows;
 
   // Row-level guards do not survive addition. A page of individually legal rows
   // can sum past MAX_SAFE_INTEGER (tokens, rejected by the schema's .int()) or
@@ -397,6 +547,8 @@ async function collect(
     inputTokens: number;
     outputTokens: number;
     cachedInputTokens: number;
+    inputAudioTokens: number;
+    outputAudioTokens: number;
     requests: number;
   } | null = null;
   if (usageRows !== null) {
@@ -404,6 +556,8 @@ async function collect(
       inputTokens: usageRows.reduce((n, r) => n + r.inputTokens, 0),
       outputTokens: usageRows.reduce((n, r) => n + r.outputTokens, 0),
       cachedInputTokens: usageRows.reduce((n, r) => n + r.cachedInputTokens, 0),
+      inputAudioTokens: usageRows.reduce((n, r) => n + r.inputAudioTokens, 0),
+      outputAudioTokens: usageRows.reduce((n, r) => n + r.outputAudioTokens, 0),
       requests: usageRows.reduce((n, r) => n + r.requests, 0),
     };
     if (!Object.values(usageTotals).every(Number.isSafeInteger)) {
@@ -424,22 +578,21 @@ async function collect(
 
   if (usageRows === null) {
     usageResult.status = {
-      state: usageResult.pages.length ? "partial" : "unavailable",
-      pagesRead: usageResult.pages.length,
+      state: usageResult.pagesRead ? "partial" : "unavailable",
+      pagesRead: usageResult.pagesRead,
       errorKind: "invalid-response",
       message: safeMessage("invalid-response"),
     };
   }
   if (costRows === null) {
     costResult.status = {
-      state: costResult.pages.length ? "partial" : "unavailable",
-      pagesRead: costResult.pages.length,
+      state: costResult.pagesRead ? "partial" : "unavailable",
+      pagesRead: costResult.pagesRead,
       errorKind: "invalid-response",
       message: safeMessage("invalid-response"),
     };
   } else if (
-    costData !== null && costData.dropped > 0 &&
-    costResult.status.state === "complete"
+    costData.dropped > 0 && costResult.status.state === "complete"
   ) {
     // Dropped rows are contract-legal but unattributable, not a protocol error,
     // so the dimension stays usable and only loses its claim to completeness.
@@ -447,7 +600,7 @@ async function collect(
     // the dashboard renders a partial section from the message alone.
     costResult.status = {
       state: "partial",
-      pagesRead: costResult.pages.length,
+      pagesRead: costResult.pagesRead,
       errorKind: "",
       message: `OpenAI omitted the billed amount on ${costData.dropped} cost ${
         costData.dropped === 1 ? "row" : "rows"
@@ -484,13 +637,13 @@ async function collect(
     coverageEnd: coverageEnd.toISOString(),
     usageStatus: {
       state: "unavailable",
-      pagesRead: usageResult.pages.length,
+      pagesRead: usageResult.pagesRead,
       errorKind: "invalid-response",
       message: safeMessage("invalid-response"),
     },
     costStatus: {
       state: "unavailable",
-      pagesRead: costResult.pages.length,
+      pagesRead: costResult.pagesRead,
       errorKind: "invalid-response",
       message: safeMessage("invalid-response"),
     },
@@ -514,7 +667,7 @@ async function collect(
 
 export const model = {
   type: "@jpisgeek/openai-usage",
-  version: "2026.08.25.2",
+  version: "2026.09.05.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     snapshot: {

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/openai-usage"
-version: 2026.08.25.2
+version: 2026.09.05.1
 description: >
   Local OpenAI organization usage and billed-cost collection through official
   APIs. Usage and costs paginate independently, preserve partial coverage, and

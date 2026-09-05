@@ -194,9 +194,14 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
+  // Evidence links are persisted and rendered; reject embedded credentials.
   url: z.string().url().refine(
-    (value) => new URL(value).protocol === "https:",
-    "evidence URLs must use https",
+    (value) => {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" && parsed.username === "" &&
+        parsed.password === "";
+    },
+    "evidence URLs must use https and must not carry credentials",
   ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
@@ -442,7 +447,29 @@ type Json = Record<string, unknown>;
 // the informational "unknown" section instead of being published.
 // subscription_metadata_test.ts and dashboard_subscription_test.ts both assert
 // the two copies accept and reject the same snapshots.
-const DecimalSchema = z.string().regex(/^\d{1,15}(\.\d{1,4})?$/);
+function canonicalDecimal(value: string): string {
+  const [whole, fraction = ""] = value.split(".");
+  const trimmedWhole = whole.replace(/^0+(?=\d)/, "");
+  const trimmedFraction = fraction.replace(/0+$/, "");
+  return trimmedFraction ? `${trimmedWhole}.${trimmedFraction}` : trimmedWhole;
+}
+function decimalSurvivesNumberConversion(value: string): boolean {
+  const converted = Number(value);
+  if (!Number.isFinite(converted)) return false;
+  return canonicalDecimal(value) === canonicalDecimal(String(converted));
+}
+// This refinement is what lets section() emit Number(priceMinor) as an "exact"
+// observed metric at all. Nineteen significant digits fit the regex but not a
+// double, so a snapshot carrying "999999999999999.9999" — written before the
+// capture side rejected it, and good for 365 days — would otherwise be published
+// as the exact price 1000000000000000. A price that cannot come back out of the
+// conversion unchanged is not renderable here, so read() drops the whole
+// snapshot and the section degrades to unknown rather than publishing a number
+// the operator never declared.
+const DecimalSchema = z.string().regex(/^\d{1,15}(\.\d{1,4})?$/).refine(
+  decimalSurvivesNumberConversion,
+  "priceMinor must survive the report's Number() conversion without loss",
+);
 const CONFUSABLE_PAIRS = "аaеeоoрpсcуyхxіiјjѕsмmтtкkвbнhαaεeοoρpνvιiκkτt";
 const CONFUSABLES = new Map<string, string>();
 for (let index = 0; index < CONFUSABLE_PAIRS.length; index += 2) {
@@ -455,13 +482,28 @@ function foldDeclaredText(value: string): string {
 }
 const FORBIDDEN_DECLARATION =
   /remain|avail|left|per.{0,8}tokens?|tokens?.{0,8}price/;
+// In agreement with the copy in subscription_metadata.ts: a hostname label or a
+// path segment can itself be a bearer capability, so only this finite set of
+// public vendor origins and non-secret paths is storable. Enforced here as well
+// as on the write side because a snapshot written by an older, looser version of
+// this model is still readable for 365 days, and read() must not publish a
+// reference the current write path would refuse.
+const ALLOWED_REFERENCE_ORIGINS = new Set([
+  "https://www.anthropic.com",
+  "https://openai.com",
+  "https://proton.me",
+  "https://github.com",
+]);
+const ALLOWED_REFERENCE_PATHS = new Set(["/", "/pricing", "/plans"]);
 const ReferenceSchema = z.string().url().refine(
   (value) => {
     const url = new URL(value);
     return url.protocol === "https:" && !url.username && !url.password &&
-      !url.search && !url.hash;
+      !url.search && !url.hash &&
+      ALLOWED_REFERENCE_ORIGINS.has(url.origin) &&
+      ALLOWED_REFERENCE_PATHS.has(url.pathname);
   },
-  "sourceReference must use https and must not contain credentials, query parameters, or fragments",
+  "sourceReference must be one of the allowed public vendor origins with an allowed non-secret path, must use https, and must not contain credentials, query parameters, or fragments",
 );
 const LimitSchema = z.object({
   name: z.string().min(1),
@@ -485,6 +527,34 @@ const LimitSchema = z.object({
     }
   }
 });
+/** Byte-identical to the copy in subscription_metadata.ts. */
+function limitIdentity(
+  limit: { name: string; unit: string; period?: string },
+): string {
+  return JSON.stringify([limit.name, limit.unit, limit.period ?? null]);
+}
+/**
+ * Metric id for one declared limit.
+ *
+ * The id used to be `declared-limit-${index + 1}`, which names a position in an
+ * array rather than a limit: two unrelated snapshots both called their first
+ * limit `declared-limit-1`, so a consumer tracking a metric by id across
+ * captures silently followed a different declaration whenever the operator
+ * reordered or inserted an entry, and any chart keyed on the id compared a
+ * context window against a seat count. Hex-encoding the canonical identity is
+ * injective — distinct identities cannot produce the same id, which a truncated
+ * hash could not promise — so the id is a stable name for exactly one
+ * declaration, and the schemas reject two limits that share an identity.
+ */
+function limitMetricId(
+  limit: { name: string; unit: string; period?: string },
+): string {
+  let hex = "";
+  for (const byte of new TextEncoder().encode(limitIdentity(limit))) {
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return `declared-limit-${hex}`;
+}
 const SnapshotSchema = z.object({
   provider: z.string().min(1),
   planName: z.string().min(1).optional(),
@@ -501,7 +571,12 @@ const SnapshotSchema = z.object({
   renewalStart: z.iso.datetime().optional(),
   renewalEnd: z.iso.datetime().optional(),
   seats: z.number().int().nonnegative().optional(),
-  declaredLimits: z.array(LimitSchema),
+  // .default([]) mirrors the write copy exactly. Without it capture accepted a
+  // configuration with no declaredLimits and wrote the defaulted snapshot, while
+  // a snapshot missing the key outright — the shape an older writer or a direct
+  // Swamp data write produces — was rejected here, which is the same read/write
+  // divergence the strictness fixes above close.
+  declaredLimits: z.array(LimitSchema).default([]),
   sourceReference: ReferenceSchema.optional(),
   provenance: z.object({
     kind: z.literal("operator-config"),
@@ -528,6 +603,24 @@ const SnapshotSchema = z.object({
       message: "renewalStart must not follow renewalEnd",
     });
   }
+  // Two limits with one identity are two metrics with one id in the rendered
+  // section, and a renderer keyed by id keeps only the last — one declared limit
+  // vanishing behind another. The write copy refuses to persist that; this copy
+  // refuses to render it, so a snapshot from another route cannot smuggle the
+  // collision past a schema that was supposed to have already ruled it out.
+  const identities = new Set<string>();
+  for (const [index, limit] of snapshot.declaredLimits.entries()) {
+    const identity = limitIdentity(limit);
+    if (identities.has(identity)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["declaredLimits", index],
+        message:
+          "declared limits must be distinct in name, unit, and period; duplicate identity",
+      });
+    }
+    identities.add(identity);
+  }
 });
 type Snapshot = z.infer<typeof SnapshotSchema>;
 interface Context {
@@ -547,11 +640,46 @@ interface Context {
     ): Promise<Uint8Array | null>;
   };
 }
-const sensitivity = {
-  classification: "operational" as const,
-  fields: ["planName", "priceMinor", "renewalStart", "renewalEnd", "seats"],
+// Every field this report can emit that a competitor, a support agent, or a
+// screenshot in a public channel should not learn. The list used to name five of
+// them and then classify the whole bundle "operational", which is the class a
+// publication-aware consumer treats as safe to render outside the operator's own
+// walls: what a plan costs, when it renews, how many seats it has, and what the
+// provider caps are together describe a company's commercial position, and the
+// code's own note already said so while the classification contradicted it. The
+// list is exhaustive rather than computed from the snapshot in hand, so a
+// consumer reads one stable answer to "what could be in here" instead of one
+// that shrinks whenever an operator leaves a field unset.
+const SENSITIVE_SNAPSHOT_FIELDS = [
+  "provider",
+  "planName",
+  "billingCadence",
+  "priceMinor",
+  "currency",
+  "renewalStart",
+  "renewalEnd",
+  "seats",
+  "declaredLimits",
+  "sourceReference",
+];
+const sectionSensitivity = {
+  classification: "sensitive" as const,
+  fields: SENSITIVE_SNAPSHOT_FIELDS,
   redacted: false,
-  note: "Subscription and billing metadata can be commercially sensitive",
+  note:
+    "Subscription and billing metadata is commercially sensitive: plan, price, renewal window, seats, declared limits, and the operator-supplied source URL are emitted as declared",
+};
+// modelId is the Swamp instance identifier and modelName is whatever the
+// operator named the model — both are private infrastructure identity, and
+// neither tells a dashboard reader anything about the subscription. modelName is
+// required by the bundle contract so it is carried and classified; modelId is
+// optional there, so the honest handling is to not emit it at all.
+const bundleSensitivity = {
+  classification: "sensitive" as const,
+  fields: [...SENSITIVE_SNAPSHOT_FIELDS, "producer.modelName"],
+  redacted: true,
+  note:
+    "Subscription and billing metadata is commercially sensitive; producer.modelId is withheld and producer.modelName is operator-chosen private identity",
 };
 async function read(ctx: Context): Promise<Snapshot | null> {
   const handle = ctx.dataHandles.find((h) => h.specName === "snapshot") ??
@@ -598,7 +726,7 @@ function section(snapshot: Snapshot | null) {
         sensitivity: "operational",
       }],
       references: [],
-      sensitivity,
+      sensitivity: sectionSensitivity,
     });
   }
   const metrics: Json[] = [];
@@ -610,7 +738,7 @@ function section(snapshot: Snapshot | null) {
       unit: "currency",
       availability: "observed",
       confidence: "exact",
-      sensitivity: "operational",
+      sensitivity: "sensitive",
     });
   }
   if (snapshot.seats !== undefined) {
@@ -621,12 +749,12 @@ function section(snapshot: Snapshot | null) {
       unit: "count",
       availability: "observed",
       confidence: "exact",
-      sensitivity: "operational",
+      sensitivity: "sensitive",
     });
   }
-  for (const [index, limit] of snapshot.declaredLimits.entries()) {
+  for (const limit of snapshot.declaredLimits) {
     metrics.push({
-      id: `declared-limit-${index + 1}`,
+      id: limitMetricId(limit),
       label: limit.name,
       value: limit.value,
       unit: /^[a-z][a-z0-9._-]*$/.test(limit.unit) &&
@@ -649,7 +777,7 @@ function section(snapshot: Snapshot | null) {
         : `custom:${limit.unit}`,
       availability: "observed",
       confidence: "exact",
-      sensitivity: "operational",
+      sensitivity: "sensitive",
     });
   }
   const facts: Json[] = [{
@@ -657,7 +785,9 @@ function section(snapshot: Snapshot | null) {
     label: "Provider",
     value: snapshot.provider,
     confidence: "exact",
-    sensitivity: "operational",
+    // Which vendor an operator buys from is a commercial fact in its own right,
+    // and paired with the plan and price below it is the whole contract.
+    sensitivity: "sensitive",
   }, {
     id: "provenance",
     label: "Provenance",
@@ -679,7 +809,7 @@ function section(snapshot: Snapshot | null) {
         label,
         value,
         confidence: "exact",
-        sensitivity: "operational",
+        sensitivity: "sensitive",
       });
     }
   }
@@ -711,32 +841,65 @@ function section(snapshot: Snapshot | null) {
         kind: "url",
         label: "Operator-supplied source",
         url: snapshot.sourceReference,
+        // The reference contract has no sensitivity field, so this rides through
+        // its passthrough — retained by v1 parsing, and the only place a
+        // consumer looking at the reference alone can see that an
+        // operator-supplied URL may name private infrastructure or an account.
+        sensitivity: "sensitive",
       }]
       : [],
-    sensitivity,
+    sensitivity: sectionSensitivity,
   });
+}
+/**
+ * Bundle id for one model instance.
+ *
+ * The id was the constant "subscription-metadata", so every model instance in a
+ * deployment produced bundles carrying the same id: an operator running two
+ * subscriptions — two models of this type — emitted two bundles a consumer
+ * keyed by id could not tell apart, and the second overwrote the first even
+ * though nothing about them matched. Omitting producer.modelId keeps instance
+ * identity out of the bundle but does nothing to make a constant unique. A
+ * domain-separated SHA-256 of the Swamp model id is stable for an instance,
+ * distinct between instances at collision resistance the whole 256-bit digest
+ * carries, and does not carry the raw model id out of the deployment.
+ */
+async function bundleId(modelId: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      `@jpisgeek/subscription-metadata\0bundle-id\0${modelId}`,
+    ),
+  );
+  let hex = "";
+  for (const byte of new Uint8Array(digest)) {
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return `subscription-metadata-${hex}`;
 }
 export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
   const snapshot = await read(ctx);
   const sections = [section(snapshot)];
   return DashboardBundleV1Schema.parse({
     schemaVersion: DASHBOARD_BUNDLE_VERSION,
-    id: "subscription-metadata",
+    id: await bundleId(ctx.modelId),
     title: "Subscription metadata",
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/subscription-metadata",
-      extensionVersion: "2026.08.25.2",
+      extensionVersion: "2026.09.05.1",
       modelType: String(ctx.modelType),
       modelName: ctx.definition.name,
-      modelId: ctx.modelId,
+      // modelId is deliberately absent — see bundleSensitivity. It identified a
+      // specific model instance in the operator's Swamp deployment and nothing
+      // in this dashboard needs it, so the bundle does not carry it out.
       dataName: "report-jpisgeek-subscription-metadata-json",
       reportName: "@jpisgeek/subscription-metadata",
     },
     state: deriveOverallState(sections),
     sections,
     exceptions: [],
-    sensitivity,
+    sensitivity: bundleSensitivity,
     extensions: {
       "jpisgeek/subscription-metadata": {
         dataClass: "subscription-metadata",
@@ -755,13 +918,18 @@ export const report = {
   labels: ["dashboard", "subscription", "metadata"],
   execute: async (context: Context) => {
     const bundle = await normalize(context);
-    const markdownEscape = (value: string) =>
-      value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-        .replace(/([\\`*_[\]{}()#+.!|\-])/g, "\\$1").replace(/[\r\n]+/g, " ");
+    // The Markdown used to be the section summary, which is
+    // "<provider> — <plan name>": the two most commercially sensitive strings
+    // this report holds, rendered into a surface that carries none of the
+    // sensitivity classification attached to the JSON bundle and gets pasted
+    // into chat and ticket bodies. A renderer honouring the classification
+    // would still have shown them, because nothing in the Markdown says they
+    // are protected. There is no report-level sensitivity field to attach, so
+    // the Markdown carries no snapshot value at all — every declared fact is in
+    // the JSON bundle, where the classification travels with it.
     return {
-      markdown: `# ${markdownEscape(bundle.title)}\n\n${
-        markdownEscape(bundle.sections[0].summary)
-      }`,
+      markdown:
+        "# Subscription metadata\n\nSubscription and billing values are classified sensitive and are not rendered here; they are in the JSON bundle.",
       json: bundle,
     };
   },

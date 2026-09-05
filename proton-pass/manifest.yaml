@@ -1,8 +1,8 @@
 manifestVersion: 1
 name: "@jpisgeek/proton-pass"
-version: 2026.08.30.1
+version: 2026.09.05.1
 description: >
-  Proton Pass vault provider: resolves ${{ vault.get('<vault>', 'KEY') }} live through the official pass-cli at run time. Secrets stay in Proton Pass. Nothing is copied into swamp storage, this repository, or disk. Accepts item titles, title/field, or stable pass:// URIs.
+  Proton Pass vault provider: resolves ${{ vault.get('<vault>', 'KEY') }} live through the official pass-cli at run time. Secrets stay in Proton Pass. This provider copies nothing into swamp storage or this repository and writes no files; pass-cli keeps its own local database. Read-only: accepts item titles and title/field. No writes, no pass:// URIs.
 repository: https://github.com/jpisgeek/slog-bog/tree/main/proton-pass
 paths:
   base: manifest

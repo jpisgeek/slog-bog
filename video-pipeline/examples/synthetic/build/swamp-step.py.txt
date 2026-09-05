@@ -1,0 +1,134 @@
+"""Stdlib-only receipt contract demo. This is not a media renderer.
+
+Every artifact is explicitly synthetic plain text. verified means the example's
+file/hash contract passed, never that a video or audio track was inspected.
+"""
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+STAGES = ("prepare", "narrate", "render", "inspect", "package", "verify", "deliver")
+NOTICE = "SYNTHETIC CONTRACT FIXTURE: no video or audio was generated.\n"
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def confined(root, path):
+    """Keep this example's reads, writes, and delivery inside its workspace."""
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("Example paths must be absolute without traversal")
+    relative = path.relative_to(root)
+    if not relative.parts:
+        raise ValueError("Example output cannot replace the workspace")
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError("Example paths cannot contain symbolic links")
+    path.resolve().relative_to(root)
+    return path
+
+
+def write(root, path, text):
+    path = confined(root, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def artifact(root, path):
+    path = confined(root, path)
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": digest(path)}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("stage", choices=STAGES)
+    parser.add_argument("--release", required=True)
+    parser.add_argument("--input-hash")
+    parser.add_argument("--video-sha256")
+    parser.add_argument("--destination", action="append", default=[])
+    args = parser.parse_args()
+    if not re.fullmatch(r"v[0-9]+", args.release):
+        raise ValueError("Release must be v followed by digits")
+
+    root = Path.cwd().resolve()
+    scenes = confined(root, root / "scenes.json")
+    bridge = confined(root, root / "build/swamp-step.py")
+    if Path(__file__).resolve() != bridge:
+        raise ValueError("Run the fixed bridge from its own workspace")
+    source = json.loads(scenes.read_text(encoding="utf-8"))
+    if not isinstance(source, list) or not source:
+        raise ValueError("The synthetic scene list must be nonempty")
+    input_hash = hashlib.sha256(
+        b"scenes.json\0" + scenes.read_bytes()
+        + b"\0build/swamp-step.py\0" + bridge.read_bytes()
+    ).hexdigest()
+    if args.stage != "prepare" and args.input_hash != input_hash:
+        raise ValueError("Prepared inputs changed; prepare the fixture again")
+
+    output = root / "example-output" / args.release
+    video = output / "synthetic-video.txt"
+    narration = output / "synthetic-narration.txt"
+    # Validate every destination before creating any delivery directory.
+    destinations = [confined(root, Path(value)) for value in args.destination]
+    if args.stage == "deliver" and not destinations:
+        raise ValueError("The delivery example requires an in-workspace destination")
+
+    if args.stage == "prepare":
+        paths = [write(root, output / "prepared.txt", NOTICE + input_hash + "\n")]
+    elif args.stage == "narrate":
+        paths = [write(root, narration, NOTICE + "Narration placeholder: " + source[0]["voice"] + "\n")]
+    elif args.stage == "render":
+        confined(root, narration).read_text(encoding="utf-8")
+        paths = [write(root, video, NOTICE + "Video placeholder for " + input_hash + "\n")]
+    elif args.stage == "inspect":
+        paths = [write(root, output / "inspection.txt", NOTICE + "Text artifact SHA-256: " + digest(confined(root, video)) + "\nNo media properties measured.\n")]
+    elif args.stage == "package":
+        paths = [write(root, output / "package.txt", NOTICE + "Synthetic video: " + digest(confined(root, video)) + "\nSynthetic narration: " + digest(confined(root, narration)) + "\n")]
+    elif args.stage == "verify":
+        package = confined(root, output / "package.txt").read_text(encoding="utf-8")
+        if digest(confined(root, video)) not in package or digest(confined(root, narration)) not in package:
+            raise ValueError("Synthetic package hashes no longer match")
+        paths = [write(root, output / "verification.txt", NOTICE + "File/hash contract verified; media verification is not applicable.\n")]
+    else:
+        confined(root, output / "verification.txt").read_text(encoding="utf-8")
+        if args.video_sha256 != digest(confined(root, video)):
+            raise ValueError("Delivery hash does not match the synthetic video")
+        paths = [write(root, destination / "synthetic-video.txt", video.read_text(encoding="utf-8")) for destination in destinations]
+
+    if args.stage in ("inspect", "package", "verify"):
+        paths.append(video)
+    records = [artifact(root, path) for path in paths]
+    receipt = {
+        "stage": args.stage,
+        "release": args.release,
+        "inputHash": input_hash,
+        "completedAt": datetime.now(timezone.utc).isoformat(),
+        "artifacts": records,
+        "videoSha256": digest(confined(root, video)) if args.stage in STAGES[2:] else None,
+        "metrics": {
+            "durationSeconds": None,
+            "clippedSamples": None,
+            "fileCount": len(records),
+            "verified": True,
+        },
+    }
+    # stdout is exclusively one strict JSON receipt; diagnostics go to stderr.
+    print(json.dumps(receipt, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

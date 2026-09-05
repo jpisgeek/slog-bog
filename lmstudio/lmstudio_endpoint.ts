@@ -135,15 +135,82 @@ const ModelsSchema = z.object({
   syncedAt: z.string(),
 });
 
+/**
+ * `authorized` and `httpStatus` are tri-state on purpose, and null is the
+ * point of them.
+ *
+ * They used to be a plain boolean and a plain number seeded with `false` and
+ * `0`. That made "the endpoint refused this token" and "nothing about
+ * authorization was ever determined" the same stored record: a 500, a
+ * timeout, and a refused connection all wrote `authorized: false`, which
+ * reads as a positive finding about the token, and `httpStatus: 0`, which
+ * reads as a status code because it is typed as one. An operator (or a
+ * dashboard) chasing `authorized == false` across an `infinite`-lifetime
+ * resource cannot tell those apart, and the fix for a rejected token is
+ * nothing like the fix for an unreachable host -- which is the whole reason
+ * this model keeps reachability and authorization in separate fields to
+ * begin with.
+ *
+ *   authorized: true   an accepted (2xx) response came back
+ *                      false  an explicit 401/403
+ *                      null   never determined
+ *   httpStatus: number an HTTP response actually arrived and said this
+ *                      null   no HTTP response exists
+ *
+ * The cross-field rules below are what make the old ambiguous record
+ * unrepresentable rather than merely discouraged: a writer that regresses to
+ * `false`/`0` fails validation instead of quietly storing a false negative.
+ */
 const HealthSchema = z.object({
   reachable: z.boolean(),
-  authorized: z.boolean(),
-  httpStatus: z.number(),
+  authorized: z.boolean().nullable(),
+  httpStatus: z.number().nullable(),
   latencyMs: z.number(),
   /** "" | "unauthorized" | "http_error" | "unreachable" | "timeout" */
   errorKind: z.string(),
   error: z.string(),
   checkedAt: z.string(),
+}).superRefine((v, ctx) => {
+  // No HTTP exchange happened, so there is no status to report and nothing
+  // could have accepted or refused the token.
+  if (!v.reachable && (v.httpStatus !== null || v.authorized !== null)) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "an unreachable endpoint has no HTTP status and no authorization " +
+        "result: both must be null, never false/0",
+      path: ["reachable"],
+    });
+  }
+  // The converse: reachability is only ever set from a response arriving.
+  if (v.reachable && v.httpStatus === null) {
+    ctx.addIssue({
+      code: "custom",
+      message: "a reachable endpoint must record the HTTP status it returned",
+      path: ["httpStatus"],
+    });
+  }
+  // true only after an accepted response.
+  if (
+    v.authorized === true &&
+    !(v.httpStatus !== null && v.httpStatus >= 200 && v.httpStatus <= 299)
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message: "authorized may only be true for a 2xx response",
+      path: ["authorized"],
+    });
+  }
+  // false only for an explicit refusal.
+  if (v.authorized === false && v.httpStatus !== 401 && v.httpStatus !== 403) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "authorized may only be false for an explicit 401/403; anything " +
+        "else that failed left authorization undetermined (null)",
+      path: ["authorized"],
+    });
+  }
 });
 
 function normalizeBase(raw: string): string {
@@ -176,6 +243,108 @@ function safeUrlForLog(raw: string): string {
 }
 
 /**
+ * Remove everything from a remote-controlled string that can drive a
+ * terminal, hide or reorder displayed text, or decode ambiguously.
+ *
+ * Split out of safeRemoteText() because the order of the three passes --
+ * screen, redact, clamp -- is load-bearing, and each of them now runs over
+ * the whole string.
+ *
+ * Screening runs FIRST because redaction is a literal substring match. An
+ * endpoint that echoes the token back with a zero-width space wedged into the
+ * middle of it does not match the configured token, so a redact-first pass
+ * left it alone -- and the zero-width strip that ran afterwards reassembled
+ * the credential intact inside the stored `error`.
+ */
+function screenRemoteText(text: string): string {
+  return text
+    // deno-lint-ignore no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
+    .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "\ufffd")
+    .replace(/(^|[^\ud800-\udbff])([\udc00-\udfff])/g, "$1\ufffd")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * The one cut this function cannot move is the byte cap inside
+ * readBodyCapped(): the body is already severed at MAX_RESPONSE_BYTES before
+ * any of this runs, and that cut can land inside an echoed token, leaving a
+ * genuine prefix of the credential at the very end of the text where split()
+ * cannot match it. Collapsing whitespace then pulls that tail forward, so
+ * "it is 256 KiB in, nobody will ever read that far" is not an argument.
+ *
+ * Applied only to a read that actually hit the cap: the tail of a complete
+ * body is complete, and running this unconditionally would clip real error
+ * text that merely happens to end with the token's first character.
+ */
+function stripTrailingTokenPrefix(text: string, token: string): string {
+  if (!token) return text;
+  const longest = Math.min(token.length - 1, text.length);
+  for (let n = longest; n > 0; n--) {
+    if (token.startsWith(text.slice(text.length - n))) {
+      return `${text.slice(0, text.length - n)}[REDACTED]`;
+    }
+  }
+  return text;
+}
+
+/**
+ * Strip every form of the token from already-screened text.
+ *
+ * The screened spelling of the token is removed as well as the configured
+ * one: screening collapses whitespace and drops zero-width characters, so a
+ * token containing either no longer matches its own configured spelling by
+ * the time this runs.
+ */
+function redactAll(text: string, token: string, truncated: boolean): string {
+  let out = redact(text, token);
+  const screenedToken = screenRemoteText(token);
+  const alsoScreened = screenedToken !== "" && screenedToken !== token;
+  if (alsoScreened) out = redact(out, screenedToken);
+  if (truncated) {
+    out = stripTrailingTokenPrefix(out, token);
+    if (alsoScreened) out = stripTrailingTokenPrefix(out, screenedToken);
+  }
+  return out;
+}
+
+/**
+ * True when remote-controlled text carries the configured token in either of
+ * the two spellings redactAll() knows about.
+ *
+ * The screened spelling is checked as well as the configured one for the same
+ * reason redaction checks it: screenRemoteText() collapses whitespace and
+ * drops zero-width characters, so a token containing either no longer matches
+ * its own configured spelling once the text around it has been screened.
+ */
+function containsToken(text: string, token: string): boolean {
+  if (!token) return false;
+  if (text.includes(token)) return true;
+  const screened = screenRemoteText(token);
+  return screened !== "" && screened !== token && text.includes(screened);
+}
+
+/**
+ * Cut screened text to `max` characters without severing a surrogate pair.
+ *
+ * `slice()` cuts by UTF-16 code unit, so a cut landing between the two halves
+ * of an astral character leaves a lone surrogate at the end of the kept text
+ * -- recreating, after the screen, exactly what screenRemoteText() replaced a
+ * moment earlier, in a string this extension documents as screened. Because
+ * screening already replaced every unpaired surrogate, a high surrogate at
+ * the boundary is necessarily the first half of a real pair, so backing the
+ * cut up by one code unit is all that is needed.
+ */
+function clampText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const boundary = text.charCodeAt(max - 1);
+  const cut = boundary >= 0xd800 && boundary <= 0xdbff ? max - 1 : max;
+  return `${text.slice(0, cut)}...`;
+}
+
+/**
  * Screen a remote-controlled string before it reaches a log line, a thrown
  * error, or a stored resource.
  *
@@ -196,17 +365,29 @@ function safeUrlForLog(raw: string): string {
  * an endpoint that echoes your request inside its own error body can put part
  * of it in `error` -- is stated in the README Security section rather than
  * papered over.
+ *
+ * The clamp happens LAST, and that ordering is the whole fix for a real leak.
+ * The old shape was `redact(text.slice(0, 4096), token)`: it cut the body
+ * first and searched only the cut for the token, so a token longer than 4096
+ * characters echoed at the start of a response was split by the slice, no
+ * longer matched `split(token)`, and rode through with its first 4096
+ * characters intact -- of which the first `max` were then written into an
+ * `infinite`-lifetime resource and into a thrown message. Nothing is cut here
+ * until every occurrence of the credential is already gone from the complete
+ * response, which readBodyCapped() has already bounded to
+ * MAX_RESPONSE_BYTES.
+ *
+ * `truncated` reports that the read hit that byte cap -- the one cut this
+ * function did not make; see stripTrailingTokenPrefix().
  */
-function safeRemoteText(text: string, token: string, max: number): string {
-  const screened = redact(text.slice(0, 4096), token)
-    // deno-lint-ignore no-control-regex
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
-    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
-    .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "\ufffd")
-    .replace(/(^|[^\ud800-\udbff])([\udc00-\udfff])/g, "$1\ufffd")
-    .replace(/\s+/g, " ")
-    .trim();
-  return screened.length > max ? `${screened.slice(0, max)}...` : screened;
+function safeRemoteText(
+  text: string,
+  token: string,
+  max: number,
+  truncated = false,
+): string {
+  const safe = redactAll(screenRemoteText(text), token, truncated);
+  return clampText(safe, max);
 }
 
 /**
@@ -361,7 +542,11 @@ function classifyFetchError(
  *    length is capped, both refused outright rather than truncated: a cut
  *    list stored as a measurement is a wrong answer, not a failed one.
  */
-function extractModelIds(payload: unknown, url: string): string[] {
+function extractModelIds(
+  payload: unknown,
+  url: string,
+  token: string,
+): string[] {
   const shapeError = (why: string) =>
     new Error(
       `MALFORMED_RESPONSE: ${url} returned a 2xx body that is not an ` +
@@ -399,6 +584,21 @@ function extractModelIds(payload: unknown, url: string): string[] {
         `a data[] entry has an unusable model id (${
           screened.error.issues[0]?.message ?? "rejected"
         })`,
+      );
+    }
+    // The screen above says nothing about a well-formed id that happens to BE
+    // the credential. `/v1/models` is answered by the far end, so a hostile or
+    // compromised endpoint can reply `{ data: [{ id: "<your bearer token>" }] }`
+    // and the token is then written verbatim into an `infinite`-lifetime
+    // resource, put in a tag, and logged -- the one path in this file where
+    // remote text is stored without going through redactAll() first, because
+    // an id is a measurement rather than a message. Refused, not redacted:
+    // "[REDACTED]" stored as a served model id is a wrong answer, and the
+    // whole list is suspect once the endpoint is playing this game.
+    if (containsToken(screened.data, token)) {
+      // The offending id is never echoed: it is the credential.
+      throw shapeError(
+        "a data[] entry returns the configured API token as a model id",
       );
     }
     ids.push(screened.data);
@@ -467,7 +667,12 @@ async function models(
     // endpoint's own body -- which could in principle echo request headers
     // back on a misconfigured proxy's error page, or carry terminal control
     // sequences -- is bounded and screened before it reaches an error.
-    const safeBody = safeRemoteText(body.text, g.apiToken, MAX_ERROR_SNIPPET);
+    const safeBody = safeRemoteText(
+      body.text,
+      g.apiToken,
+      MAX_ERROR_SNIPPET,
+      body.truncated,
+    );
     throw new Error(
       `HTTP_ERROR: ${url} returned HTTP ${response.status}. ${safeBody}`,
     );
@@ -507,7 +712,7 @@ async function models(
     );
   }
 
-  const ids = extractModelIds(payload, url);
+  const ids = extractModelIds(payload, url, g.apiToken);
 
   // Cancellation that landed while the body was being parsed is the caller
   // pulling the plug, not a measurement. Checked before the write so a
@@ -545,8 +750,14 @@ async function health(
   });
 
   let reachable = false;
-  let authorized = false;
-  let httpStatus = 0;
+  // Seeded null, not false/0: before the request has been made, nothing about
+  // authorization has been determined and no HTTP status exists. `false` here
+  // was a claim the endpoint rejected the token, made before the endpoint had
+  // been asked anything -- and every path that never reached a 401/403 (a
+  // 500, a timeout, a refused connection) shipped that claim to an
+  // infinite-lifetime resource unchanged. See HealthSchema.
+  let authorized: boolean | null = null;
+  let httpStatus: number | null = null;
   let errorKind = "";
   let error = "";
 
@@ -568,9 +779,15 @@ async function health(
     reachable = true;
     httpStatus = response.status;
     if (response.status === 401 || response.status === 403) {
+      // The only place `false` is earned: the endpoint was asked and said no.
+      authorized = false;
       errorKind = "unauthorized";
       error = "endpoint reachable but rejected the API token";
     } else if (!response.ok) {
+      // A 500, a 404, a gateway's 502 -- the endpoint never got as far as
+      // ruling on the token, so authorization stays null. Recording `false`
+      // here (the old behaviour) was a fabricated finding about the
+      // credential in a resource that is never garbage-collected.
       errorKind = "http_error";
       error = `endpoint returned HTTP ${response.status}`;
     } else {
@@ -623,14 +840,23 @@ async function health(
   }, {
     tags: {
       reachable: String(reachable),
-      authorized: String(authorized),
+      // Tags are strings, so the tri-state has to be spelled out rather than
+      // stringified: `String(null)` is "null", which reads as a value someone
+      // set. A tag search for authorized=false must return only endpoints
+      // that actually refused the token.
+      authorized: authorized === null ? "unknown" : String(authorized),
       errorKind,
     },
   });
 
   ctx.logger.info(
     "health: reachable={reachable} authorized={authorized} status={status} latency={ms}ms",
-    { reachable, authorized, status: httpStatus, ms: latencyMs },
+    {
+      reachable,
+      authorized: authorized === null ? "unknown" : String(authorized),
+      status: httpStatus === null ? "none" : String(httpStatus),
+      ms: latencyMs,
+    },
   );
 
   return { dataHandles: [handle] };
@@ -644,11 +870,16 @@ async function health(
  */
 export const model = {
   type: "@jpisgeek/lmstudio/endpoint",
-  version: "2026.08.25.1",
+  version: "2026.09.05.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.08.25.1",
     description: "Tighten endpoint validation with no argument schema changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.09.05.1",
+    description:
+      "Security hardening without renaming arguments or changing destinations; existing values are preserved and must pass current validation",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
 
@@ -669,13 +900,17 @@ export const model = {
     },
     health: {
       description:
-        "Reachability and auth as two independent booleans, with HTTP " +
-        "status and latency recorded separately, so 'host is down' and " +
-        "'host is up but rejects the token' never collapse into one " +
-        "generic failure. An unreachable, unauthorized, or slow endpoint is " +
-        "recorded as data, not thrown -- the one exception is caller " +
-        "cancellation, which throws rather than being written as a " +
-        "misleading 'timeout' observation.",
+        "Reachability and auth recorded independently, with HTTP status and " +
+        "latency separate, so 'host is down' and 'host is up but rejects " +
+        "the token' never collapse into one generic failure. `authorized` " +
+        "is true only after a 2xx, false only for an explicit 401/403, and " +
+        "null whenever authorization was never determined -- a 500, a " +
+        "timeout, or a refused connection leaves it null rather than " +
+        "claiming the token was rejected. `httpStatus` is null when no HTTP " +
+        "response arrived at all, never 0. An unreachable, unauthorized, or " +
+        "slow endpoint is recorded as data, not thrown -- the one exception " +
+        "is caller cancellation, which throws rather than being written as " +
+        "a misleading 'timeout' observation.",
       schema: HealthSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,

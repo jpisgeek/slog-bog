@@ -1,4 +1,5 @@
 /** Normalize scoped @jpisgeek/swamp-observability snapshots into bundle v1. */
+import { createHash } from "node:crypto";
 // BEGIN INLINED DASHBOARD CONTRACT V1
 /**
  * Provider-neutral dashboard bundle contract.
@@ -194,9 +195,14 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
+  // Evidence links are persisted and rendered; reject embedded credentials.
   url: z.string().url().refine(
-    (value) => new URL(value).protocol === "https:",
-    "evidence URLs must use https",
+    (value) => {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" && parsed.username === "" &&
+        parsed.password === "";
+    },
+    "evidence URLs must use https and must not carry credentials",
   ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
@@ -438,24 +444,143 @@ const InterfaceNameSchema = z.enum([
   "serve-heartbeat",
 ]);
 
-const ObservationSchema = z.object({
-  interface: InterfaceNameSchema,
-  available: z.boolean(),
-  observedAt: z.iso.datetime(),
-  errorKind: z.enum([
-    "",
-    "unsupported",
-    "unauthorized",
-    "timeout",
-    "unreachable",
-    "invalid-response",
-    "command-failed",
-  ]),
-  error: z.string(),
-  payload: z.json().nullable(),
-});
+/**
+ * The projected payload shapes the collector is allowed to persist, restated
+ * here because this report carries its own copy of the snapshot contract.
+ *
+ * The payload used to be `z.json().nullable()` — anything at all — so this
+ * report would happily normalize, and a renderer would happily display, a
+ * stored blob containing whatever the observed Swamp instance had put in its
+ * response. Stating the shape here is the second half of the collector's
+ * redaction: a snapshot carrying a field this version does not expect is not
+ * read at all, it becomes a coverage gap for that one interface, and the
+ * remaining four still render.
+ */
+/**
+ * The closed status vocabulary, restated here as the read-side half of the
+ * collector's redaction.
+ *
+ * This was a 32-character pattern, which is exactly wide enough for a short
+ * credential, an IP address, an account ID or an internal hostname — remote
+ * text this report would then have normalized into a bundle and a renderer
+ * would have displayed. An enum has no such hole: a snapshot whose status is
+ * anything other than one of these six is not read at all. That is a real
+ * refusal rather than a sanitizing pass, because there is no sanitizer here
+ * that could turn attacker-chosen text into a safe status.
+ */
+const StatusBucketSchema = z.enum([
+  "active",
+  "succeeded",
+  "failed",
+  "stale",
+  "orphaned",
+  "unknown",
+]);
+
+type StatusBucket = z.infer<typeof StatusBucketSchema>;
+
+const RecordSchema = z.object({
+  status: StatusBucketSchema.optional(),
+  stale: z.literal(true).optional(),
+  orphaned: z.literal(true).optional(),
+  identified: z.literal(true).optional(),
+}).strict();
+
+/** Counts are nonnegative safe integers or they are not counts. */
+const CountSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+
+const PayloadSchema = z.union([
+  z.object({ runs: z.array(RecordSchema) }).strict(),
+  z.object({ results: z.array(RecordSchema) }).strict(),
+  z.object({
+    totalTracked: CountSchema.optional(),
+    active: CountSchema.optional(),
+    stale: CountSchema.optional(),
+    orphaned: CountSchema.optional(),
+  }).strict(),
+]);
+
+/** The classifications only an UNAVAILABLE snapshot is allowed to carry. */
+const ErrorKindSchema = z.enum([
+  "unsupported",
+  "unauthorized",
+  "timeout",
+  "unreachable",
+  "invalid-response",
+  "oversized",
+  "command-failed",
+]);
+
+type ErrorKind = z.infer<typeof ErrorKindSchema>;
+
+/**
+ * A snapshot is either an availability or a failure, and cannot be both.
+ *
+ * This was one flat object with `available: z.boolean()` beside an errorKind
+ * enum that included the failure kinds, `error: z.string()` and a nullable
+ * payload, and it was not `.strict()`. Every combination therefore parsed: a
+ * snapshot could claim `available: true` while carrying `errorKind:
+ * "unauthorized"` and a full healthy payload, and this report read the payload
+ * and rendered the section healthy — a failure wearing the shape of health.
+ * Unknown top-level fields rode along too, despite the README promising they
+ * were rejected. Splitting on `available` makes those states unrepresentable
+ * rather than merely unlikely, and a snapshot that mixes them is refused
+ * outright: readObservations() turns it into a coverage gap for that one
+ * interface and the other four still render.
+ *
+ * `error` on the failure branch is parsed only so a well-formed snapshot still
+ * validates. Its text is never read — see describeError(), which derives every
+ * displayed word from errorKind instead. Bounding that text's length or
+ * alphabet here would be the wrong fix twice over: it is not the shape of the
+ * text that makes it unsafe, it is that a stored string from a drifted or
+ * tampered collector has no business reaching a rendered bundle at all.
+ */
+const ObservationSchema = z.discriminatedUnion("available", [
+  z.object({
+    interface: InterfaceNameSchema,
+    available: z.literal(true),
+    observedAt: z.iso.datetime(),
+    errorKind: z.literal(""),
+    error: z.literal(""),
+    payload: PayloadSchema,
+  }).strict(),
+  z.object({
+    interface: InterfaceNameSchema,
+    available: z.literal(false),
+    observedAt: z.iso.datetime(),
+    errorKind: ErrorKindSchema,
+    error: z.string(),
+    payload: z.null(),
+  }).strict(),
+]);
 
 type Observation = z.infer<typeof ObservationSchema>;
+
+/**
+ * The only sentences this report will ever print about a failed interface.
+ *
+ * The summary, the coverage note, the completeness reason and the exception
+ * detail all used to be `observation.error` — a string this report reads back
+ * out of the datastore. Whatever a drifted, replaced or tampered collector put
+ * there was copied verbatim into the bundle JSON and the report Markdown, so a
+ * secret or a chunk of markup in that field reached every renderer downstream.
+ * errorKind is a closed enum, so deriving the words from it means the rendered
+ * text is chosen here and there is nothing left to escape.
+ */
+const ERROR_TEXT: Record<ErrorKind, string> = {
+  unsupported: "This Swamp build exposes no public query for this interface",
+  unauthorized: "Swamp reported this interface's command as unauthorized",
+  timeout: "The Swamp interface did not respond before the timeout",
+  unreachable: "The Swamp interface could not be reached",
+  "invalid-response":
+    "The stored snapshot for this interface is not one this report version can read",
+  oversized: "Swamp returned more output than the collector will read",
+  "command-failed": "The Swamp command for this interface failed",
+};
+
+function describeError(kind: ErrorKind): string {
+  return ERROR_TEXT[kind];
+}
 
 interface DataHandle {
   name: string;
@@ -508,77 +633,50 @@ function arrayFrom(
   };
 }
 
+/**
+ * A projected history record is usable when it carries a status bucket.
+ *
+ * The collector replaces a record it could not project with `{}` rather than
+ * dropping it, so those placeholders land here and are counted as malformed —
+ * the population stays honest without any of the original record surviving.
+ */
 function historyRecord(value: Json): boolean {
-  return ["status", "state", "outcome"].some((key) =>
-    typeof value[key] === "string" && value[key].trim() !== ""
-  );
+  return statusKnown(value);
 }
 
+/**
+ * A stored-report record is usable when it carries a status, or when the
+ * collector saw the response identify the artifact and this Swamp build simply
+ * exposes no status field. `identified` is that marker and deliberately holds
+ * no name: presence is the fact the dashboard needs, the report name is not.
+ */
 function reportRecord(value: Json): boolean {
-  return ["status", "state", "outcome", "id", "name", "reportName", "dataName"]
-    .some((key) =>
-      typeof value[key] === "string" && String(value[key]).trim() !== ""
-    );
+  return historyRecord(value) || value.identified === true;
 }
 
 function isJson(value: unknown): value is Json {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function statusOf(value: Json): string {
-  for (const key of ["status", "state", "outcome"]) {
-    if (typeof value[key] === "string") {
-      const status = value[key].trim().toLowerCase();
-      if (status !== "") return status;
-    }
-  }
-  return "unknown";
+/**
+ * Read the bucket a projected record carries.
+ *
+ * The whole-token vocabulary that used to live here now runs at the collection
+ * boundary, because the mapping IS the redaction: classifying in this file
+ * would mean the snapshot had to keep the response's own status text long
+ * enough for this file to read it. A record with no status field at all —
+ * a build that does not expose one — reads as "unknown" here, and
+ * `statusKnown()` below is what keeps that distinguishable from a status the
+ * collector saw and could not recognize.
+ */
+function statusOf(value: Json): StatusBucket {
+  const parsed = StatusBucketSchema.safeParse(value.status);
+  return parsed.success ? parsed.data : "unknown";
 }
 
-/** Buckets a status string can land in. Never a boolean: unknown is a value. */
-type StatusBucket =
-  | "active"
-  | "succeeded"
-  | "failed"
-  | "stale"
-  | "orphaned"
-  | "unknown";
-
-/**
- * Status vocabularies, matched whole rather than by substring.
- *
- * These were unanchored substring probes evaluated success-before-failure,
- * which laundered compound statuses into passes: "completed_with_errors" and
- * "unsuccessful" both matched /success|succeeded|completed|passed/ and were
- * counted as succeeded, so a run that failed inflated the success count and
- * left the section healthy. Whole-token matching cannot do that, and a status
- * this build does not recognize falls through to "unknown", which degrades the
- * section rather than quietly passing it.
- */
-const STATUS_VOCABULARY: ReadonlyArray<[StatusBucket, RegExp]> = [
-  // Failure is tested first so that any future overlap resolves pessimistically.
-  [
-    "failed",
-    /^(failed|failure|failing|error|errored|errors|cancel|cancelled|canceled|cancelling|aborted|abort|timeout|timed[_ -]?out|unsuccessful|rejected|crashed|killed)$/,
-  ],
-  ["stale", /^(stale|stalled)$/],
-  ["orphaned", /^(orphan|orphaned)$/],
-  [
-    "active",
-    /^(running|active|queued|pending|starting|started|in[_ -]?progress|waiting|scheduled)$/,
-  ],
-  [
-    "succeeded",
-    /^(succeeded|success|successful|completed|complete|passed|pass|ok|done|finished)$/,
-  ],
-];
-
-/** Classify one normalized status string into exactly one bucket. */
-function classifyStatus(status: string): StatusBucket {
-  for (const [bucket, pattern] of STATUS_VOCABULARY) {
-    if (pattern.test(status)) return bucket;
-  }
-  return "unknown";
+/** Whether the response carried a status field for this record at all. */
+function statusKnown(value: Json): boolean {
+  return StatusBucketSchema.safeParse(value.status).success;
 }
 
 /**
@@ -588,6 +686,21 @@ function classifyStatus(status: string): StatusBucket {
  * healthy snapshot is seconds old.
  */
 const MAX_OBSERVATION_AGE_SECONDS = 300;
+
+/**
+ * How far ahead of this host's clock an observation may be timestamped.
+ *
+ * Freshness was a one-sided test: anything not older than the budget was
+ * fresh, and a timestamp in the FUTURE has a negative age, so it passed most
+ * comfortably of all. A snapshot dated next year — a wrong clock on the
+ * observed host, or a timestamp chosen by whoever wrote the resource — could
+ * therefore keep asserting "observed moments ago" indefinitely, which is the
+ * one claim freshness exists to make honestly. A small window still absorbs
+ * ordinary clock skew between the collector and this report; past it the
+ * timestamp is not evidence of anything, so freshness is unknown rather than
+ * fresh.
+ */
+const MAX_CLOCK_SKEW_SECONDS = 60;
 
 /**
  * Derive freshness by actually comparing observedAt against now.
@@ -610,6 +723,13 @@ function freshnessOf(observedAt: string) {
     };
   }
   const ageSeconds = (Date.now() - observedMs) / 1000;
+  if (ageSeconds < -MAX_CLOCK_SKEW_SECONDS) {
+    return {
+      state: "unknown" as const,
+      reason:
+        `observation timestamp is more than ${MAX_CLOCK_SKEW_SECONDS}s ahead of this host's clock`,
+    };
+  }
   return ageSeconds > MAX_OBSERVATION_AGE_SECONDS
     ? {
       state: "stale" as const,
@@ -630,24 +750,30 @@ function unavailableState(observation: Observation): DashboardState {
   return observation.errorKind === "unauthorized" ? "unauthorized" : "partial";
 }
 
-function unavailableSection(observation: Observation, title: string) {
+function unavailableSection(
+  observation: Observation & { available: false },
+  title: string,
+) {
   const state = unavailableState(observation);
+  // Every rendered string below is derived from the errorKind enum. None of
+  // them is the stored `error` text, which this report does not read.
+  const detail = describeError(observation.errorKind);
   return DashboardSectionSchema.parse({
     id: observation.interface,
     title,
     state,
     impact: "required",
-    summary: observation.error,
+    summary: detail,
     coverage: {
       kind: "unknown",
       scope: observation.interface,
-      notes: observation.error,
+      notes: detail,
     },
     freshness: {
       state: "unknown",
-      reason: observation.error,
+      reason: detail,
     },
-    completeness: { state: "unknown", reason: observation.error },
+    completeness: { state: "unknown", reason: detail },
     metrics: [],
     facts: [{
       id: "interface-available",
@@ -665,7 +791,7 @@ function unavailableSection(observation: Observation, title: string) {
       headline: observation.errorKind === "unsupported"
         ? "Interface unsupported"
         : "Interface unavailable",
-      detail: observation.error,
+      detail,
       source: "@jpisgeek/swamp-observability",
       suppressed: false,
       suppressReason: "",
@@ -701,7 +827,7 @@ function historySection(
       counts.orphaned++;
       continue;
     }
-    counts[classifyStatus(statusOf(entry))]++;
+    counts[statusOf(entry)]++;
   }
   const state: DashboardState = parsed.rejected > 0
     ? "partial"
@@ -816,7 +942,7 @@ function reportsSection(observation: Observation) {
   // status field on report search results at all? It answers presence, and it
   // is the correct gate for the "status not exposed by this build" path below.
   const hasStatus = entries.length > 0 &&
-    entries.every((entry) => statusOf(entry) !== "unknown");
+    entries.every((entry) => statusKnown(entry));
   // Once status is exposed, the VALUE has to be read. Every branch in this
   // section used to key off hasStatus alone, so an inventory in which every
   // stored report carried status "failed" rendered state "healthy", summary
@@ -832,7 +958,7 @@ function reportsSection(observation: Observation) {
     unknown: 0,
   };
   if (hasStatus) {
-    for (const entry of entries) counts[classifyStatus(statusOf(entry))]++;
+    for (const entry of entries) counts[statusOf(entry)]++;
   }
   // Anything neither finished-well nor still-running. Kept as one number so a
   // status this build does not recognize degrades the section instead of being
@@ -992,13 +1118,58 @@ function doctorSection(observation: Observation) {
   if (!observation.available) {
     return unavailableSection(observation, "Run diagnostics");
   }
-  const payload = isJson(observation.payload) ? observation.payload : {};
-  const number = (key: string) =>
-    typeof payload[key] === "number" ? payload[key] : undefined;
+  const payload =
+    (isJson(observation.payload) ? observation.payload : {}) as Json;
+  /**
+   * A diagnostic count is a nonnegative integer, and anything else is an
+   * absent count rather than a number to do arithmetic with.
+   *
+   * The test was `typeof payload[key] === "number"`, which accepts -1, 0.5,
+   * NaN and 1e308. That is not pedantry: with `stale: -1, orphaned: 0` every
+   * count was "present", so the completeness check saw a complete response,
+   * `(stale ?? 0) + (orphaned ?? 0) > 0` was false, and a run doctor result
+   * that never described a healthy repository rendered as healthy with an
+   * exact coverage claim. Treating the value as unavailable instead makes the
+   * section partial and says a count is missing, which is the truth.
+   */
+  const number = (key: string) => {
+    const value = payload[key];
+    return typeof value === "number" && Number.isSafeInteger(value) &&
+        value >= 0
+      ? value
+      : undefined;
+  };
   const stale = number("stale");
   const orphaned = number("orphaned");
   const active = number("active");
   const tracked = number("totalTracked");
+  /**
+   * Each count was checked on its own and never against the others, so
+   * `totalTracked: 1, active: 5, stale: 0, orphaned: 0` passed every test and
+   * rendered healthy with exact coverage — a snapshot describing an impossible
+   * repository, presented as a clean bill. active, stale and orphaned each
+   * name a subset of the tracked runs, so none of them can exceed
+   * totalTracked; a snapshot where one does is not a diagnosis with a bad
+   * number in it, it is not a diagnosis at all.
+   *
+   * The pairwise ceiling is asserted rather than the sum, because a run can
+   * legitimately be counted under more than one heading and a sum rule would
+   * reject honest responses.
+   */
+  const impossible = tracked !== undefined &&
+    [active, stale, orphaned].some((value) =>
+      value !== undefined && value > tracked
+    );
+  if (impossible) {
+    return unavailableSection({
+      interface: "run-doctor",
+      available: false,
+      observedAt: observation.observedAt,
+      errorKind: "invalid-response",
+      error: "",
+      payload: null,
+    }, "Run diagnostics");
+  }
   const incomplete = [stale, orphaned, active, tracked].some((value) =>
     value === undefined
   );
@@ -1110,9 +1281,17 @@ function doctorSection(observation: Observation) {
  * A snapshot this version cannot read is a coverage gap for that one
  * interface, and is now surfaced as one.
  */
-async function readObservations(ctx: ReportContext): Promise<Observation[]> {
+const MAX_DATA_HANDLES = 16;
+
+async function readObservations(ctx: ReportContext): Promise<{
+  observations: Observation[];
+  omitted: number;
+}> {
+  // Slice before any repository read or record parsing. Five interface records
+  // are expected; the bounded allowance also lets duplicate detection operate.
+  const handles = ctx.dataHandles.slice(0, MAX_DATA_HANDLES);
   const observations: Observation[] = [];
-  for (const handle of ctx.dataHandles) {
+  for (const handle of handles) {
     if (
       handle.specName !== "observation" && !handle.name.startsWith("interface-")
     ) continue;
@@ -1124,9 +1303,16 @@ async function readObservations(ctx: ReportContext): Promise<Observation[]> {
         handle.version,
       );
       if (!content) continue;
-      observations.push(
-        ObservationSchema.parse(JSON.parse(new TextDecoder().decode(content))),
+      if (content.byteLength > 4 * 1024 * 1024) {
+        throw new Error("observation exceeds size limit");
+      }
+      const item = ObservationSchema.parse(
+        JSON.parse(new TextDecoder().decode(content)),
       );
+      if (handle.name !== `interface-${item.interface}`) {
+        throw new Error("observation identity mismatch");
+      }
+      observations.push(item);
     } catch {
       // The interface name lives in the handle, so an unreadable snapshot can
       // still be attributed. When it cannot be, fall through: normalize()'s
@@ -1141,13 +1327,14 @@ async function readObservations(ctx: ReportContext): Promise<Observation[]> {
         available: false,
         observedAt: new Date().toISOString(),
         errorKind: "invalid-response",
-        error:
-          "The stored interface snapshot could not be read or parsed by this report version",
+        // Empty on purpose: the displayed sentence comes from errorKind through
+        // describeError(), so this field is never the source of rendered text.
+        error: "",
         payload: null,
       });
     }
   }
-  return observations;
+  return { observations, omitted: ctx.dataHandles.length - handles.length };
 }
 
 /** Normalize a completed observe execution into dashboard bundle v1. */
@@ -1155,20 +1342,35 @@ export async function normalize(
   ctx: ReportContext,
 ): Promise<DashboardBundleV1> {
   if (String(ctx.modelType) !== "@jpisgeek/swamp-observability") {
+    // The rejected type is deliberately NOT in the message. A model type names
+    // an extension the operator has installed — often a private one — and a
+    // misconfiguration is exactly how this branch is reached, so interpolating
+    // it wrote that name into whatever log or stored failure caught the throw.
+    // The only type this report accepts is fixed and already public, so naming
+    // it costs nothing and identifies the fault just as well.
     throw new Error(
-      `unsupported Swamp observability source ${String(ctx.modelType)}`,
+      "unsupported Swamp observability source: this report normalizes @jpisgeek/swamp-observability executions only",
     );
   }
-  const observations = await readObservations(ctx);
-  const byName = new Map(observations.map((item) => [item.interface, item]));
-  const missing = (name: Observation["interface"]): Observation => ({
+  const { observations, omitted } = await readObservations(ctx);
+  const byName = new Map<Observation["interface"], Observation>();
+  const duplicated = new Set<Observation["interface"]>();
+  for (const item of observations) {
+    if (byName.has(item.interface)) duplicated.add(item.interface);
+    byName.set(item.interface, item);
+  }
+  const missing = (
+    name: Observation["interface"],
+  ): Observation & { available: false } => ({
     interface: name,
     available: false,
     observedAt: new Date().toISOString(),
     errorKind: "invalid-response",
-    error: "The collector did not return this required interface snapshot",
+    error: "",
     payload: null,
   });
+  for (const name of duplicated) byName.set(name, missing(name));
+  const heartbeat = byName.get("serve-heartbeat");
   const sections = [
     historySection(
       byName.get("run-history") ?? missing("run-history"),
@@ -1183,21 +1385,84 @@ export async function normalize(
     ),
     reportsSection(byName.get("stored-reports") ?? missing("stored-reports")),
     unavailableSection(
-      byName.get("serve-heartbeat") ?? missing("serve-heartbeat"),
+      // There is no public heartbeat query, so a snapshot claiming this
+      // interface was available is not evidence of anything: it is refused the
+      // same way a snapshot that failed to parse is.
+      heartbeat !== undefined && !heartbeat.available
+        ? heartbeat
+        : missing("serve-heartbeat"),
       "Serve heartbeat",
     ),
   ];
+  if (omitted > 0) {
+    const detail =
+      `Only the first ${MAX_DATA_HANDLES} data handles were inspected; ${omitted} handles were omitted by the report limit.`;
+    sections.push(DashboardSectionSchema.parse({
+      id: "observation-coverage",
+      title: "Observation coverage",
+      state: "partial",
+      impact: "required",
+      summary: detail,
+      coverage: {
+        kind: "unknown",
+        scope: "execution data handles",
+        notes: detail,
+      },
+      freshness: { state: "unknown", reason: detail },
+      completeness: {
+        state: "partial",
+        observed: MAX_DATA_HANDLES,
+        expected: ctx.dataHandles.length,
+        reason: detail,
+      },
+      metrics: [],
+      facts: [],
+      exceptions: [{
+        id: "swamp:observations:handle-limit",
+        severity: "warning",
+        subject: "Observation coverage",
+        headline: "Execution data handle limit exceeded",
+        detail,
+        source: "@jpisgeek/swamp-observability",
+        suppressed: false,
+        suppressReason: "",
+        sensitivity: "operational",
+      }],
+      references: [],
+      sensitivity,
+    }));
+  }
+  const namespace = createHash("sha256").update(JSON.stringify([
+    "swamp-observability/v1",
+    String(ctx.modelType),
+    ctx.modelId,
+  ])).digest("hex");
+  for (const section of sections) {
+    section.id = `swamp-${namespace}:${section.id}`;
+    for (const finding of section.exceptions) {
+      finding.id = `swamp-${namespace}:${finding.id}`;
+    }
+  }
   const bundle = {
     schemaVersion: DASHBOARD_BUNDLE_VERSION,
-    id: "swamp-observability",
+    id: `swamp-observability:${namespace}`,
     title: "Swamp observability",
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/dashboard-swamp",
-      extensionVersion: "2026.08.25.2",
+      extensionVersion: "2026.09.05.1",
       modelType: String(ctx.modelType),
-      modelName: ctx.definition.name,
-      modelId: ctx.modelId,
+      // Fixed, not `ctx.definition.name`, and no `modelId` at all.
+      //
+      // Those two fields named the operator's own model instance — whatever
+      // they called it in their workflow file, plus the instance UUID — inside
+      // a stored report artifact that is meant to be publishable and is handed
+      // to renderers. The bundle needs to say WHAT produced it so a consumer
+      // can trust the shape; it never needed to say WHICH deployment, and the
+      // contract makes modelId optional precisely so a producer can decline.
+      // The instance identifiers are still used to READ the snapshots below —
+      // they just never leave this function.
+      modelName: "swamp-observability",
       dataName: "report-jpisgeek-dashboard-swamp-json",
       reportName: "@jpisgeek/dashboard-swamp",
     },

@@ -1,3 +1,15 @@
+publicationNote: >-
+  for the repository's security review requirements. This version is shared as
+  GitHub source and is not published to the Swamp registry.
+install: |
+  Clone this GitHub repository and register this extension's source in your Swamp repo.
+  Replace the example path with the canonical location of your clone:
+
+  ```sh
+  swamp extension source add /example/slog-bog/dashboard-lmstudio --only reports
+  ```
+
+  This repaired version is distributed through GitHub source, not a registry release.
 package: "@jpisgeek/dashboard-lmstudio"
 purpose: >-
   Normalizes scoped @jpisgeek/lmstudio endpoint, remote headless-daemon, and request-probe output into
@@ -6,15 +18,20 @@ purpose: >-
   distinct. Token and timing values retain their actual units and one probe is
   never presented as aggregate runtime accounting.
 example: |
-  # Require this report on any @jpisgeek/lmstudio model definition.
-  reports:
-    require:
-      - '@jpisgeek/dashboard-lmstudio'
+  # <your-lmstudio-model-name> is a placeholder for the name YOU give the
+  # @jpisgeek/lmstudio model definition this report runs on. Use your own.
+  models:
+    - name: <your-lmstudio-model-name>
+      type: "@jpisgeek/lmstudio/probe"
+      reports:
+        require:
+          - '@jpisgeek/dashboard-lmstudio'
 
-  # After a probe runs, pass its exact report artifact to the renderer:
+  # After that model's probe runs, pass its report artifact to the renderer,
+  # naming the same model definition:
   globalArguments:
     bundles:
-      - ${{ data.latest("lmstudio-probe", "report-jpisgeek-dashboard-lmstudio-json").attributes }}
+      - ${{ data.latest("<your-lmstudio-model-name>", "report-jpisgeek-dashboard-lmstudio-json").attributes }}
 caveats: >-
   Each report describes exactly one endpoint, daemon, or request-probe execution. A
   completion bundle uses observed-traffic coverage with accountingScope
@@ -24,16 +41,30 @@ caveats: >-
   runtime ledger requires instrumenting all traffic or a trustworthy aggregate
   runtime source. Model and loaded-model inventories are enumerated as facts
   only up to 200 entries: the count metric stays exact, completeness turns
-  partial, and a truncation exception names how many entries were cut.
-  Untrusted strings from the endpoint are clamped before they reach a fact,
-  summary, or exception, and a clamped value ends in [truncated]. A reasoning
-  token count the model never reported is reported as unknown for that reason
-  alone, not as a failed request.
+  partial, and a truncation exception names how many entries were cut. A source
+  resource over 1 MiB is refused before it is decoded, and reported as a
+  partial observation naming its size rather than parsed. A source record whose
+  fields contradict each other — an empty error kind with a 500 status, a
+  stopped daemon holding loaded models — is rejected as an invalid record
+  rather than believed. Untrusted strings from the endpoint are screened and
+  clamped before they reach a fact, summary, or exception, and a clamped value
+  ends in [truncated]. A reasoning token count the model never reported is
+  reported as unknown for that reason alone, not as a failed request.
 security: >-
   This report performs no network, process, environment, or vault operations.
-  It reads only the data handles from the scoped LM Studio execution. The API
-  token and caller prompt are not present in those resources. Model identifiers,
-  HTTP status, timings, usage counts, and capability findings are operational
-  metadata. Classified collector errors can also retain a sanitized endpoint
-  hostname or URL without userinfo or query parameters; protect stored reports
-  and rendered dashboards accordingly.
+  It reads only the data handles from the scoped LM Studio execution. Model
+  identifiers, HTTP status, timings, usage counts, and capability findings are
+  operational metadata and remain private to the repository's reports.
+  Collector diagnostic prose is discarded entirely, including short unlabelled
+  values that cannot be recognized by credential patterns. Repository read and
+  parse failures become fixed coverage messages without quoting their errors.
+  Model identifiers and finish-reason text are stripped of controls and screened
+  for credential, URL, filesystem-path, address, and hostname shapes, then
+  clamped; this reduces accidental disclosure but is not a guarantee that
+  operator-chosen model identifiers contain no sensitive information.
+  Source model names and IDs are omitted from the producer metadata. Stable
+  source identity is instead derived from a SHA-256 digest of an unambiguous
+  tuple. The bundle records those omissions and every text transformation in
+  sensitivity.fields and sensitivity.redacted. Protect stored reports and
+  rendered dashboards as operational inventory; redaction is not publication
+  authorization.

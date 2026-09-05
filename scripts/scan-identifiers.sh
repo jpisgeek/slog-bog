@@ -21,7 +21,7 @@
 #
 # Generic rules (always on):
 #   ip-private      RFC 1918, loopback, link-local, CGNAT, IPv6 ULA/link-local
-#   host-local      localhost, *.local, *.lan, *.internal, *.home.arpa
+#   host-local      *.local, *.lan, *.internal, *.home.arpa
 #   path-local      /Users/, /home/, /Volumes/, /private/, C:\Users\, file://
 #   secret-shape    AWS access keys, GitHub/OpenAI-style tokens, PEM blocks,
 #                   Slack tokens, "Bearer <long>", password=/secret= literals
@@ -114,7 +114,7 @@ rule_names=(
 )
 rule_regex=(
   # ip-private: 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, 100.64/10, fc00::/7, fe80::/10
-  '(^|[^0-9.])(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|169\.254\.[0-9]{1,3}\.[0-9]{1,3}|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3})([^0-9.]|$)|(^|[^0-9a-fA-F:])(f[cd][0-9a-fA-F]{2}:|fe80:)'
+  '(^|[^0-9.])(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|169\.254\.[0-9]{1,3}\.[0-9]{1,3}|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3})(/[0-9]{1,3})?([^0-9.]|$)|(^|[^0-9a-fA-F:])(f[cd][0-9a-fA-F]{2}:|fe80:)'
   # host-local
   '(^|[^A-Za-z0-9.-])localhost([^A-Za-z0-9-]|$)|[A-Za-z0-9-]+\.(local|lan|internal|home\.arpa)([^A-Za-z0-9.-]|$)'
   # path-local (/home/linuxbrew/, the public Linuxbrew prefix, is filtered
@@ -140,9 +140,12 @@ post_filter() {
     email) grep -a -v -E -i '@([a-z0-9-]+\.)*example\.[a-z]+$|@localhost$' || true ;;
     path-local) grep -a -v -E '/home/linuxbrew($|[^A-Za-z0-9._-])' || true ;;
     userinfo-url) grep -a -v -E '://user:pass@$' || true ;;
-    # bare loopback is a documentation idiom (e.g. an agent reached over SSH);
-    # it identifies nothing. Any other 127.x address still fires.
-    ip-private) grep -a -v -E '(^|[^0-9.])127\.0\.0\.1([^0-9.]|$)' || true ;;
+    # Standard loopback names and the canonical loopback block describe public
+    # protocol constants, not an operator's fleet. Individual noncanonical
+    # addresses and local-domain names still fire. Matching the complete CIDR
+    # keeps other prefix lengths from inheriting the canonical /8 exception.
+    ip-private) grep -a -v -E '(^|[^0-9.])127\.0\.0\.1([^0-9.]|$)|(^|[^0-9.])127\.0\.0\.0/8([^0-9A-Za-z./]|$)' || true ;;
+    host-local) grep -a -v -E '(^|[^A-Za-z0-9.-])localhost([^A-Za-z0-9.-]|$)' || true ;;
     *) cat ;;
   esac
 }

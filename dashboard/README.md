@@ -8,14 +8,20 @@ discovery and reaches no network. Missing, invalid, stale, partial, unsupported,
 and unauthorized inputs remain visible. Each exception is also written as a
 queryable resource.
 
-**Version** `2026.08.25.2` · **License** MIT · **Source**
+**Version** `2026.09.05.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/dashboard
 
 ## Install
 
+Clone this GitHub repository and register this extension's source in your Swamp
+repo. Replace the example path with the canonical location of your clone:
+
+```sh
+swamp extension source add /example/slog-bog/dashboard --only models
 ```
-swamp extension pull @jpisgeek/dashboard
-```
+
+This repaired version is distributed through GitHub source, not a registry
+release.
 
 ## `@jpisgeek/dashboard`
 
@@ -64,7 +70,18 @@ globalArguments:
 The renderer accepts bundle v1 only. Unsupported major versions and invalid
 values render as visible coverage exceptions instead of aborting or becoming
 healthy. It does not enumerate models or infer which adapters are installed.
-Delivery remains separate: compose the generated file with the transport model
+Input validation is limited to 64 bundles, 50,000 values and 2 MiB of text per
+bundle, and depth 32. Array length is checked before entries are read, and
+object values are visited only while the remaining budget allows them. Oversized
+or cyclic inputs become explicit invalid coverage. Duplicate section IDs or
+duplicate exception IDs within a bundle reject that bundle with a critical
+coverage exception. Exception resource names and shortened IDs use SHA-256 so
+distinct conditions cannot be merged by a practical 32-bit hash collision. The
+output file is overwritten each render at the operator-configured outputPath.
+Cleanup accepts only validated prior render metadata and current SHA-256
+exception resource names. Invalid or legacy metadata skips cleanup and displays
+a warning; it never supplies arbitrary resource deletion targets. Delivery
+remains separate: compose the generated file with the transport model
 appropriate for the deployment.
 
 ## Security
@@ -75,4 +92,5 @@ does not itself enforce access control; protect any published dashboard
 according to the operational data it contains.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the release gates every version passes before it reaches the registry.
+for the repository's security review requirements. This version is shared as
+GitHub source and is not published to the Swamp registry.

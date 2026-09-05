@@ -1,3 +1,15 @@
+publicationNote: >-
+  for the repository's security review requirements. This version is shared as
+  GitHub source and is not published to the Swamp registry.
+install: |
+  Clone this GitHub repository and register this extension's source in your Swamp repo.
+  Replace the example path with the canonical location of your clone:
+
+  ```sh
+  swamp extension source add /example/slog-bog/dashboard-homelab --only reports
+  ```
+
+  This repaired version is distributed through GitHub source, not a registry release.
 package: "@jpisgeek/dashboard-homelab"
 purpose: >-
   Normalizes scoped execution output from the local @jpisgeek/netdata,
@@ -14,24 +26,90 @@ example: |
   # After the collector method runs, pass its exact stored JSON artifact:
   globalArguments:
     bundles:
-      - ${{ data.latest("netdata", "report-jpisgeek-dashboard-homelab-json").attributes }}
+      - ${{ data.latest("<your-collector-model-name>", "report-jpisgeek-dashboard-homelab-json").attributes }}
 caveats: >-
   This package observes only the data handles produced by the collector
-  execution it is attached to. Firewalla filtered runs declare filtered
+  execution it is attached to. At most 5,000 handles are read and each record
+  is limited to 1 MiB before JSON decoding; overflow remains a visible coverage
+  rejection. Firewalla filtered runs declare filtered
   coverage, and the Firewalla device count and online count are cross-checked
-  against the published device records; an inventory rollup the device records
-  do not corroborate is reported as coverage drift and its online metric drops
-  below exact confidence. TrueNAS alerts remain independent from certificate
-  exceptions because the current alert resource exposes no stable certificate
-  identity. The report never guesses a match from message text or list order.
-  An alert dismissed in the TrueNAS UI still counts toward section and bundle
-  state; the dismissal is reported as detail, never as suppression. An alert
-  level outside the recognized vocabulary, including an empty one, is treated
-  as a warning and named in the exception rather than filed as information.
-security: >-
-  The report performs no network, process, environment, or vault operations.
-  It reads only scoped Swamp execution data through the public report context.
-  Source validation errors contain resource names and validation classes, not
-  source payloads. Bundle contents are classified operational and may include
-  host, pool, mount, certificate, machine, and network names; protect rendered
-  dashboards accordingly.
+  against the published device records. Only a rollup the device records
+  corroborate is published as an observed count: a rollup they contradict, and
+  a rollup with no device records beside it at all, are reported as coverage
+  drift with `devices.online` emitted as an unavailable metric carrying no
+  value. Unmeasured and zero are different states — an inventory of zero
+  devices with no device records cannot be told apart from a device scan whose
+  records never landed, so it is reported as unmeasured coverage rather than
+  as a healthy zero. An inventory whose counts cannot be true (negative,
+  fractional, more online than total, online and offline not summing to the
+  total) fails validation and is rejected rather than published. TrueNAS
+  alerts remain independent from certificate exceptions because the current
+  alert resource exposes no stable certificate identity. The report never
+  guesses a match from message text or list order. An alert dismissed in the
+  TrueNAS UI still counts toward section and bundle state; the dismissal is
+  reported as detail, never as suppression. An alert level outside the
+  recognized vocabulary, including an empty one, is treated as a warning and
+  named in the exception rather than filed as information.
+security: |
+  **Access.** The report performs no network, process, environment, or vault
+  operations. It reads only scoped Swamp execution data through the public
+  report context.
+
+  **What is written.** Both outputs — the Markdown summary and the persisted
+  JSON bundle — are classified `operational`, and the JSON carries producer
+  identifiers and diagnostic detail beyond what the Markdown renders. Every
+  bundle names its producer: `extension`, `extensionVersion`, `modelType`,
+  `modelName` (the Swamp model definition name you chose), `dataName`,
+  `reportName`, the generation timestamp, and a bundle `id` of the form
+  `<section>-observability:<32 hex>`. The collector's Swamp model ID is *not*
+  emitted; the hex half of the bundle id is a one-way SHA-256 namespace
+  derived from the model type and model ID, and every record identifier in the
+  bundle is derived under that namespace, so identifiers are stable per
+  collector instance without disclosing the ID itself.
+
+  **Fields carried out of the collectors.** Netdata: `node.name`,
+  `alarm.node`, `alarm.name`, `alarm.status` (as the mapped severity, and
+  verbatim when it is outside the mapped vocabulary), `alarm.value`,
+  `alarm.units`, `mount.node`, `mount.mount`, `mount.usedPercent`,
+  `summary.nodes`, `summary.nodesReachable`. TrueNAS: `pool.name`,
+  `pool.status`, `pool.usedPercent`, `certificate.name`,
+  `certificate.daysRemaining`, `certificate.notAfter` (re-rendered from the
+  parsed instant, never the source string), `alert.klass`, `alert.level` (as
+  the mapped severity, and verbatim when it is outside the mapped
+  vocabulary), `alert.silenced` (reported as "dismissed in the TrueNAS UI"),
+  `summary.pools`, `summary.poolsUnhealthy`. Firewalla: `machine.name`,
+  `machine.networks`, `device.online` (as the online device-record count in
+  the coverage-drift detail), `inventory.networks`, `inventory.online`,
+  `inventory.total`. Field names are the collector's own record keys, so this
+  list can be diffed against the collector schemas directly. That is the whole
+  list, and it is also what each section's `sensitivity.fields` reports. Treat
+  it with the sensitivity of your infrastructure inventory.
+
+  **Free text is never carried out.** No collector-supplied prose reaches
+  either output. Repository read errors, JSON parse errors and schema
+  validation errors are reduced to enumerated classes
+  (`unknown-resource-type`, `repository-read-failed`, `content-unavailable`,
+  `invalid-json`, `schema-validation-failed`, `record-size-limit-exceeded`,
+  `record-count-limit-exceeded`) attached to an opaque digest of
+  the failing data handle — the handle name and the thrown message are not
+  published, because a read error routinely carries a storage URL, a
+  filesystem path, or the credential the request was rejected for. An
+  unreachable node's `error` field is matched against a fixed pattern list and
+  reported only as one class from that list, such as `request timed out` or
+  `TLS failure`. A Netdata alarm's `info` and a TrueNAS alert's `formatted`
+  message are validated as part of the record and then dropped entirely; the
+  numeric reading, the mapped severity and the dismissal state are reported in
+  their place. `sensitivity.redacted` is `true` on every bundle and section to
+  record that.
+
+  **Names are allow-listed, not filtered.** The names above are the one class
+  of source-controlled text that still publishes, so each passes a structural
+  allow-list before it is emitted: at most 96 characters, no control
+  characters, no URL scheme, `@`, `=`, `?` or `&`, no word that labels a
+  secret, and no unbroken 32-character run of token alphabet. A name that
+  fails any of those is replaced with a marker beginning `(withheld:` — the
+  exception itself is still published, and its
+  identifier still distinguishes the record, so a withheld name loses
+  legibility rather than the finding. The trade cuts the other way
+  occasionally: a legitimate mount path with a long hash segment is withheld
+  too.
