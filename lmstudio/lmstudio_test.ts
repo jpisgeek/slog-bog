@@ -14,10 +14,10 @@ import { assertEquals } from "jsr:@std/assert@1";
 import { model as endpoint } from "./lmstudio_endpoint.ts";
 import { model as probe } from "./lmstudio_probe.ts";
 import {
+  type CommandRunner,
   MAX_OUTPUT_BYTES,
   model as daemon,
   runCommandForTest,
-  setCommandRunnerForTest,
 } from "./lmstudio_daemon.ts";
 
 const OK = {
@@ -206,7 +206,7 @@ Deno.test("completionProbe: absent usage remains unknown rather than zero", () =
   assertEquals(parsed.success, true);
 });
 
-Deno.test("health: reachable and authorized are independent booleans", () => {
+Deno.test("health: reachable and authorized are independent", () => {
   // "up but rejecting the token" must be representable distinctly from "down".
   const upButUnauthorized = {
     reachable: true,
@@ -219,8 +219,8 @@ Deno.test("health: reachable and authorized are independent booleans", () => {
   };
   const down = {
     reachable: false,
-    authorized: false,
-    httpStatus: 0,
+    authorized: null,
+    httpStatus: null,
     latencyMs: 0,
     errorKind: "unreachable",
     error: "refused",
@@ -247,13 +247,42 @@ Deno.test("the two model types are distinct", () => {
 
 Deno.test("published models migrate existing arguments without mutation", () => {
   for (const model of [endpoint, probe]) {
-    assertEquals(model.version, "2026.08.25.1");
-    assertEquals(model.upgrades.at(-1)?.toVersion, model.version);
-    const old = { ...OK, timeoutSec: 30 };
-    assertEquals(model.upgrades.at(-1)?.upgradeAttributes(old), old);
+    assertEquals(model.version, "2026.09.05.1");
+    assertEquals(model.upgrades.map((upgrade) => upgrade.toVersion), [
+      "2026.08.25.1",
+      model.version,
+    ]);
+    for (const sourceVersion of ["2026.08.23.1", "2026.08.25.1"]) {
+      const old = Object.freeze({ ...OK, timeoutSec: 30 });
+      const applicable = model.upgrades.filter((upgrade) =>
+        upgrade.toVersion > sourceVersion
+      );
+      assertEquals(applicable.at(-1)?.toVersion, model.version);
+      const migrated = applicable.reduce(
+        (args, upgrade) => upgrade.upgradeAttributes(args),
+        old as Record<string, unknown>,
+      );
+      assertEquals(migrated, old);
+      assertEquals(model.globalArguments.safeParse(migrated).success, true);
+    }
   }
-  assertEquals(daemon.version, "2026.08.25.1");
-  assertEquals("upgrades" in daemon, false);
+  assertEquals(daemon.version, "2026.09.05.1");
+  assertEquals(daemon.upgrades.at(-1)?.toVersion, daemon.version);
+});
+
+Deno.test("daemon migration preserves destinations and leaves unsafe remote hosts rejected", () => {
+  const migrate = daemon.upgrades.at(-1)!.upgradeAttributes;
+  for (
+    const [host, accepted] of [
+      ["127.0.0.1:1234", true],
+      ["daemon.example.com:1234", false],
+    ] as const
+  ) {
+    const old = Object.freeze({ lmsBinary: "lms", timeoutMs: 5000, host });
+    const migrated = migrate(old);
+    assertEquals(migrated, old);
+    assertEquals(daemon.globalArguments.safeParse(migrated).success, accepted);
+  }
 });
 
 Deno.test("completion rejects a malformed 2xx envelope", async () => {
@@ -337,28 +366,26 @@ Deno.test("completion rejects an empty finish reason", async () => {
 });
 
 async function runDaemon(
-  runner: Parameters<typeof setCommandRunnerForTest>[0],
+  runner: CommandRunner,
   signal: AbortSignal = new AbortController().signal,
 ) {
-  setCommandRunnerForTest(runner);
   let written: unknown;
-  try {
-    await daemon.methods.observe.execute({}, {
-      globalArgs: {
-        lmsBinary: "lms",
-        host: "inference.example.com",
-        timeoutMs: 100,
-      },
-      signal,
-      writeResource: (_spec: string, _name: string, value: unknown) => {
-        written = value;
-        return Promise.resolve({ name: "daemon" });
-      },
-    });
-    return written as Record<string, unknown>;
-  } finally {
-    setCommandRunnerForTest();
-  }
+  await daemon.methods.observe.execute({}, {
+    globalArgs: {
+      lmsBinary: "lms",
+      // Remote CLI mode is reached through the local end of an encrypted
+      // tunnel; a directly named remote host no longer parses at all.
+      host: "127.0.0.1:1234",
+      timeoutMs: 100,
+    },
+    signal,
+    commandRunner: runner,
+    writeResource: (_spec: string, _name: string, value: unknown) => {
+      written = value;
+      return Promise.resolve({ name: "daemon" });
+    },
+  });
+  return written as Record<string, unknown>;
 }
 
 Deno.test("daemon: remote lms ps records loaded models", async () => {
@@ -380,7 +407,7 @@ Deno.test("daemon: remote lms ps records loaded models", async () => {
   assertEquals(argv, [
     "ps",
     "--host",
-    "inference.example.com",
+    "127.0.0.1:1234",
     "--json",
   ]);
   assertEquals(value.loadedModelCount, 1);
@@ -389,24 +416,20 @@ Deno.test("daemon: remote lms ps records loaded models", async () => {
 });
 
 Deno.test("daemon: local headless deployment does not invent a host", async () => {
-  setCommandRunnerForTest((_binary, args) => {
-    assertEquals(args, ["ps", "--json"]);
-    return Promise.resolve({
-      success: true,
-      code: 0,
-      stdout: "[]",
-      stderr: "",
-    });
+  await daemon.methods.observe.execute({}, {
+    globalArgs: { lmsBinary: "lms", timeoutMs: 100 },
+    signal: new AbortController().signal,
+    commandRunner: (_binary, args) => {
+      assertEquals(args, ["ps", "--json"]);
+      return Promise.resolve({
+        success: true,
+        code: 0,
+        stdout: "[]",
+        stderr: "",
+      });
+    },
+    writeResource: () => Promise.resolve({ name: "daemon" }),
   });
-  try {
-    await daemon.methods.observe.execute({}, {
-      globalArgs: { lmsBinary: "lms", timeoutMs: 100 },
-      signal: new AbortController().signal,
-      writeResource: () => Promise.resolve({ name: "daemon" }),
-    });
-  } finally {
-    setCommandRunnerForTest();
-  }
 });
 
 Deno.test("daemon: successful empty list is measured zero", async () => {
@@ -474,7 +497,7 @@ Deno.test("daemon: missing CLI and timeout are not false zeroes", async () => {
 Deno.test("daemon model supports local headless and safe remote hosts", () => {
   assertEquals(daemon.globalArguments.safeParse({}).success, true);
   assertEquals(
-    daemon.globalArguments.safeParse({ host: "inference.example.com" }).success,
+    daemon.globalArguments.safeParse({ host: "127.0.0.1:1234" }).success,
     true,
   );
   assertEquals(
@@ -482,6 +505,93 @@ Deno.test("daemon model supports local headless and safe remote hosts", () => {
     false,
   );
   assertEquals(daemon.type, "@jpisgeek/lmstudio/daemon");
+});
+
+// ---------------------------------------------------------------------------
+// GATE BLOCK 7 -- "Remote daemon mode delegates networking to `lms --host`
+// without establishing or enforcing encrypted transport."
+//
+// `lms --host` speaks cleartext and offers no TLS. Naming a remote host
+// directly puts the daemon exchange on the wire unprotected, on a link this
+// code cannot inspect. The only remote configuration whose confidentiality
+// can be asserted is one whose encryption is already terminated locally --
+// WireGuard, ssh -L, stunnel -- and all of those present as loopback.
+// ---------------------------------------------------------------------------
+
+Deno.test("daemon: a directly named remote host is refused, loopback is not", () => {
+  for (
+    const host of [
+      "inference.example.com",
+      "10.0.0.4",
+      "10.0.0.4:1234",
+      "192.168.1.10:1234",
+      "127.0.0.1.example.com",
+      "[2001:db8::1]:1234",
+    ]
+  ) {
+    assertEquals(
+      daemon.globalArguments.safeParse({ host }).success,
+      false,
+      `CLEARTEXT REMOTE — accepted a host lms would reach unencrypted: ${host}`,
+    );
+  }
+  // The tunnel-endpoint spellings an operator actually uses must still work,
+  // or the guard has removed the feature rather than secured it.
+  for (
+    const host of [
+      "localhost",
+      "localhost:1234",
+      "127.0.0.1",
+      "127.0.0.1:1234",
+      "127.0.0.2:1234",
+      "::1",
+      "[::1]:1234",
+    ]
+  ) {
+    assertEquals(
+      daemon.globalArguments.safeParse({ host }).success,
+      true,
+      `rejected a local tunnel endpoint: ${host}`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GATE BLOCK 6 -- "The configurable child executable is spawned without
+// clearing or explicitly limiting its environment, exposing inherited runtime
+// environment values to it."
+//
+// `lmsBinary` is operator-configured, and Deno.Command hands a child the
+// entire parent environment by default -- so every secret the swamp runtime
+// holds in env was being passed to an arbitrary executable.
+// ---------------------------------------------------------------------------
+
+Deno.test("daemon runner: the child inherits nothing but the allowlist", async () => {
+  const key = "LMSTUDIO_TEST_INHERITED_SECRET";
+  const marker = "canary-value-not-real";
+  Deno.env.set(key, marker);
+  try {
+    const controller = new AbortController();
+    const result = await runCommandForTest("/bin/sh", [
+      "-c",
+      // `env` prints the child's whole environment: what it does NOT contain
+      // is the assertion. PATH is checked too -- clearing the environment must
+      // not leave `lms` unable to resolve its own runtime.
+      "env",
+    ], controller.signal);
+    assertEquals(
+      result.stdout.includes(marker),
+      false,
+      "ENV LEAK — the spawned binary inherited a value from the runtime",
+    );
+    assertEquals(
+      result.stdout.includes("PATH="),
+      true,
+      "the documented allowlist must still reach the child",
+    );
+  } finally {
+    Deno.env.delete(key);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -837,6 +947,9 @@ async function runMethod(
   args: Record<string, unknown>,
   queue: (() => Response)[],
   signal: AbortSignal = new AbortController().signal,
+  // Overridable so a test can configure a token of its own -- the redaction
+  // boundary tests below turn on the token's length and spelling.
+  globalArgs: Record<string, unknown> = OK,
 ): Promise<RunOutcome> {
   const originalFetch = globalThis.fetch;
   const outcome: RunOutcome = { calls: 0 };
@@ -848,7 +961,7 @@ async function runMethod(
   };
   try {
     await execute(args, {
-      globalArgs: OK,
+      globalArgs,
       signal,
       logger: { info: () => {}, warning: () => {} },
       writeResource: (
@@ -1364,4 +1477,484 @@ Deno.test("daemon: a truncated payload that happens to parse is still refused", 
     "invalid-response",
     "a prefix that parses is a wrong answer, not a whole one",
   );
+});
+
+// ---------------------------------------------------------------------------
+// GATE FINDING 1 -- "Redaction truncates remote text before searching for the
+// token. A token longer than 4096 characters that is echoed at the beginning
+// of a response will not match and its prefix can enter an error or
+// resource."  Evidence: `redact(text.slice(0, 4096), token)`.
+//
+// The defect was an ordering one: the body was CUT first and searched for the
+// credential afterwards, so any cut that split the token defeated split().
+// Screening ran after redaction for the same reason, which let a token echoed
+// back with a zero-width character inside it survive the redaction pass and
+// then be reassembled by the zero-width strip.
+//
+// Order is now screen -> redact -> clamp, each over the whole response.
+// ---------------------------------------------------------------------------
+
+/**
+ * A bearer token longer than the old 4096-character cut. Built rather than
+ * written out so nothing in this file looks like a real credential.
+ */
+const LONG_TOKEN = `example-token-${"a".repeat(5000)}-tail`;
+
+Deno.test("models: a token longer than the old 4096-char cut is still redacted", async () => {
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() =>
+      new Response(
+        `upstream echoed Authorization: Bearer ${LONG_TOKEN}`,
+        { status: 500 },
+      )],
+    undefined,
+    { ...OK, apiToken: LONG_TOKEN },
+  );
+  const message = outcome.thrown?.message ?? "";
+  assertEquals(message.startsWith("HTTP_ERROR:"), true);
+  assertEquals(
+    message.includes(LONG_TOKEN.slice(0, 64)),
+    false,
+    "TOKEN LEAK -- a token split by the pre-redaction cut reached a thrown error",
+  );
+  assertEquals(message.includes("[REDACTED]"), true);
+});
+
+Deno.test("completion: a token longer than the old 4096-char cut never reaches the stored error", async () => {
+  const outcome = await runMethod(
+    probe.methods.completion.execute,
+    { model: "example/chat", prompt: "hello", maxTokens: 8, temperature: 0 },
+    [() =>
+      new Response(
+        `upstream echoed Authorization: Bearer ${LONG_TOKEN}`,
+        { status: 500 },
+      )],
+    undefined,
+    { ...OK, apiToken: LONG_TOKEN },
+  );
+  const stored = String(outcome.written?.error ?? "");
+  assertEquals(
+    stored.includes(LONG_TOKEN.slice(0, 64)),
+    false,
+    "TOKEN LEAK -- a token prefix reached an infinite-lifetime resource",
+  );
+  assertEquals(stored.includes("[REDACTED]"), true);
+});
+
+Deno.test("completion: a zero-width character inside an echoed token does not defeat redaction", async () => {
+  // Screening used to run AFTER redaction: this spelling missed the literal
+  // match, and the zero-width strip then handed the intact credential to the
+  // stored error field.
+  const smuggled = `${OK.apiToken.slice(0, 6)}${ZWSP}${OK.apiToken.slice(6)}`;
+  const outcome = await runMethod(
+    probe.methods.completion.execute,
+    { model: "example/chat", prompt: "hello", maxTokens: 8, temperature: 0 },
+    [() => new Response(`upstream echoed Bearer ${smuggled}`, { status: 500 })],
+  );
+  const stored = String(outcome.written?.error ?? "");
+  assertEquals(
+    stored.includes(OK.apiToken),
+    false,
+    "TOKEN LEAK -- screening reassembled a token that redaction had skipped",
+  );
+  assertEquals(stored.includes("[REDACTED]"), true);
+});
+
+/**
+ * A body whose only cut is the one this extension cannot move: the
+ * MAX_RESPONSE_BYTES read cap, landing `at` characters into an echoed token.
+ * The leading filler is whitespace so the screening pass collapses it and
+ * pulls the surviving token prefix to the front of the snippet -- the reason
+ * "it is 256 KiB in, nobody will read that far" is not a defence.
+ */
+function bodyCutInsideToken(token: string, at: number, status = 500): Response {
+  const text = " ".repeat(256 * 1024 - at) + token;
+  return new Response(new TextEncoder().encode(text), { status });
+}
+
+Deno.test("completion: a token split by the response byte cap is not stored as a prefix", async () => {
+  const outcome = await runMethod(
+    probe.methods.completion.execute,
+    { model: "example/chat", prompt: "hello", maxTokens: 8, temperature: 0 },
+    [() => bodyCutInsideToken(OK.apiToken, 10)],
+  );
+  const stored = String(outcome.written?.error ?? "");
+  assertEquals(
+    stored.includes(OK.apiToken.slice(0, 10)),
+    false,
+    "TOKEN LEAK -- the byte cap split the token and its prefix was stored",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// GATE FINDING 2 -- "Health records `authorized: false` when authorization was
+// never determined. A 500 response, timeout, or connection failure is stored
+// as false rather than unknown. `httpStatus: 0` similarly represents an
+// absent status as a number."  Evidence: `let authorized = false;`.
+//
+// false is now earned only by an explicit 401/403, true only by a 2xx, and
+// every other outcome leaves both fields null -- enforced by the resource
+// schema as well as by the writer, so the old shape cannot be stored at all.
+// ---------------------------------------------------------------------------
+
+Deno.test("health: a 500 leaves authorization undetermined rather than false", async () => {
+  const outcome = await runMethod(
+    endpoint.methods.health.execute,
+    {},
+    [() => new Response("boom", { status: 500 })],
+  );
+  assertEquals(
+    outcome.written?.authorized,
+    null,
+    "a 500 never judged the token, so false is a fabricated finding",
+  );
+  assertEquals(outcome.written?.httpStatus, 500);
+  assertEquals(outcome.written?.reachable, true);
+  assertEquals(outcome.written?.errorKind, "http_error");
+  assertEquals(
+    endpoint.resources.health.schema.safeParse(outcome.written).success,
+    true,
+  );
+});
+
+Deno.test("health: an unreachable endpoint records neither a status nor an auth verdict", async () => {
+  const outcome = await runMethod(
+    endpoint.methods.health.execute,
+    {},
+    [() => {
+      throw new TypeError("connection refused");
+    }],
+  );
+  assertEquals(
+    outcome.written?.authorized,
+    null,
+    "nothing was asked, so nothing was refused",
+  );
+  assertEquals(
+    outcome.written?.httpStatus,
+    null,
+    "0 is not a status; an absent status must be absent",
+  );
+  assertEquals(outcome.written?.reachable, false);
+  assertEquals(outcome.written?.errorKind, "unreachable");
+  assertEquals(
+    endpoint.resources.health.schema.safeParse(outcome.written).success,
+    true,
+  );
+});
+
+Deno.test("health: false is reserved for an explicit 401/403, true for a 2xx", async () => {
+  for (const status of [401, 403]) {
+    const outcome = await runMethod(
+      endpoint.methods.health.execute,
+      {},
+      [() => new Response("nope", { status })],
+    );
+    assertEquals(outcome.written?.authorized, false, `status ${status}`);
+    assertEquals(outcome.written?.httpStatus, status);
+    assertEquals(outcome.written?.errorKind, "unauthorized");
+  }
+  const ok = await runMethod(
+    endpoint.methods.health.execute,
+    {},
+    [() => jsonResponse(JSON.stringify({ data: [] }))],
+  );
+  assertEquals(ok.written?.authorized, true);
+  assertEquals(ok.written?.httpStatus, 200);
+  assertEquals(ok.written?.errorKind, "");
+});
+
+Deno.test("health: the schema refuses an auth verdict nothing determined", () => {
+  const at = new Date(0).toISOString();
+  const cases: [string, Record<string, unknown>, boolean][] = [
+    ["unreachable, both unknown", {
+      reachable: false,
+      authorized: null,
+      httpStatus: null,
+      latencyMs: 0,
+      errorKind: "unreachable",
+      error: "refused",
+      checkedAt: at,
+    }, true],
+    // The exact record the pre-fix writer produced for a dead host.
+    ["unreachable, but claiming false/0", {
+      reachable: false,
+      authorized: false,
+      httpStatus: 0,
+      latencyMs: 0,
+      errorKind: "unreachable",
+      error: "refused",
+      checkedAt: at,
+    }, false],
+    // ...and for a 500.
+    ["a 500 claiming the token was rejected", {
+      reachable: true,
+      authorized: false,
+      httpStatus: 500,
+      latencyMs: 1,
+      errorKind: "http_error",
+      error: "boom",
+      checkedAt: at,
+    }, false],
+    ["authorized true without a 2xx", {
+      reachable: true,
+      authorized: true,
+      httpStatus: 500,
+      latencyMs: 1,
+      errorKind: "",
+      error: "",
+      checkedAt: at,
+    }, false],
+  ];
+  for (const [label, record, expected] of cases) {
+    assertEquals(
+      endpoint.resources.health.schema.safeParse(record).success,
+      expected,
+      label,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GATE BLOCK 1 -- "A malicious endpoint can return the bearer token as a valid
+// model ID, causing the credential to be stored indefinitely. Model IDs are
+// screened for characters but never compared with or redacted against
+// `apiToken`."
+//
+// A model id is the one piece of remote text this extension stores as a
+// measurement rather than a message: it skips redaction entirely, and it is
+// written to an infinite-lifetime resource, put in a tag, logged, and folded
+// into a storage path. The character screen has nothing to say about a
+// well-formed string that happens to be the credential.
+// ---------------------------------------------------------------------------
+
+Deno.test("models: a model id that IS the bearer token fails closed", async () => {
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() =>
+      jsonResponse(
+        JSON.stringify({
+          data: [{ id: "example/chat" }, { id: OK.apiToken }],
+        }),
+      )],
+  );
+  assertEquals(
+    outcome.written,
+    undefined,
+    "CREDENTIAL LEAK — the token was stored as a served model id",
+  );
+  const message = outcome.thrown?.message ?? "";
+  assertEquals(message.startsWith("MALFORMED_RESPONSE:"), true);
+  assertEquals(
+    message.includes(OK.apiToken),
+    false,
+    "the refusal must not echo the credential it refused",
+  );
+});
+
+Deno.test("probe: a model argument carrying the token never reaches storage", async () => {
+  // Same cross-field protection on the caller's side of the boundary: the id
+  // becomes a tag, a log line, and an instance name that maps to a path.
+  const outcome = await runMethod(
+    probe.methods.embedding.execute,
+    { model: OK.apiToken, input: "swamp lmstudio probe" },
+    [],
+  );
+  assertEquals(outcome.calls, 0, "the request must not even be sent");
+  assertEquals(outcome.written, undefined, "CREDENTIAL LEAK — token stored");
+  assertEquals(outcome.thrown?.message.includes(OK.apiToken), false);
+  assertEquals(
+    outcome.thrown?.message.startsWith("INVALID_ARGUMENT:"),
+    true,
+    outcome.thrown?.message,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// GATE BLOCK 2 -- "Caller-supplied embedding input and completion prompts can
+// contain sensitive material, but neither argument is marked sensitive."
+//
+// Both carry whatever the operator is testing against a third-party endpoint.
+// The platform only knows to handle them like the token if they say so.
+// ---------------------------------------------------------------------------
+
+Deno.test("probe: input and prompt are declared sensitive arguments", () => {
+  // `input` has a default, so the wrapper -- not the inner string -- is the
+  // schema the platform reads metadata from. Asserted through the exported
+  // model surface for exactly that reason.
+  const input = probe.methods.embedding.arguments.shape.input;
+  assertEquals(
+    input.meta()?.sensitive,
+    true,
+    "embedding input is caller content and must be handled as sensitive",
+  );
+  const prompt = probe.methods.completion.arguments.shape.prompt;
+  assertEquals(
+    prompt.meta()?.sensitive,
+    true,
+    "completion prompt is caller content and must be handled as sensitive",
+  );
+  // The description must survive the meta() call; zod merges them, and the
+  // ordering that loses one is easy to write by accident.
+  assertEquals(typeof input.meta()?.description, "string");
+  assertEquals(typeof prompt.meta()?.description, "string");
+});
+
+// ---------------------------------------------------------------------------
+// GATE BLOCK 3 -- "An endpoint can echo embedding input into an error body,
+// which is then stored indefinitely. Only the API token is redacted."
+//
+// The embedding input is a second secret in the token's exact position, and
+// it must be stripped in the token's exact place in the pipeline: after
+// screening (so a zero-width character wedged into the echo cannot dodge the
+// literal match and then be reassembled) and before the clamp.
+// ---------------------------------------------------------------------------
+
+const SENSITIVE_INPUT = "patient 4417 presented with chest pain at 0300";
+
+Deno.test("embedding: an echoed input never reaches the stored error", async () => {
+  const outcome = await runMethod(
+    probe.methods.embedding.execute,
+    { model: "example/embed", input: SENSITIVE_INPUT },
+    [() =>
+      new Response(
+        `cannot embed "${SENSITIVE_INPUT}": no embedding model is loaded`,
+        { status: 400 },
+      )],
+  );
+  const stored = String(outcome.written?.error ?? "");
+  assertEquals(
+    stored.includes("patient 4417"),
+    false,
+    "INPUT LEAK — the submitted embedding input was stored for ever",
+  );
+  assertEquals(stored.includes("[REDACTED]"), true);
+  // The diagnosable half survives: the endpoint's own words are why this
+  // probe keeps remote error text at all.
+  assertEquals(stored.includes("no embedding model is loaded"), true);
+});
+
+Deno.test("embedding: a zero-width character inside the echoed input does not defeat redaction", async () => {
+  // The ordering test. Screening runs first and strips the ZWSP, so the
+  // literal match still fires; a redact-first pipeline would miss it here and
+  // then reassemble the input intact.
+  const smuggled = `${SENSITIVE_INPUT.slice(0, 12)}${ZWSP}${
+    SENSITIVE_INPUT.slice(12)
+  }`;
+  const outcome = await runMethod(
+    probe.methods.embedding.execute,
+    { model: "example/embed", input: SENSITIVE_INPUT },
+    [() => new Response(`rejected input ${smuggled}`, { status: 400 })],
+  );
+  const stored = String(outcome.written?.error ?? "");
+  assertEquals(
+    stored.includes("patient 4417"),
+    false,
+    "INPUT LEAK — a zero-width character carried the input past redaction",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// GATE BLOCK 5 -- "Length bounding uses UTF-16 slicing after surrogate
+// screening. A cut between a valid surrogate pair recreates an unpaired
+// surrogate in stored or thrown text, contradicting the documented screening
+// guarantee."  Evidence: `` `${safe.slice(0, max)}...` ``.
+//
+// screenRemoteText() replaces every lone surrogate a moment earlier, so the
+// clamp is the only thing that can put one back. The body below is built so
+// the cut lands exactly between the halves of an astral character.
+// ---------------------------------------------------------------------------
+
+/** An astral character: one code point, two UTF-16 code units. */
+const ASTRAL = "\u{1f600}";
+
+Deno.test("models: the length clamp never severs a surrogate pair", async () => {
+  // MAX_ERROR_SNIPPET is 200 on the endpoint model; 199 filler characters put
+  // the high surrogate at index 199 and the low one at index 200.
+  const body = `${"a".repeat(199)}${ASTRAL}${"b".repeat(400)}`;
+  const outcome = await runMethod(
+    endpoint.methods.models.execute,
+    {},
+    [() => new Response(body, { status: 500 })],
+  );
+  const message = outcome.thrown?.message ?? "";
+  assertEquals(message.startsWith("HTTP_ERROR:"), true);
+  assertEquals(
+    hasScreenableChar(message),
+    false,
+    "the clamp cut a surrogate pair in half and put a lone surrogate back " +
+      "into text this extension documents as screened",
+  );
+});
+
+Deno.test("embedding: the classifier snippet never severs a surrogate pair", async () => {
+  // The same cut, at the other bound: classifyHttpError() clamps to
+  // MAX_ERROR_SNIPPET (160) when it builds the message that is stored.
+  const body = `${"a".repeat(159)}${ASTRAL}${"b".repeat(4000)}`;
+  const outcome = await runMethod(
+    probe.methods.embedding.execute,
+    { model: "example/embed", input: "swamp lmstudio probe" },
+    [() => new Response(body, { status: 400 })],
+  );
+  const stored = String(outcome.written?.error ?? "");
+  assertEquals(
+    hasScreenableChar(stored),
+    false,
+    "a lone surrogate reached an infinite-lifetime stored error",
+  );
+});
+
+Deno.test("daemon: concurrent injected runners stay within their own observation", async () => {
+  const runWith = (identifier: string) =>
+    runDaemon(async () => {
+      await Promise.resolve();
+      return {
+        success: true,
+        code: 0,
+        stdout: JSON.stringify([{ identifier }]),
+        stderr: "",
+      };
+    });
+  const [a, b] = await Promise.all([
+    runWith("example-a"),
+    runWith("example-b"),
+  ]);
+  assertEquals(
+    (a.loadedModels as { identifier: string }[])[0].identifier,
+    "example-a",
+  );
+  assertEquals(
+    (b.loadedModels as { identifier: string }[])[0].identifier,
+    "example-b",
+  );
+});
+
+Deno.test("daemon: injected success cannot contaminate a later production observation", async () => {
+  let injectedCalls = 0;
+  await runDaemon(() => {
+    injectedCalls++;
+    return Promise.resolve({
+      success: true,
+      code: 0,
+      stdout: "[]",
+      stderr: "",
+    });
+  });
+  let recorded: Record<string, unknown> = {};
+  await daemon.methods.observe.execute({}, {
+    // Executes a deterministic local failure through the real runner; no lms
+    // daemon or remote resource is contacted by this regression.
+    globalArgs: { lmsBinary: "/usr/bin/false", timeoutMs: 2000 },
+    signal: new AbortController().signal,
+    writeResource: (_spec, _name, value) => {
+      recorded = value;
+      return Promise.resolve({ name: "daemon" });
+    },
+  });
+  assertEquals(injectedCalls, 1);
+  assertEquals(recorded.daemonRunning, false);
+  assertEquals(recorded.errorKind, "command-failed");
 });

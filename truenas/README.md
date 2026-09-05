@@ -7,26 +7,33 @@ API: system identity, ZFS pools, physical disks, active alerts, and certificate
 expiry. Each is its own addressable resource, so a workflow can gate on any one
 of them. The NAS is the deep end of the swamp, and this is the depth gauge.
 
-**Version** `2026.08.23.1` · **License** MIT · **Source**
+**Version** `2026.09.05.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/truenas
 
 ## Install
 
+Clone this GitHub repository and register this extension's source in your Swamp
+repo. Replace the example path with the canonical location of your clone:
+
+```sh
+swamp extension source add /example/slog-bog/truenas --only models
 ```
-swamp extension pull @jpisgeek/truenas
-```
+
+This repaired version is distributed through GitHub source, not a registry
+release.
 
 ## `@jpisgeek/truenas`
 
 ### Arguments
 
-| argument            | type    | required | default | description                                                                                                                                                                                                                                                                          |
-| ------------------- | ------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `baseUrl`           | string  | yes      |         | Base URL of the TrueNAS host, e.g. https://nas.example.com. Prefer the DNS name over an IP so TLS verification actually succeeds. The WebSocket URL is rebuilt from this (https -> wss, /api/current), so a host, port and path are fine but a query string or fragment is rejected. |
-| `apiKey`            | string  | yes      |         | TrueNAS API key; source it from a vault expression                                                                                                                                                                                                                                   |
-| `allowInsecureHttp` | boolean | no       | `false` | Allow baseUrl to use http://, which becomes an unencrypted ws:// connection carrying the API key in cleartext on every call. Off by default; only set this for a trusted loopback/VPN path where TLS genuinely cannot be terminated on the TrueNAS host.                             |
-| `timeoutSec`        | integer | no       | `20`    |                                                                                                                                                                                                                                                                                      |
-| `certWarnDays`      | integer | no       | `30`    | Certificates expiring within this many days are flagged                                                                                                                                                                                                                              |
+| argument            | type            | required | default | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------- | --------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseUrl`           | string          | yes      |         | Base URL of the TrueNAS host, e.g. https://nas.example.com. Prefer the DNS name over an IP so TLS verification actually succeeds. The WebSocket URL is rebuilt from this (https -> wss, /api/current). A non-default port is allowed; credentials, paths, query strings and fragments are rejected.                                                                                                                                                                             |
+| `apiKey`            | string          | yes      |         | TrueNAS API key; source it from a vault expression. Must be 8-128 characters of printable ASCII using TrueNAS raw-key format `{id}-{64 alphanumerics}` -- other values are rejected before connecting because they can collide with non-string remote primitives.                                                                                                                                                                                                               |
+| `allowInsecureHttp` | boolean         | no       | `false` | Allow baseUrl to use http://, which becomes an unencrypted ws:// connection carrying the API key in cleartext on every call. Off by default; only set this for a trusted loopback/VPN path where TLS genuinely cannot be terminated on the TrueNAS host.                                                                                                                                                                                                                        |
+| `allowedHosts`      | array of string | no       | `[]`    | Optional pin: exact hosts the API key may be sent to, e.g. ['nas.example.com', 'nas.example.com:8443']. When non-empty the host derived from baseUrl must match one entry exactly or the run fails before a socket is opened. Entries are bare hosts or host:port; a bare host pins only the scheme's default port, so every non-default port must be explicit. No scheme, path or wildcard. Set this whenever baseUrl comes from anywhere but a literal in your workflow file. |
+| `timeoutSec`        | integer         | no       | `20`    |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `certWarnDays`      | integer         | no       | `30`    | Certificates expiring within this many days are flagged                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
 ### Methods
 
@@ -34,20 +41,27 @@ swamp extension pull @jpisgeek/truenas
 
 Read-only sweep of system info, pools, disks, alerts, and certificates in one
 pass. Writes one resource per object plus a summary, and prunes objects the box
-no longer reports.
+no longer reports. The five sub-fetches are issued together; every response is
+parsed, every derived value computed, every resource schema checked, and every
+duplicate identity rejected before the first write. Any failure therefore aborts
+with nothing written or pruned. The writes themselves are not a transaction --
+the datastore offers none -- so `summary.generationComplete:false` is written
+before any resource or prune. Every record carries that summary's
+`generationId`; only after all writes and deletes succeed is the summary
+replaced with `generationComplete:true`.
 
 No arguments.
 
 ### Data written
 
-| resource      | lifetime | fields                                                                                                                                                                                                                    | description                                                                                                                                                                                                                                           |
-| ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `system`      | infinite | `hostname`, `version`, `model`, `cores`, `physmemBytes`, `uptimeSeconds`, `loadavg`, `metricsKnown`                                                                                                                       | Host identity, version, CPU, memory, uptime, load. `metricsKnown` is false when TrueNAS omitted cores/memory/uptime; those read -1 rather than 0 so an absent uptime cannot look like a fresh reboot.                                                 |
-| `pool`        | infinite | `name`, `status`, `healthy`, `allocatedBytes`, `freeBytes`, `sizeBytes`, `usedPercent`, `fragmentationPercent`, `capacityKnown`                                                                                           | One record per ZFS pool with status, health, capacity, fragmentation. Check `capacityKnown` before gating on capacity: when TrueNAS reports no allocated/free the four capacity fields are -1, not 0, so an unknown pool cannot read as an empty one. |
-| `disk`        | infinite | `name`, `serial`, `model`, `sizeBytes`, `type`, `pool`, `sizeKnown`                                                                                                                                                       | One record per physical disk and its pool membership. `sizeKnown` is false when TrueNAS reported no size; `sizeBytes` is then -1.                                                                                                                     |
-| `alert`       | infinite | `id`, `klass`, `level`, `formatted`, `dismissed`, `silenced`                                                                                                                                                              | One record per active TrueNAS alert. `silenced` marks alerts that were dismissed in the UI. Still true, just no longer visible there.                                                                                                                 |
-| `certificate` | infinite | `name`, `commonName`, `notAfter`, `daysRemaining`, `expiryKnown`, `expiringSoon`, `expired`                                                                                                                               | One record per certificate with days remaining, tracked independently of TrueNAS alert state so a dismissed expiry warning cannot hide a cert that is about to lapse.                                                                                 |
-| `summary`     | infinite | `hostname`, `version`, `pools`, `poolsUnhealthy`, `poolsCapacityUnknown`, `disks`, `alerts`, `alertsSilenced`, `certificates`, `certificatesExpiringSoon`, `certificatesExpired`, `certificatesWithoutExpiry`, `syncedAt` | Single roll-up of the most recent discover.                                                                                                                                                                                                           |
+| resource      | lifetime | fields                                                                                                                                                                                                                                                                                                                                                   | description                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `system`      | infinite | `generationId`, `hostname`, `version`, `model`, `cores`, `physmemBytes`, `uptimeSeconds`, `loadavg`, `metricsKnown`                                                                                                                                                                                                                                      | Host identity, version, CPU, memory, uptime, load. `metricsKnown` is false when TrueNAS omitted cores/memory/uptime; those read -1 rather than 0 so an absent uptime cannot look like a fresh reboot.                                                                                                                                                                                                                                                           |
+| `pool`        | infinite | `generationId`, `name`, `status`, `healthy`, `allocatedBytes`, `freeBytes`, `sizeBytes`, `usedPercent`, `fragmentationPercent`, `capacityKnown`                                                                                                                                                                                                          | One record per ZFS pool with status, health, capacity, fragmentation. Check `capacityKnown` before gating on capacity: when TrueNAS reports no allocated/free the four capacity fields are -1, not 0, so an unknown pool cannot read as an empty one.                                                                                                                                                                                                           |
+| `disk`        | infinite | `generationId`, `name`, `serial`, `model`, `sizeBytes`, `type`, `pool`, `sizeKnown`, `poolKnown`                                                                                                                                                                                                                                                         | One record per physical disk and its pool membership. Missing name, serial, model, or type reads `UNKNOWN`. `sizeKnown` is false when TrueNAS reported no size; `sizeBytes` is then -1. `poolKnown` is false when TrueNAS did not answer the pool-membership question at all or answered with screened-empty text, which is a different fact from a disk that is in no pool; the tag reads `unknown` there, never `none`.                                       |
+| `alert`       | infinite | `generationId`, `id`, `klass`, `level`, `formatted`, `dismissed`, `silenced`, `contentKnown`                                                                                                                                                                                                                                                             | One record per active TrueNAS alert. `silenced` marks alerts that were dismissed in the UI. Still true, just no longer visible there. `contentKnown` is false when TrueNAS sent no usable class, level or text: class and level then read `UNKNOWN` rather than an empty string, because an alert no severity gate can match must not look like an ordinary one.                                                                                                |
+| `certificate` | infinite | `generationId`, `name`, `commonName`, `notAfter`, `daysRemaining`, `expiryKnown`, `expiringSoon`, `expired`                                                                                                                                                                                                                                              | One record per certificate with days remaining; missing name/commonName reads `UNKNOWN`. Tracked independently of TrueNAS alert state so a dismissed expiry warning cannot hide a cert that is about to lapse.                                                                                                                                                                                                                                                  |
+| `summary`     | infinite | `generationId`, `generationComplete`, `hostname`, `version`, `pools`, `poolsUnhealthy`, `poolsCapacityUnknown`, `disks`, `alerts`, `alertsSilenced`, `alertsContentUnknown`, `certificates`, `certificatesExpiringSoon`, `certificatesExpired`, `certificatesWithoutExpiry`, `poolsReportedEmpty`, `disksReportedEmpty`, `discoveryDegraded`, `syncedAt` | Single roll-up of the most recent discover. Require `generationComplete` and consume only records carrying its `generationId`; then gate on `discoveryDegraded` before trusting the counts. It is true when pool.query or disk.query came back empty, which is what an importing pool looks like and is indistinguishable from a healthy box by the counts alone, and true when any alert arrived without usable class, level or text (`alertsContentUnknown`). |
 
 ## Example
 
@@ -56,7 +70,11 @@ globalArguments:
   # Prefer the DNS name the host's certificate was issued to; that is what
   # lets TLS verification succeed.
   baseUrl: https://truenas.example.com
-  apiKey: ${{ vault.get('myvault', '<your-truenas-api-key-item>') }}
+  apiKey: ${{ vault.get('<your-vault>', '<your-truenas-api-key-item>') }}
+  # Pin the host the key may be sent to. Optional, but set it whenever
+  # baseUrl is not a literal you can read right here.
+  allowedHosts:
+    - truenas.example.com
   timeoutSec: 20
   certWarnDays: 30
   allowInsecureHttp: false
@@ -68,51 +86,229 @@ Discovery only: there is no write path to TrueNAS anywhere in this model.
 Certificate expiry is computed independently of TrueNAS's own alert state. A
 `CertificateIsExpiring` alert dismissed in the UI is still reported, with
 `silenced: true`. Dismissing an alert does not renew a certificate, we checked.
-Four fields say whether a number is real before you gate on it: `expiryKnown` on
-a certificate (a CSR has no expiry), `capacityKnown` on a pool, `sizeKnown` on a
-disk, and `metricsKnown` on `system` for cores/memory/uptime. When one of those
-is false the numbers it covers are `-1`, never `0`, because `0` is a value
-TrueNAS legitimately reports for all of them and a capacity gate reading
-`usedPercent: 0` would call an unknown pool empty.
-`summary.poolsCapacityUnknown` surfaces the same thing for a workflow that only
-reads the roll-up. `baseUrl` may carry a host, port and path (a reverse-proxied
-subpath works) but not a query string or fragment; the `wss://` URL is rebuilt
-from its parts. Verified against SCALE 25.10. `auth.login_with_api_key` is
+
+**Absent is not zero.** Five flags say whether a value is real before you gate
+on it: `expiryKnown` on a certificate (a CSR has no expiry), `capacityKnown` on
+a pool, `sizeKnown` and `poolKnown` on a disk, and `metricsKnown` on `system`
+for cores/memory/uptime. Unknown system, pool, and disk numbers use `-1`;
+unknown certificate `daysRemaining` uses `-9999`. Neither sentinel is `0`,
+because `0` is a value TrueNAS legitimately reports and a capacity gate reading
+`usedPercent: 0` would call an unknown pool empty. `poolKnown` is the same idea
+for a string: a disk whose pool membership TrueNAS never answered is tagged
+`pool: unknown`, never `pool: none`; a blank or screened-empty pool value is
+unknown too, rather than a known blank. When that join fails it fails for every
+disk at once and an orphaned-disk gate would fire across the whole array.
+`summary.poolsCapacityUnknown` surfaces the capacity case for a workflow that
+only reads the roll-up. System `hostname` and `version` are required strings;
+missing or null values are response-contract failures. A present value that
+screens to blank becomes `UNKNOWN`, as do an absent/null/blank system model;
+disk name, serial, model, and type; and certificate name or common name. They
+never flatten those states to an ordinary empty string that a consumer could
+mistake for real data. Pool rows are stricter: the `name` key must be a string
+(it may be blank only when a usable ID supplies stable identity), `status` and
+`healthy` are mandatory, and having neither a usable name nor ID aborts before
+writes.
+
+**An alert with nothing in it is not an ordinary alert.** When TrueNAS sends an
+alert whose `klass`, `level` or `formatted` is null, blank, or becomes blank
+after remote-text screening, the class and level read `UNKNOWN`, `contentKnown`
+is false on that record, `summary.alertsContentUnknown` counts it, and the run
+is flagged `discoveryDegraded`. Missing or null `dismissed` is rejected as
+response-contract drift rather than being converted to `false`. These states
+must not leave a critical condition present in the datastore but matched by no
+rule on the box.
+
+**Malformed is not absent either.** A value that is present but cannot be read
+fails the whole run rather than being smoothed into a benign default: a
+fragmentation that is not a 0-100 percentage, a certificate expiry that is
+present but is not a date, a `pool.query` row missing `status`/`healthy`, an
+`alert.list` row missing `klass`/`level`/`formatted` or a boolean `dismissed`, a
+pool, disk, or alert row with no nonblank stable identifier, a response string
+containing an unpaired UTF-16 surrogate, a `certificate.query` row with neither
+`until` nor `not_after`, or a `certificate.query` row with neither a usable `id`
+nor a `name` (there is nothing stable to name its record by, and naming it by
+its position in the response would move expiry history between certificates
+whenever TrueNAS reorders them). Both expiry aliases are parsed when present: a
+null or blank one cannot mask a valid peer, an unreadable peer is never ignored,
+and two different valid values abort as conflicting. Blank preferred identifiers
+do not mask usable fallbacks, and duplicate derived kind/name pairs are rejected
+before any write. An absent fragmentation is the one deliberate exception and
+still reads `0`: unlike capacity, 0% fragmentation is not itself an alarming
+value, so no gate is lulled by it.
+
+**Sizes and values are capped before expensive work.** The pinned WebSocket
+client enforces a 4,000,000-byte message limit while receiving fragments, before
+a complete message is assembled or parsed; compression and redirects are
+disabled. A collection over 5,000 rows, a raw string over 1,024 UTF-16 code
+units (65,536 for alert text), a certificate-expiry string over 1,024 UTF-16
+code units, or a `loadavg` over 8 entries fails the run. Accepted alert text is
+screened and then truncated for storage after 4,096 Unicode code points, with a
+truncation suffix. Numeric readings must be finite, nonnegative, and stay inside
+field-specific ceilings; every fully derived resource is checked against its
+output schema before the first write. The far end does not get to choose how
+much work or invalid permanent data one discovery costs.
+
+**The wire envelope is strict.** Every response and notification must declare
+JSON-RPC 2.0. Responses carry the integer request ID and exactly one of `result`
+or a structured `error` with an integer code; notifications carry a method and
+optional array/object params but no response members. A malformed response fails
+its waiting call immediately instead of timing out or being mistaken for an
+ignorable notification. Malformed JSON and invalid frames with no usable request
+ID fail every pending call and close the socket. A response for an ID this
+client never issued, or one it already settled, does the same rather than being
+ignored until another call times out.
+
+**Nothing is written until nothing can throw, and `summary` is the commit
+marker.** The five sub-fetches are issued together over one authenticated
+connection, and any failure or contract violation among them aborts the run
+before a single resource is written or pruned. Every response is parsed and
+every derived value computed — fragmentation percentages, canonical certificate
+expiry, instance names — and every planned record schema-checked before the
+first write happens, so a certificate or derived number this model cannot
+represent leaves the datastore exactly as it found it. That is not atomicity,
+and this extension does not claim it. Each resource is its own `writeResource`
+call, the datastore offers no transaction, and a datastore failure part-way
+through the write leaves that generation half written — records from this run
+beside records from the last. What is arranged instead is that an incomplete
+generation says so. Before any resource write or prune, `summary` is written
+with `generationComplete: false`; every record written by the run carries that
+summary's `generationId`. Only after every write and delete succeeds is the same
+summary replaced with `generationComplete: true`. Require that flag and consume
+only records whose `generationId` matches it; a failed write can no longer leave
+a recent healthy summary authorizing mixed generations.
+
+**An empty inventory is reported, not rolled up as healthy.** A run in which
+TrueNAS reports zero pools (or zero disks, or any alert with no class, level or
+text) sets `summary.discoveryDegraded`, plus `poolsReportedEmpty` /
+`disksReportedEmpty`, and logs a warning unconditionally, including on a first
+run where there is nothing stale to keep. Gate on `discoveryDegraded`, not on
+the counts: `pools: 0, poolsUnhealthy: 0` is also what a flawless box looks
+like. Those records are not pruned either, because an empty pool list is what a
+pool still importing after a reboot looks like; records for an object that
+really was removed are pruned by the next run that reports any object of that
+kind, so only the removal of the very last pool or disk leaves a stale record to
+clear by hand. Alerts and certificates are pruned on absence as before, since a
+resolved alert must go.
+
+**Instance names.** `system` and `summary` are fixed names. Everything else is
+`<prefix>-<slug of the identity fields, up to 48 chars>-<32 hex digits of SHA-256 over length-prefixed field provenance, primitive type, and raw value>`,
+with prefixes `pool-`, `disk-`, `alert-` and `cert-`. The identity fields are
+remote text — a pool name, a disk identifier, an alert class, a certificate CN —
+so the readable slug is built from the screened form of them. Before either
+slugging or hashing, any raw, JSON-escaped, invisibly split, or
+ASCII-case-folded form of the API key aborts the run with no writes; the
+completed name is checked again after slug case-folding, so no persisted name or
+digest is ever derived from key material. Prune logs do not include datastore
+names at all. Non-secret identities still hash their raw typed and provenanced
+values, so screening cannot merge two records. Blank preferred identity fields
+use the first nonblank stable fallback and rows with none are refused; duplicate
+derived identities are also refused before writes. Certificates use `cert-` even
+though the resource kind is `certificate`: the name is the record's identity in
+the datastore, so renaming the prefix would prune and recreate every stored
+certificate and lose its history, which is not worth a tidier spelling. This
+release widened that digest from 32 bits of FNV-1a to 128 bits of SHA-256 and
+changed how the identity is encoded, so **every instance name changes once when
+you upgrade to it**: the first run after upgrading writes records under the new
+names and prunes the old ones, and history under the old names is lost. That is
+a deliberate one-time cost. 32 bits is a coin flip across ~77,000 identities,
+and a collision there means two disks silently sharing one infinite-lifetime
+record.
+
+`baseUrl` may carry a host and port, but no path, query string, fragment,
+userinfo, or API-key form; the fixed `wss://.../api/current` URL is rebuilt from
+its parts. The full argument is marked sensitive and no URL component is copied
+into logs or errors. Verified against SCALE 25.10. `auth.login_with_api_key` is
 scheduled for removal in TrueNAS 27: a successful connect to a host that new
 logs a warning, and a failed authentication says so in the error, which is where
 you actually hit it if the call is gone. If a scheduled run fails to connect
 while the same call works from a shell on the same Mac, suspect macOS Local
-Network privacy. Instance names are
-`<prefix>-<slug of the identity fields, ≤48 chars>-<8 hex digits of FNV-1a over the raw identity>`,
-with fixed names `system` and `summary`. Certificates use the prefix `cert-`
-even though the resource kind is `certificate`: the name is the record's
-identity in the datastore, so renaming the prefix would prune and recreate every
-stored certificate and lose its history, which is not worth a tidier spelling. A
-run in which TrueNAS reports zero pools (or zero disks) does not prune the
-existing `pool`/`disk` records, because that is what a pool still importing
-after a reboot looks like; the run logs a warning instead. Records for an object
-that really was removed are pruned by the next run that reports any object of
-that kind, so only the removal of the very last pool or disk leaves a stale
-record to clear by hand. Alerts and certificates are pruned on absence as before
-— a resolved alert must go.
+Network privacy.
 
 ## Security
 
-The API key is marked sensitive, sent once over the authenticated WebSocket, and
-never logged. `baseUrl` must be `https://` (→ `wss://`), must not embed
-userinfo, and must not carry a query string or fragment (both would be copied
-into the connection log and every connection error). Remote text that reaches an
-error or a log line is truncated to a bounded preview rather than pasted in
-whole. `allowInsecureHttp: true` permits `http://` → `ws://` with the key in
-cleartext on every call, so anyone on the path captures a live TrueNAS API key.
-It is off by default and exists for a trusted loopback or VPN path where TLS
-genuinely cannot be terminated on the NAS; leave it off unless that describes
-you. Written data: hostname, version, pool names and health, disk models and
+**Dependency boundary.** The sole bundled third-party module allowed by this
+extension is exact-pinned `npm:ws@8.21.0`; Swamp's quality gate audits it before
+review. `npm:zod@4` is the platform-provided exception and is not bundled. The
+manifest `dependencies` key is exclusively for dependencies on other Swamp
+extensions, and this extension has none.
+
+**The API key.** Marked sensitive, sent once over the authenticated WebSocket,
+and never logged. Remote prose from `auth.login_with_api_key` failures is never
+surfaced at all: that call takes the key as its only argument, and no literal
+redactor can enumerate every partial or transformed echo. Other remote strings
+still have the complete key stripped defensively. It must use the TrueNAS
+raw-key grammar documented by the official API client: a positive numeric key
+ID, a hyphen, and exactly 64 alphanumeric key-material characters. The overall
+128-character ceiling bounds the ID. That grammar and each restriction keep
+redaction enforceable: anything shorter than 8 cannot be stripped out of remote
+text without shredding every diagnostic message, anything longer than 128 is not
+a TrueNAS key, and a key containing a zero-width, bidi or control character
+would be altered by the screening that runs over remote text — leaving a form of
+the key that the literal match no longer finds. Number-, percentage-, or
+date-shaped substitutes could be reflected through non-string RPC fields that
+never cross a string redactor at all. A credential this model cannot keep out of
+its own logs is one it will not connect with.
+
+**Where the key may go.** `baseUrl` must be `https://` (which becomes `wss://`),
+is marked sensitive, and must not embed userinfo, an API-key form, a path, a
+query string or a fragment. Once the socket is open its own reported URL is
+checked again, before authentication: a connection that landed on a different
+host, or on `ws://` after `wss://` was approved, is closed with the key still
+unsent. A socket that reports no destination of its own is refused too, rather
+than checked against the URL that was asked for. Underneath that, the redirect
+is never taken in the first place: the pinned WebSocket client is configured
+with redirects disabled, so a 3xx handshake has no second hop for the key. The
+test suite holds that runtime to it, against a real local server that answers
+the handshake with a 302 to a second origin. `allowedHosts` pins the exact
+destination the key may be sent to; when set it is enforced before any socket
+opens and again against the destination the connection actually reached. A bare
+host covers only the scheme's default port (443 for HTTPS/WSS, 80 for HTTP/WS);
+every non-default port must be written as `host:port`. A pin with a scheme,
+path, or wildcard is rejected as a configuration error rather than silently
+matching nothing. **It is optional, and that is a deliberate trade.** Where
+`baseUrl` is a literal in your workflow file, a mandatory allowlist is a second
+copy of that same literal written at the same moment, so it cannot catch the
+typo it exists to catch. Where `baseUrl` comes from a vault expression, a
+datastore value, or a workflow variable, the pin is an independent literal and
+the only thing standing between a changed upstream value and your API key going
+somewhere new. Set it in that case. Left unset, the key goes to whatever host
+`baseUrl` names.
+
+**Cleartext opt-out.** `allowInsecureHttp: true` permits `http://` -> `ws://`
+with the key in cleartext on every call, so anyone on the path captures a live
+TrueNAS API key and any host answering that address receives it. It is off by
+default and exists for a trusted loopback or VPN path where TLS genuinely cannot
+be terminated on the NAS; leave it off unless that describes you.
+
+**Remote text.** Everything the far end says crosses one boundary on its way
+into a log line, an error message, a stored field or a tag: control, bidi and
+Unicode control, format, bidi, line-separator, and default-ignorable code points
+are removed first so the text cannot drive a terminal, reorder what you read, or
+split an echoed key to evade matching. The API key and every per-character
+JSON-escaped or ASCII-case-folded form are then redacted out of string results.
+Non-string diagnostic contents are never serialized at all; only their type is
+kept. Authentication-error prose is dropped entirely because partial and
+transformed key echoes cannot be exhaustively redacted. In that order, so a key
+echoed back with a zero-width character hidden inside it cannot slip past the
+match and then be reassembled by the screening pass that removes the character —
+and it is truncated on Unicode code-point boundaries (200 code points for logs
+and errors; 4,096 code points plus a truncation suffix for stored alert text).
+It is truncated rather than blanked, because "TrueNAS RPC failure: pool is busy"
+is the finding and a canned status code would make this model undiagnosable for
+the cases it exists to diagnose. The residual trade: a bounded, screened
+fragment of whatever the box said still reaches your logs and your `alert`
+records. Certificate expiry is never stored in its remote form: every accepted
+date becomes a canonical ISO timestamp first.
+
+**Written data.** Hostname, version, pool names and health, disk models and
 serial numbers, certificate names and CNs (which commonly reveal internal DNS
-names), and full alert text. Alert text is free-form prose written by TrueNAS
-and routinely embeds IP addresses, usernames from failed-login alerts, share and
-dataset paths, and disk serial numbers. Anywhere these resources are read is
-somewhere that data goes.
+names), and screened alert text truncated after 4,096 Unicode code points with a
+suffix. Alert text is free-form prose written by TrueNAS and routinely embeds IP
+addresses, usernames from failed-login alerts, share and dataset paths, and disk
+serial numbers. It is kept in a bounded, screened form rather than blanked,
+because an alert you cannot read is an alert you cannot act on. Anywhere these
+resources are read is somewhere that data goes.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the release gates every version passes before it reaches the registry.
+for the repository's security review requirements. This version is shared as
+GitHub source and is not published to the Swamp registry.

@@ -8,14 +8,20 @@ Deliberately not a metrics collector. Netdata already stores the telemetry and
 runs the health engine. This model just wades in, records the verdicts, and
 hands them to whatever workflow needs to act on them.
 
-**Version** `2026.08.23.1` · **License** MIT · **Source**
+**Version** `2026.09.05.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/netdata
 
 ## Install
 
+Clone this GitHub repository and register this extension's source in your Swamp
+repo. Replace the example path with the canonical location of your clone:
+
+```sh
+swamp extension source add /example/slog-bog/netdata --only models
 ```
-swamp extension pull @jpisgeek/netdata
-```
+
+This repaired version is distributed through GitHub source, not a registry
+release.
 
 ## `@jpisgeek/netdata`
 
@@ -24,7 +30,7 @@ swamp extension pull @jpisgeek/netdata
 | argument           | type            | required | default | description                                                                                                                                                                                                                                                                           |
 | ------------------ | --------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `nodes`            | array of object | yes      |         |                                                                                                                                                                                                                                                                                       |
-| `nodes[].name`     | string          | yes      |         | Logical node name; match the SSH fleet name                                                                                                                                                                                                                                           |
+| `nodes[].name`     | string          | yes      |         | Logical node name; match the SSH fleet name. 1-64 characters, no control characters: it becomes this model's resource instance names.                                                                                                                                                 |
 | `nodes[].url`      | string          | yes      |         | Agent base URL, e.g. http://netdata.example.com:19999                                                                                                                                                                                                                                 |
 | `nodes[].ssh`      | object          | no       |         | Reach this agent by running curl over SSH instead of connecting directly. For roaming machines: the agent stays bound to loopback with the host firewall on, so it never exposes a port on an untrusted network, and swamp still reaches it using the same key auth as the SSH fleet. |
 | `nodes[].ssh.host` | string          | yes      |         |                                                                                                                                                                                                                                                                                       |
@@ -102,40 +108,102 @@ rather than constructing them. Node names must stay distinct after
 normalisation, not just as typed: the node record's instance name is
 `node-<slug>`, so `NAS` and `nas`, or `db 1` and `db-1`, name the same record
 and are rejected at the start of the sweep rather than silently overwriting each
-other. A response that is not the shape the endpoint promises -- an `alarms` or
-`charts` value that is not an object, a `/data` row that is not an array -- is
-treated as a failed sub-fetch and carried forward, not read as zero alarms or an
-empty filesystem.
+other. Every API response is checked against the shape its endpoint promises
+before a single field is read, and anything that does not match is a failed
+sub-fetch: carried forward, node marked degraded, records protected from the
+prune. That includes a response body that is not a JSON object, an `alarms` or
+`charts` key that is missing, null or not an object, an alarm entry with no
+`status` or `chart`, an alarm `value` that is present but not a number, an
+`/api/v1/info` body missing `version`, `os_name`, `os_version`, `cores_total` or
+`collectors`, and a `/data` response without string labels and array rows.
+Absence is not zero: `{"alarms": {}}` is an agent telling you nothing is firing,
+while `{}` is an agent that did not answer the question, and only the first is
+read as zero alarms. Nothing unmeasured is ever written as a measurement -- an
+unreadable capacity does not become an empty filesystem, and a node whose
+`/info` is unusable does not become a reachable host with zero cores. Two
+records that would generate the same instance name are not merged: the first is
+written, the second is refused with a warning, and the node is marked degraded
+so the shortfall is visible rather than silent. This release renames every
+`alarm-*` and `mount-*` record once: the identity behind a record's hash suffix
+is now length-prefixed rather than joined on a control character, and the hash
+itself is wider. The first full sweep after the upgrade writes the new names and
+prunes the old ones. Node and summary record names are unchanged, and no stored
+field changes meaning.
 
 ## Security
 
-Plain HTTP to the agent API is accepted because the API carries no credential.
-HTTP is still unauthenticated in both directions: an on-path party can read the
-hostnames, OS/version, alarm text and mount paths in transit, and can rewrite
-the responses too (return no alarms so a firing critical reads as cleared, or
-inject text into the stored `error`/`info` fields). Prefer the SSH transport, or
-HTTPS for anything off a trusted LAN. `url` is restricted to `http(s)` and
-rejected if it embeds userinfo, and it is persisted verbatim as non-sensitive
-data. Redirects are never followed, on either transport: a 3xx is refused and
-recorded as a failed poll. A configured `https://` URL therefore stays HTTPS --
-previously the agent could answer 302 with an `http://` Location and silently
-downgrade the connection to cleartext, defeating the operator's choice without
-saying so anywhere. The SSH transport uses `BatchMode=yes` (unknown host keys
-fail closed) and never assembles a local shell command. Because that rewrite is
-in the threat model, the volume a single agent can impose is bounded as well as
-its content: response bodies are refused above 8 MiB, `maxMountsPerNode` and
-`maxAlarmsPerNode` cap how many per-mount queries and alarm writes one node can
-drive, and `nodeBudgetSec` caps the wall-clock time its whole poll may take.
-Hitting any of those marks the node degraded and preserves its existing records
-rather than pruning them. Every individual string the agent supplies -- alarm
-name, chart, status, units, the free-text `info`, mount path, hostname, OS and
-version -- is capped at 512 characters and has control characters replaced
-before it is stored or hashed into a record name, so no single field can be
-arbitrarily large and none can carry a raw escape sequence into a terminal or
-forge a colliding record name. Written data: node URL, hostname, OS, Netdata
-version, alarm names/values, mount paths and capacity, plus a free-text `error`
-field on unreachable nodes (a classified failure message, `user@host` and stderr
-stay in the log, not the resource).
+SSH stdout and stderr are streamed under separate 8 MiB and 8 KiB caps. Crossing
+either cap kills the child and refuses the node's poll. Caller cancellation and
+the command deadline kill the child with SIGKILL and end the wait even if a
+descendant retains the pipes or the child ignores termination. Cancelled sweeps
+do not write unreachable observations.
+
+**Transport.** Plain HTTP to the agent API is accepted because the API carries
+no credential. This is a deliberate trade, and what you are accepting is
+concrete: HTTP is unauthenticated in both directions, so an on-path party can
+read the hostnames, OS/version, alarm text and mount paths in transit, and can
+rewrite the responses too -- return no alarms so a firing critical reads as
+cleared, or inject text into the stored `error`/`info` fields. Prefer the SSH
+transport, or HTTPS for anything off a trusted LAN. `url` must be `http(s)` with
+no embedded userinfo, no query string and no fragment; a query string both
+carries credentials in practice and, because every endpoint is appended to this
+value, would redirect all four API calls onto `/`. The value stored on the
+`node` record is the canonical form swamp actually polled -- scheme, host, port
+and path with trailing slashes removed -- not the string as typed. Redirects are
+never followed, on either transport: a 3xx is refused and recorded as a failed
+poll, so a configured `https://` URL stays HTTPS instead of being downgraded to
+cleartext by the server's own `Location`.
+
+**SSH transport.** `ssh` runs with `BatchMode=yes` and an explicit
+`StrictHostKeyChecking=yes`, both passed on the command line so they win over
+`~/.ssh/config` and `/etc/ssh/ssh_config`. That means the node's host key must
+already be in the swamp host's `known_hosts`: an unknown or changed key fails
+the poll rather than being accepted. `ssh.host` and `ssh.user` are bounded to
+hostname/username characters, and no local shell is ever assembled. The remote
+`curl` runs with `-q` first, so `/etc/curlrc` and `~/.curlrc` on the node cannot
+switch on `insecure`, `location`, a `proxy` or a `user` credential behind
+swamp's back, and it then states its own policy explicitly
+(`--proto '=http,https'`, `--noproxy '*'`, no `-L`).
+
+**Bounds.** Because response rewriting is in the threat model, the volume a
+single agent can impose is bounded as well as its content: response bodies are
+refused above 8 MiB, `maxMountsPerNode` and `maxAlarmsPerNode` cap how many
+per-mount queries and alarm writes one node can drive, and `nodeBudgetSec` caps
+the wall-clock time its whole poll may take. Hitting any of those marks the node
+degraded and preserves its existing records rather than pruning them.
+
+**Stored data.** Written: node URL, hostname, OS, Netdata version, alarm
+names/values/units/info, mount paths and capacity, and an `error` field on nodes
+that did not answer. Treat all of it with the sensitivity of your infrastructure
+inventory. The free-text fields an agent supplies -- alarm name, chart, status,
+units, `info`, mount path, hostname, OS and version -- are deliberately
+persisted rather than dropped, because they are the reason the records are
+useful; the trade is that on a cleartext poll their contents are chosen by
+whoever can answer or rewrite the response. They are bounded rather than
+filtered: each is capped at 512 characters and has control characters replaced
+before it is stored, hashed into a record name, or written to a log field, so no
+single field can be arbitrarily large and none can carry a raw escape sequence
+into a terminal or forge a colliding record name. No other redaction is applied,
+so do not treat these fields as trustworthy prose. The `error` field is the
+exception: it is not agent text at all but one value from a fixed set of failure
+classes (`connection failed`, `timed out`, `HTTP 503 (transient)`,
+`ssh transport: host key verification failed`, `malformed response …`, and so
+on). Nothing from a response body, a `Location` header, ssh stderr or an ssh
+`user@host` reaches a stored field.
+
+**Logs.** The full diagnostic does go to `logger.warning`: the ssh target, ssh
+stderr, a bounded prefix of an HTTP error body, a refused redirect's `Location`,
+and the agent-supplied names in a degraded-mount warning. That is a deliberate
+trade in the other direction -- a fleet that quietly stops answering has to be
+diagnosable without querying stored data -- and it means swamp's log sink
+inherits the same sensitivity as the inventory: private hostnames, key paths
+echoed by ssh, and remote-chosen text. What the trade does not include is size:
+the agent-supplied parts of a log line -- alarm name, chart id, mount path, the
+endpoint path of a failed per-mount query -- go through the same 512-character
+cap and control-character replacement as the stored fields, so a rewritten
+response cannot turn one warning into a multi-megabyte log entry. If your logs
+go somewhere the datastore does not, account for that.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the release gates every version passes before it reaches the registry.
+for the repository's security review requirements. This version is shared as
+GitHub source and is not published to the Swamp registry.

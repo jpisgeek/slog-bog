@@ -1,6 +1,43 @@
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import { model } from "./dashboard.ts";
 
+Deno.test("known 32-bit identity collision cannot merge exceptions or suppressions", async () => {
+  // These suffixes collide under the previous FNV hash after tuple scoping.
+  const exceptions = ["7c852ba1", "e4d0bde7"].map((suffix) =>
+    exception({
+      id: `condition:${"a".repeat(300)}${suffix}`,
+    })
+  );
+  const first = await render([bundle({ exceptions })]);
+  const rows = first.written.filter((row) => row.spec === "exception");
+  assertEquals(rows.length, 2);
+  assertEquals(new Set(rows.map((row) => row.name)).size, 2);
+  assertEquals(new Set(rows.map((row) => row.data.id)).size, 2);
+  const suppressed = await render([bundle({ exceptions })], {
+    suppress: [{ id: rows[0].data.id, reason: "Synthetic accepted condition" }],
+  });
+  assertEquals(suppressed.result.suppressed, 1);
+  assertEquals(suppressed.result.warning, 1);
+});
+
+Deno.test("oversized and deeply nested bundle inputs remain visible coverage failures", async () => {
+  const oversized = bundle();
+  oversized.sections[0].summary = "x".repeat(2 * 1024 * 1024 + 1);
+  const nested = bundle() as Json;
+  let cursor = nested;
+  for (let index = 0; index < 40; index++) {
+    const child: Json = {};
+    cursor.extra = child;
+    cursor = child;
+  }
+  for (const input of [oversized, nested]) {
+    const result = await render([input]);
+    assertEquals(result.result.bundlesValid, 0);
+    assertStringIncludes(result.html, "Invalid dashboard bundle");
+    assertEquals(result.html.includes("Nothing needs you"), false);
+  }
+});
+
 type Json = Record<string, unknown>;
 
 function exception(extra: Json = {}) {
@@ -353,10 +390,107 @@ Deno.test("stale partial evidence cannot render all-clear", async () => {
 });
 
 Deno.test("resolved exception resources are pruned through the model API", async () => {
+  const first = await render([bundle({ exceptions: [exception()] })]);
+  const priorNames = first.result.exceptionResources as string[];
   const rendered = await render([bundle()], {
-    prior: { exceptionResources: ["exception-old-deadbeef"] },
+    prior: {
+      ...first.result,
+      exceptionResources: [...priorNames, ...priorNames],
+    },
   });
-  assertEquals(rendered.deleted, ["exception-old-deadbeef"]);
+  assertEquals(rendered.deleted, priorNames);
+});
+
+Deno.test("duplicate exception IDs cannot hide a later critical condition", async () => {
+  for (const acrossLevels of [false, true]) {
+    const input = bundle({
+      state: "critical",
+      exceptions: [
+        exception({ id: "condition:duplicate", severity: "warning" }),
+      ],
+    });
+    const critical = exception({
+      id: "condition:duplicate",
+      severity: "critical",
+    });
+    if (acrossLevels) (input as Json).exceptions = [critical];
+    else input.sections[0].exceptions.push(critical);
+    const rendered = await render([input]);
+    assertEquals(rendered.result.bundlesValid, 0);
+    assertEquals(rendered.result.critical, 1);
+    assertStringIncludes(rendered.html, "Duplicate dashboard identity");
+  }
+});
+
+Deno.test("duplicate section IDs become explicit critical coverage", async () => {
+  const input = bundle();
+  input.sections.push(structuredClone(input.sections[0]));
+  const rendered = await render([input]);
+  assertEquals(rendered.result.bundlesValid, 0);
+  assertEquals(rendered.result.critical, 1);
+  assertStringIncludes(rendered.html, "Duplicate dashboard identity");
+});
+
+Deno.test("oversized arrays are rejected by length before reading entries", async () => {
+  const values: unknown[] = [];
+  values.length = 1_000_000;
+  let read = false;
+  Object.defineProperty(values, "0", {
+    enumerable: true,
+    get: () => {
+      read = true;
+      return "example";
+    },
+  });
+  const input = bundle() as Json;
+  input.extra = values;
+  const rendered = await render([input]);
+  assertEquals(read, false);
+  assertEquals(rendered.result.bundlesValid, 0);
+});
+
+Deno.test("wide objects stop reading values when the node budget is exhausted", async () => {
+  const wide: Json = {};
+  let reads = 0;
+  for (let index = 0; index < 50_005; index++) {
+    Object.defineProperty(wide, `example${index}`, {
+      enumerable: true,
+      get: () => {
+        reads++;
+        return null;
+      },
+    });
+  }
+  const input = bundle() as Json;
+  input.extra = wide;
+  const rendered = await render([input]);
+  assertEquals(reads <= 50_000, true);
+  assertEquals(rendered.result.bundlesValid, 0);
+});
+
+Deno.test("forged or legacy prior render metadata cannot delete unrelated resources", async () => {
+  const first = await render([bundle({ exceptions: [exception()] })]);
+  const priorNames = first.result.exceptionResources as string[];
+  const forged: Json[] = [
+    { exceptionResources: priorNames },
+    { ...first.result, unexpected: true },
+    ...[
+      "render",
+      "unrelated-resource",
+      "exception-old-deadbeef",
+      `exception-old-${"A".repeat(64)}`,
+    ]
+      .map((name) => ({
+        ...first.result,
+        exceptionResources: [...priorNames, name],
+      })),
+  ];
+  for (const prior of forged) {
+    const rendered = await render([bundle()], { prior });
+    assertEquals(rendered.deleted, []);
+    assertEquals(rendered.result.warning, 1);
+    assertStringIncludes(rendered.html, "Previous render cleanup skipped");
+  }
 });
 
 Deno.test("accepted exceptions-first visual direction remains", async () => {

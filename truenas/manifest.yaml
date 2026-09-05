@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/truenas"
-version: 2026.08.23.1
+version: 2026.09.05.1
 description: >
   Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket API. Records system state, pools, disks, alerts, and certificate expiry as separate addressable resources, so a workflow can gate on any of them individually. Deliberately narrow: discovery only, no dataset, share, or snapshot management. The API key is supplied at runtime via vault.get().
 repository: https://github.com/jpisgeek/slog-bog/tree/main/truenas
@@ -25,4 +25,6 @@ labels:
   - storage
   - zfs
   - monitoring
-dependencies: []
+# Bundled module allowlist (exactly one): npm:ws@8.21.0. npm:zod@4 is Swamp's
+# runtime-provided exception and is not bundled. The manifest `dependencies`
+# key names other Swamp extensions, not npm modules; this extension has none.

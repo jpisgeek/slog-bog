@@ -7,14 +7,20 @@ official Admin APIs, then emits dashboard bundle v1. Usage and costs paginate
 independently so authorization, rate limits, malformed pages, and partial
 coverage cannot turn into reassuring zeroes.
 
-**Version** `2026.08.25.2` · **License** MIT · **Source**
+**Version** `2026.09.05.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/openai-usage
 
 ## Install
 
+Clone this GitHub repository and register this extension's source in your Swamp
+repo. Replace the example path with the canonical location of your clone:
+
+```sh
+swamp extension source add /example/slog-bog/openai-usage --only models,reports
 ```
-swamp extension pull @jpisgeek/openai-usage
-```
+
+This repaired version is distributed through GitHub source, not a registry
+release.
 
 ## `@jpisgeek/openai-usage`
 
@@ -46,37 +52,57 @@ Collect paginated completion usage and billed costs for an explicit UTC window.
 
 ```yaml
 globalArguments:
-  apiKey: ${{ vault.get("example-vault", "OPENAI_ADMIN_KEY") }}
+  apiKey: ${{ vault.get('<your-vault>', '<your-openai-admin-key-item>') }}
   timeoutMs: 15000
 reports:
   require:
     - "@jpisgeek/openai-usage"
 
 # Run with an explicit UTC window:
-# swamp model method run openai-org collect --input startTime=EXAMPLE_UNIX_SECONDS
+# swamp model method run <your-model-name> collect --input startTime=<unix-seconds>
 ```
 
 ## Caveats
 
-This package observes completion usage only; other OpenAI usage endpoint
-families are not silently included. The Usage and Costs APIs can differ, so
-billed cost remains a separate dimension and is authoritative for spend. Access
-requires an eligible OpenAI Admin API credential. This package does not inspect
-ChatGPT subscriptions, scrape personal dashboards, or infer remaining quota.
-Breakdown identifiers are retained as operational metadata. Optional fields
-OpenAI omits are read as absent rather than as errors: a missing cached-token
-counter is zero, and a cost row returned without an amount is excluded from the
-totals with the cost dimension marked partial, so an incomplete billed total is
-never reported as complete.
+After upgrading from versions before 2026.09.05.1, collect a fresh snapshot so
+text and audio counters are present in the report schema. This package observes
+completion usage only; other OpenAI usage endpoint families are not silently
+included. The Usage and Costs APIs can differ, so billed cost remains a separate
+dimension and is authoritative for spend. Access requires an eligible OpenAI
+Admin API credential. This package does not inspect ChatGPT subscriptions,
+scrape personal dashboards, or infer remaining quota. Breakdown identifiers are
+retained as operational metadata. Optional fields OpenAI omits are read as
+absent rather than as errors: a missing cached-token counter is zero, and a cost
+row returned without an amount is excluded from the totals with the cost
+dimension marked partial, so an incomplete billed total is never reported as
+complete. Responses are otherwise validated strictly, per endpoint: a page,
+bucket, or result row carrying a field this version does not model is treated as
+a response it cannot fully vouch for, and that dimension is reported unavailable
+rather than totalled from the part it recognised. If OpenAI adds a field to
+these result objects, expect that dimension to read `invalid-response` until
+this package models it. Each endpoint walk stops at 500 pages or five minutes;
+capped observations retain their successful prefix as partial coverage.
 
 ## Security
 
 Supply the Admin API key through a Swamp vault expression. It is marked
 sensitive, used only in the Authorization header, and never persisted in
 resources, errors, report output, or URLs. Response bodies and server error text
-are not persisted. Requests are fixed to the official HTTPS API origin. Stored
-project, model, and line-item breakdowns may expose internal workload names, so
-protect Swamp data and generated dashboards accordingly.
+are not persisted. Requests are fixed to the official HTTPS API origin and
+redirects are never followed, so a 3xx cannot carry the Admin API key to another
+host; a redirected request is recorded as a failed observation. The module
+exports no transport override: a caller may supply its own `fetch` only per
+collection call, alongside the key it is already providing, so no importer can
+install a transport that observes another caller's header. Stored project,
+model, and line-item breakdowns may expose internal workload names, so protect
+Swamp data and generated dashboards accordingly. The Bundle IDs use a
+domain-separated SHA-256 of the producing model ID, so different instances
+retain distinct, stable observations. The dashboard JSON report additionally
+records the local Swamp model name and instance ID that produced it, under
+`producer.modelName` and `producer.modelId`; both are listed in the bundle's
+sensitivity metadata so they can be stripped before a bundle is published
+anywhere.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the release gates every version passes before it reaches the registry.
+for the repository's security review requirements. This version is shared as
+GitHub source and is not published to the Swamp registry.

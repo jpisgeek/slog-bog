@@ -8,32 +8,38 @@ every device it has ever seen, including ones offline right now. One `device`
 resource per device, one `machine` per deduplicated host (NICs collapsed), one
 `inventory` roll-up.
 
-**Version** `2026.08.22.2` · **License** MIT · **Source**
+**Version** `2026.09.05.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/firewalla
 
 ## Install
 
+Clone this GitHub repository and register this extension's source in your Swamp
+repo. Replace the example path with the canonical location of your clone:
+
+```sh
+swamp extension source add /example/slog-bog/firewalla --only models
 ```
-swamp extension pull @jpisgeek/firewalla
-```
+
+This repaired version is distributed through GitHub source, not a registry
+release.
 
 ## `@jpisgeek/firewalla`
 
 ### Arguments
 
-| argument            | type            | required | default                                              | description                                                                                                                                                                                                                                                                                                                                                              |
-| ------------------- | --------------- | -------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `mspDomain`         | string          | yes      |                                                      | MSP domain, e.g. example-msp.firewalla.net (scheme optional). Must resolve under firewalla.net. The token is sent here.                                                                                                                                                                                                                                                  |
-| `token`             | string          | yes      |                                                      | MSP personal access token; source it from a vault expression                                                                                                                                                                                                                                                                                                             |
-| `deepCheckTypes`    | array of string | no       | `["desktop","nas&server","switch","goldpro","fwap"]` | deviceType values (prefix match) that belong to the deep tier                                                                                                                                                                                                                                                                                                            |
-| `timeoutSec`        | integer         | no       | `30`                                                 | HTTP timeout for MSP API calls                                                                                                                                                                                                                                                                                                                                           |
-| `wiredSuffixes`     | array of string | no       | `["eth","lan","en0"]`                                | Interface suffixes considered wired. A wired address wins the primaryIp race. It is the more reliable path to monitor over.                                                                                                                                                                                                                                              |
-| `interfaceSuffixes` | array of string | no       | `["eth","wifi","wl","awg","lan","en0"]`              | Trailing name segments that denote a NIC rather than a distinct machine. 'example-host-eth' and 'example-host-wifi' collapse to one machine, 'example-host'.                                                                                                                                                                                                             |
-| `apiManaged`        | array of string | no       | `[]`                                                 | Machines reached through their own API rather than SSH. They stay in the inventory but are never SSH fleet candidates. The Firewalla itself is handled automatically; add hosts like a TrueNAS box here.                                                                                                                                                                 |
-| `excludeNetworks`   | array of string | no       | `[]`                                                 | Firewalla networks that are off limits entirely. Devices on these are skipped before anything is written. Not collected, not counted, not stored. Use for VLANs outside the scope of this automation (a work network, a guest network you do not own).                                                                                                                   |
-| `exclude`           | array of string | no       | `[]`                                                 | Device names that must never be treated as machines, even if their deviceType lands them in the deep tier. Supports a trailing '*'. Thunderbolt docks are the motivating case: they hold a MAC and take an IP, so Firewalla reports them as 'desktop'.                                                                                                                   |
-| `dependencies`      | object          | no       | `{}`                                                 | machine -> machine it runs on or depends upon. A dependent being unreachable while its parent is down is a consequence, not a separate incident; downstream alerting can suppress on this.                                                                                                                                                                               |
-| `pruneMaxShrink`    | number          | no       | `0.5`                                                | Largest fraction of the previous sync's device total that may vanish in one run and still be pruned. 0.5 means a run seeing fewer than half of last run's devices refuses to delete anything and warns instead, on the assumption the fetch was not representative. Set to 1 to disable the shrink guard (a zero-device response still never prunes without forcePrune). |
+| argument            | type            | required | default                                              | description                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------- | --------------- | -------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mspDomain`         | string          | yes      |                                                      | MSP domain, e.g. example-msp.firewalla.net (scheme optional). Must resolve under firewalla.net. The token is sent here.                                                                                                                                                                                                                                                 |
+| `token`             | string          | yes      |                                                      | MSP personal access token; source it from a vault expression                                                                                                                                                                                                                                                                                                            |
+| `deepCheckTypes`    | array of string | no       | `["desktop","nas&server","switch","goldpro","fwap"]` | deviceType values (prefix match) that belong to the deep tier                                                                                                                                                                                                                                                                                                           |
+| `timeoutSec`        | integer         | no       | `30`                                                 | HTTP timeout for MSP API calls                                                                                                                                                                                                                                                                                                                                          |
+| `wiredSuffixes`     | array of string | no       | `["eth","lan","en0"]`                                | Interface suffixes considered wired. A wired address wins the primaryIp race. It is the more reliable path to monitor over.                                                                                                                                                                                                                                             |
+| `interfaceSuffixes` | array of string | no       | `["eth","wifi","wl","awg","lan","en0"]`              | Trailing name segments that denote a NIC rather than a distinct machine. 'example-host-eth' and 'example-host-wifi' collapse to one machine, 'example-host'.                                                                                                                                                                                                            |
+| `apiManaged`        | array of string | no       | `[]`                                                 | Machines reached through their own API rather than SSH. They stay in the inventory but are never SSH fleet candidates. The Firewalla itself is handled automatically; add hosts like a TrueNAS box here.                                                                                                                                                                |
+| `excludeNetworks`   | array of string | no       | `[]`                                                 | Firewalla networks that are off limits entirely. Devices on these are skipped before anything is written, and any record already stored for such a network is deleted on the next sync that can read it, regardless of the prune guards. Use for VLANs outside the scope of this automation (a work network, a guest network you do not own).                           |
+| `exclude`           | array of string | no       | `[]`                                                 | Device names that are never aggregated into a machine, even if their deviceType lands them in the deep tier. They are still written as device records, flagged excluded, so the skip is visible. Supports a trailing '*'. Thunderbolt docks are the motivating case: they hold a MAC and take an IP, so Firewalla reports them as 'desktop'.                            |
+| `dependencies`      | object          | no       | `{}`                                                 | machine -> machine it runs on or depends upon. A dependent being unreachable while its parent is down is a consequence, not a separate incident; downstream alerting can suppress on this.                                                                                                                                                                              |
+| `pruneMaxShrink`    | number          | no       | `0.5`                                                | Largest fraction of the last full sync's device baseline that may vanish in one run and still be pruned. 0.5 means a run seeing fewer than half of that baseline refuses to delete anything and warns instead, on the assumption the fetch was not representative. Set to 1 to disable the shrink guard (a zero-device response still never prunes without forcePrune). |
 
 ### Methods
 
@@ -53,11 +59,11 @@ sync, or one whose device count looks unrepresentative, does not.
 
 ### Data written
 
-| resource    | lifetime | fields                                                                                                                                                                                            | description                                                                                                                                                                                                                                       |
-| ----------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `device`    | infinite | `id`, `gid`, `name`, `ip`, `mac`, `macVendor`, `deviceType`, `network`, `online`, `ipReserved`, `isRouter`, `isFirewalla`, `totalDownload`, `totalUpload`, `tier`, `sshCandidate`, `excluded`     | One record per device known to the Firewalla, including devices that are currently offline. Tagged with tier, network, deviceType, online, and sshCandidate so workflow CEL can select subsets.                                                   |
-| `machine`   | infinite | `name`, `primaryIp`, `deviceType`, `macVendor`, `tier`, `sshCandidate`, `online`, `networks`, `interfaces`, `interfaceCount`, `dependsOn`                                                         | One record per machine, collapsed from the device list so a multi-homed host is checked once rather than once per NIC. This is the correct source for generating an SSH fleet. Tagged with tier, online, sshCandidate, multiHomed, and dependsOn. |
-| `inventory` | infinite | `mspDomain`, `total`, `online`, `offline`, `deep`, `presence`, `reserved`, `skippedByNetwork`, `excludedNetworks`, `machines`, `sshCandidates`, `excluded`, `networks`, `deviceTypes`, `syncedAt` | Single roll-up of the most recent sync: totals by tier and state, the network list, and a deviceType histogram.                                                                                                                                   |
+| resource    | lifetime | fields                                                                                                                                                                                                                                | description                                                                                                                                                                                                                                       |
+| ----------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `device`    | infinite | `id`, `gid`, `name`, `ip`, `mac`, `macVendor`, `deviceType`, `network`, `online`, `ipReserved`, `isRouter`, `isFirewalla`, `totalDownload`, `totalUpload`, `tier`, `sshCandidate`, `excluded`                                         | One record per device known to the Firewalla, including devices that are currently offline. Tagged with tier, network, deviceType, online, and sshCandidate so workflow CEL can select subsets.                                                   |
+| `machine`   | infinite | `name`, `primaryIp`, `deviceType`, `macVendor`, `tier`, `sshCandidate`, `online`, `networks`, `interfaces`, `interfaceCount`, `dependsOn`                                                                                             | One record per machine, collapsed from the device list so a multi-homed host is checked once rather than once per NIC. This is the correct source for generating an SSH fleet. Tagged with tier, online, sshCandidate, multiHomed, and dependsOn. |
+| `inventory` | infinite | `mspDomain`, `total`, `baselineTotal`, `online`, `offline`, `deep`, `presence`, `reserved`, `reservedUnknown`, `skippedByNetwork`, `excludedNetworks`, `machines`, `sshCandidates`, `excluded`, `networks`, `deviceTypes`, `syncedAt` | Single roll-up of the most recent sync: totals by tier and state, the network list, and a deviceType histogram.                                                                                                                                   |
 
 ## Example
 
@@ -68,11 +74,11 @@ globalArguments:
   deepCheckTypes: [desktop, "nas&server", switch, goldpro, fwap]
   interfaceSuffixes: [eth, wifi, wl, lan, en0]
   wiredSuffixes: [eth, lan, en0]
-  apiManaged: [nas]
+  apiManaged: [example-nas]
   excludeNetworks: [Guest]
-  exclude: ["dock-*"]
+  exclude: ["example-dock-*"]
   dependencies:
-    app-server: nas
+    example-app-server: example-nas
   timeoutSec: 30
   pruneMaxShrink: 0.5
 ```
@@ -85,26 +91,78 @@ duplicates: `device-<slug>-<hash>`, `machine-<slug>-<hash>`, and the single
 `inventory`. Pruning of departed records happens only on a full, unfiltered
 sync. A `tier`- or `network`-restricted run never deletes. It is also skipped,
 with a warning, when the run looks unrepresentative: no devices written at all,
-or a count that fell more than `pruneMaxShrink` below the previous roll-up's
-total. Pass `forcePrune: true` after a genuine mass decommission. Every
+or a count that fell more than `pruneMaxShrink` below `inventory.baselineTotal`,
+and when that baseline cannot be established at all — the stored roll-up could
+not be read, or predates this field. The baseline is not `total`: it moves only
+on a full, unfiltered sync that passed those guards, so a filtered run's small
+total can never become the floor a later full sync is measured against. Pass
+`forcePrune: true` after a genuine mass decommission. Know the limit of that
+guard: a run that refuses to prune still SUCCEEDS and still overwrites the
+`inventory` roll-up with the reduced counts it saw. The `inventory` resource
+carries no representative-or-degraded marker, so a consumer reading it cannot
+tell a suspicious fetch from a real decommission — only the warning in the log
+says the run was judged unrepresentative. Retaining the previous roll-up under a
+fresh `syncedAt` would be a worse lie than a low count, and failing the whole
+sync would discard a device list that is usually fine, so this is the trade the
+model makes. If your consumers need the distinction in data rather than in logs,
+gate on the warning or compare `total` against the previous run yourself. Every
 operator-supplied name is matched case- and whitespace-insensitively against
-what the MSP reports — `excludeNetworks`, `exclude`, `apiManaged`, and the
-`dependencies` keys all fold the same way, and two `dependencies` keys that fold
-together are reported rather than silently merged. Two devices reported under
-the same name are kept as separate machines even when both names carry a NIC
-suffix. The `machine` list, not the raw `device` list, is the correct source for
-generating an SSH fleet. Fields the MSP omits are omitted from the record rather
-than defaulted: `ip`, `totalDownload`, and `totalUpload` are simply absent when
-unknown, so a missing counter never reads as measured zero traffic. `online` is
-the deliberate exception. It stays a required boolean and an absent value is
-recorded as offline, because every consumer of this model asks a two-state
-question and an absent presence signal should fail loudly (a fleet that reports
-down gets looked at) rather than quietly green. A run that had to do this logs a
-warning naming the count. The response is validated field by field rather than
-parsed strictly: entries that are not objects are skipped and counted, but a
-field the MSP _adds_ is ignored, not treated as an error. An inventory model
-going dark because the vendor shipped a new attribute would be a worse failure
-than the one strict parsing prevents.
+what the MSP reports — `excludeNetworks`, `exclude`, `apiManaged`, the `network`
+method argument, and the `dependencies` keys all fold the same way, and two
+`dependencies` keys that fold together are reported rather than silently merged.
+Machines are grouped in one pass over the whole response rather than as devices
+stream past, so machine identity never depends on the order the MSP returned its
+array in. Two devices reported under the same name are kept as separate machines
+even when both names carry a NIC suffix, and when one name is reported for more
+than one host, NIC deduplication is not applied to that name at all: the API
+carries no host identifier, so nothing reliably says which `nas-eth` belongs
+with which `nas-wifi`. Every device under a colliding name becomes its own
+machine named `<name>-<mac>` — none of them keeps the bare name — so a
+multi-homed host caught by this is reported once per interface. That is logged,
+and so is a `dependencies` edge left pointing at a name that has become
+ambiguous. The `machine` list, not the raw `device` list, is the correct source
+for generating an SSH fleet. A device matched by `exclude` is written as a
+`device` record flagged `excluded` and is not aggregated into a machine at all:
+no `machine` resource, no entry in `inventory.machines`, no SSH candidacy. Only
+the device record remains, which is where a Thunderbolt dock belongs.
+`excludeNetworks` is enforced in both directions. Devices on an off-limits
+network are skipped before anything is written, and any record already in the
+datastore whose own networks are all off limits is deleted on the next sync,
+including runs that are `tier`- or `network`-filtered and runs whose device
+count tripped a prune guard. That deletion is deliberately outside those guards:
+pruning acts on an absence that a bad fetch makes meaningless, while this acts
+on the stored record's own network, which a bad fetch does not change. A machine
+with even one interface on an in-scope network is kept. A record the datastore
+cannot return is left alone rather than deleted on a guess, so excluding a
+network you have never synced does nothing. Resource names are a bounded
+readability slug plus 128 bits of SHA-256 over the record's full identity tuple,
+making accidental collisions unlikely without claiming a mathematical guarantee.
+Changing `interfaceSuffixes` changes machine identity by design, and the old
+records are pruned as departed on the next full, representative sync. Fields the
+MSP omits are omitted from the record rather than defaulted: `ip`, `primaryIp`,
+the machine interface `ip`, `totalDownload`, `totalUpload`, `ipReserved`,
+`isRouter` and `isFirewalla` are simply absent when unknown, so a missing
+counter never reads as measured zero traffic and a host with no known address
+never produces an SSH target pointing at the empty string. The three booleans
+matter for a sharper reason: a defaulted `false` is not "unknown", it is the
+positive claim that the field was checked. An unknown `isFirewalla` therefore
+WITHHOLDS SSH candidacy rather than granting it — `sshCandidate` is "deep tier
+and not the firewall", and the Firewalla's own deviceType is deep tier, so a
+defaulted `false` put the firewall itself into the generated SSH fleet. If the
+MSP renames that field the fleet goes empty and a warning names the count, which
+is the loud direction of failure. An unknown `ipReserved` is counted in
+`inventory.reservedUnknown` rather than folded into `inventory.reserved`, so a
+fleet whose reservation flag was never reported cannot render as the measured
+fact `reserved: 0`; `reserved` is a count of measured reservations only.
+`online` is the deliberate exception. It stays a required boolean and an absent
+value is recorded as offline, because every consumer of this model asks a
+two-state question and an absent presence signal should fail loudly (a fleet
+that reports down gets looked at) rather than quietly green. A run that had to
+do this logs a warning naming the count. The response is validated field by
+field rather than parsed strictly: entries that are not objects are skipped and
+counted, but a field the MSP _adds_ is ignored, not treated as an error. An
+inventory model going dark because the vendor shipped a new attribute would be a
+worse failure than the one strict parsing prevents.
 
 ## Security
 
@@ -115,15 +173,26 @@ sent. The request always goes to `https://<hostname>` and sets
 instead of relying on the runtime to strip the credential. The token is marked
 sensitive and sent as `Authorization: Token <token>`. Every piece of foreign
 text that reaches an error message — HTTP error bodies, JSON parser messages
-that quote the body, network errors, and datastore driver errors — is passed
-through the same redaction first, and 401/403 bodies are discarded entirely.
-429/503 retries honour `Retry-After` capped at 5 s, and `timeoutSec` bounds the
-whole call including the retry waits, not just one request. Written data is a
-personal inventory of your network: device names, MAC addresses, IPs, vendors,
+that quote the body, network errors, and datastore driver errors — is screened
+for control and invisible characters, then passed through the same
+case-insensitive token redaction first, and 401/403 bodies are discarded
+entirely. 429/503 retries honour `Retry-After` in either standard form,
+delay-seconds or an HTTP-date, capped at 5 s; an unparseable value falls back to
+exponential backoff. `timeoutSec` bounds the whole call including the retry
+waits, not just one request, and a run cut short is reported as cancellation or
+timeout at every point one can happen — mid-request, mid-retry-wait, and
+mid-body — rather than as a malformed response from the vendor. Written data is
+a personal inventory of your network: device names, MAC addresses, IPs, vendors,
 networks, online state, traffic totals, plus your MSP tenant hostname in the
 `inventory` roll-up. Treat the datastore accordingly. The LICENSE carries the
 author's real name as ordinary MIT attribution; that is a deliberate choice, not
-an oversight.
+an oversight. Non-sensitive configuration is checked for the configured token
+before requests or logs. The entire decoded API payload is checked before logs,
+identity hashing, or writes. An exact, case-folded, or invisibly split
+credential echo aborts the call instead of storing a redacted value as a device
+identity. Unknown fields are included in this check, and JSON string escapes are
+decoded first.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the release gates every version passes before it reaches the registry.
+for the repository's security review requirements. This version is shared as
+GitHub source and is not published to the Swamp registry.

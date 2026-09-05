@@ -171,6 +171,14 @@ const EmbeddingArgsSchema = z.object({
     .string()
     .min(1)
     .default("swamp lmstudio probe")
+    // Caller-supplied content, sent to a third-party endpoint: whoever
+    // overrides the default is by definition testing their own text, which
+    // can be a document, a customer record, or anything else. Marked
+    // sensitive so the platform and every display treat it the way they treat
+    // apiToken rather than echoing it into run output and history. The meta()
+    // must come after default(): the wrapper carries its own metadata, so
+    // marking the inner string leaves the argument itself unmarked.
+    .meta({ sensitive: true })
     .describe(
       "Short text sent as the embedding input. The default is enough to " +
         "measure vector dimension; override only to test content-specific " +
@@ -188,6 +196,11 @@ const CompletionArgsSchema = z.object({
   prompt: z
     .string()
     .min(1)
+    // Same reasoning as `input` above, and stronger: this argument has no
+    // default at all, so every value it ever holds is the operator's own
+    // text. Marked sensitive so it is handled like a credential in displays
+    // and run records rather than as ordinary argument text.
+    .meta({ sensitive: true })
     .describe(
       "Caller-supplied prompt. No default -- the point of this probe is " +
         "testing a real prompt against a real model, not a canned string.",
@@ -376,6 +389,131 @@ function redact(text: string, token: string): string {
 }
 
 /**
+ * Remove everything from a remote-controlled string that can drive a
+ * terminal, hide or reorder displayed text, or decode ambiguously.
+ *
+ * Split out of safeRemoteText() because the order of the three passes --
+ * screen, redact, clamp -- is load-bearing, and each of them now runs over
+ * the whole string.
+ *
+ * Screening runs FIRST because redaction is a literal substring match. An
+ * endpoint that echoes the token back with a zero-width space wedged into the
+ * middle of it does not match the configured token, so a redact-first pass
+ * left it alone -- and the zero-width strip that ran afterwards reassembled
+ * the credential intact inside the stored `error`.
+ */
+function screenRemoteText(text: string): string {
+  return text
+    // deno-lint-ignore no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
+    .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "\ufffd")
+    .replace(/(^|[^\ud800-\udbff])([\udc00-\udfff])/g, "$1\ufffd")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * The one cut this function cannot move is the byte cap inside
+ * readBodyCapped(): the body is already severed at MAX_RESPONSE_BYTES before
+ * any of this runs, and that cut can land inside an echoed token, leaving a
+ * genuine prefix of the credential at the very end of the text where split()
+ * cannot match it. Collapsing whitespace then pulls that tail forward, so
+ * "it is 256 KiB in, nobody will ever read that far" is not an argument.
+ *
+ * Applied only to a read that actually hit the cap: the tail of a complete
+ * body is complete, and running this unconditionally would clip real error
+ * text that merely happens to end with the token's first character.
+ */
+function stripTrailingTokenPrefix(text: string, token: string): string {
+  if (!token) return text;
+  const longest = Math.min(token.length - 1, text.length);
+  for (let n = longest; n > 0; n--) {
+    if (token.startsWith(text.slice(text.length - n))) {
+      return `${text.slice(0, text.length - n)}[REDACTED]`;
+    }
+  }
+  return text;
+}
+
+/**
+ * Strip every form of the token from already-screened text.
+ *
+ * The screened spelling of the token is removed as well as the configured
+ * one: screening collapses whitespace and drops zero-width characters, so a
+ * token containing either no longer matches its own configured spelling by
+ * the time this runs.
+ */
+function redactAll(text: string, token: string, truncated: boolean): string {
+  let out = redact(text, token);
+  const screenedToken = screenRemoteText(token);
+  const alsoScreened = screenedToken !== "" && screenedToken !== token;
+  if (alsoScreened) out = redact(out, screenedToken);
+  if (truncated) {
+    out = stripTrailingTokenPrefix(out, token);
+    if (alsoScreened) out = stripTrailingTokenPrefix(out, screenedToken);
+  }
+  return out;
+}
+
+/**
+ * True when text carries the configured token in either of the two spellings
+ * redactAll() knows about.
+ *
+ * The screened spelling is checked as well as the configured one for the same
+ * reason redaction checks it: screenRemoteText() collapses whitespace and
+ * drops zero-width characters, so a token containing either no longer matches
+ * its own configured spelling once the text around it has been screened.
+ */
+function containsToken(text: string, token: string): boolean {
+  if (!token) return false;
+  if (text.includes(token)) return true;
+  const screened = screenRemoteText(token);
+  return screened !== "" && screened !== token && text.includes(screened);
+}
+
+/**
+ * Refuse a model id that carries the bearer token.
+ *
+ * The RemoteText screen on every `model` argument bounds and screens it, but
+ * says nothing about a perfectly well-formed id that happens to BE the
+ * credential. A model id is stored, tagged, logged, and folded into an
+ * instance name that maps to a storage path -- none of which run through
+ * redactAll(), because an id is a measurement rather than a message. So a
+ * model id copy-pasted from the wrong field, or handed over by whatever
+ * generated the workflow input, would write the token into an
+ * `infinite`-lifetime resource and into a filesystem path. Thrown rather than
+ * redacted, for the same reason endpoint.models refuses such an id outright:
+ * "[REDACTED]" stored as the model that was probed is a wrong answer.
+ */
+function assertModelIsNotToken(model: string, token: string): void {
+  if (containsToken(model, token)) {
+    throw new Error(
+      "INVALID_ARGUMENT: the model id contains the configured API token; it " +
+        "would be stored, tagged, logged, and used as a storage path",
+    );
+  }
+}
+
+/**
+ * Cut screened text to `max` characters without severing a surrogate pair.
+ *
+ * `slice()` cuts by UTF-16 code unit, so a cut landing between the two halves
+ * of an astral character leaves a lone surrogate at the end of the kept text
+ * -- recreating, after the screen, exactly what screenRemoteText() replaced a
+ * moment earlier, in a stored `error` this extension documents as screened.
+ * Because screening already replaced every unpaired surrogate, a high
+ * surrogate at the boundary is necessarily the first half of a real pair, so
+ * backing the cut up by one code unit is all that is needed.
+ */
+function clampText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const boundary = text.charCodeAt(max - 1);
+  const cut = boundary >= 0xd800 && boundary <= 0xdbff ? max - 1 : max;
+  return `${text.slice(0, cut)}...`;
+}
+
+/**
  * Screen a remote-controlled string before it reaches a log line, a thrown
  * error, or a stored resource.
  *
@@ -397,17 +535,40 @@ function redact(text: string, token: string): string {
  * be unbounded or to drive a terminal. The residual trade -- an endpoint that
  * echoes your prompt inside its own error body can put part of it in `error`
  * -- is stated in the README Security section rather than papered over.
+ *
+ * The clamp happens LAST, and that ordering is the whole fix for a real leak.
+ * The old shape was `redact(text.slice(0, 4096), token)`: it cut the body
+ * first and searched only the cut for the token, so a token longer than 4096
+ * characters echoed at the start of a response was split by the slice, no
+ * longer matched `split(token)`, and rode through with its first 4096
+ * characters intact -- of which the first `max` were then written into an
+ * `infinite`-lifetime resource and into a thrown message. Nothing is cut here
+ * until every occurrence of the credential is already gone from the complete
+ * response, which readBodyCapped() has already bounded to
+ * MAX_RESPONSE_BYTES.
+ *
+ * `truncated` reports that the read hit that byte cap -- the one cut this
+ * function did not make; see stripTrailingTokenPrefix().
  */
-function safeRemoteText(text: string, token: string, max: number): string {
-  const screened = redact(text.slice(0, 4096), token)
-    // deno-lint-ignore no-control-regex
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
-    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
-    .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "\ufffd")
-    .replace(/(^|[^\ud800-\udbff])([\udc00-\udfff])/g, "$1\ufffd")
-    .replace(/\s+/g, " ")
-    .trim();
-  return screened.length > max ? `${screened.slice(0, max)}...` : screened;
+function safeRemoteText(
+  text: string,
+  token: string,
+  max: number,
+  truncated = false,
+  alsoRedact = "",
+): string {
+  let safe = redactAll(screenRemoteText(text), token, truncated);
+  // A second secret in exactly the same position as the token: the embedding
+  // input the caller submitted. An endpoint that echoes the request back
+  // inside its own error body puts that text into an `infinite`-lifetime
+  // `error` field, and the token-only pass above has no idea it is there.
+  // Redacted here rather than at the call site so it lands between the same
+  // two passes the token gets -- after screening, because a zero-width
+  // character wedged into the echo would otherwise defeat the literal match
+  // and then be stripped back into place, and before the clamp, because a cut
+  // that split the echo would leave a fragment redaction can no longer match.
+  if (alsoRedact) safe = redactAll(safe, alsoRedact, truncated);
+  return clampText(safe, max);
 }
 
 /**
@@ -669,13 +830,13 @@ function classifyHttpError(
     return {
       kind: "model_not_found",
       message: `endpoint reports the model id is not recognized: ${
-        bodyText.slice(0, MAX_ERROR_SNIPPET)
+        clampText(bodyText, MAX_ERROR_SNIPPET)
       }`,
     };
   }
   return {
     kind: "http_error",
-    message: `HTTP ${status}: ${bodyText.slice(0, MAX_ERROR_SNIPPET)}`,
+    message: `HTTP ${status}: ${clampText(bodyText, MAX_ERROR_SNIPPET)}`,
   };
 }
 
@@ -843,7 +1004,12 @@ async function chatCompletion(
     // body -- a misconfigured proxy's error page could in principle include
     // request headers -- and bound and screen it before it is classified or
     // stored.
-    const safeBody = safeRemoteText(body.text, token, MAX_CLASSIFY_SCAN);
+    const safeBody = safeRemoteText(
+      body.text,
+      token,
+      MAX_CLASSIFY_SCAN,
+      body.truncated,
+    );
     const c = classifyHttpError(finalResponse.status, safeBody);
     if (c.kind === "unauthorized") {
       // A bad token is a configuration fault, not a measurement, so it is
@@ -977,6 +1143,9 @@ async function embedding(
 ) {
   const a = EmbeddingArgsSchema.parse(args);
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  // Cross-field check, before the id is logged, tagged, stored, or turned
+  // into a storage path: see assertModelIsNotToken().
+  assertModelIsNotToken(a.model, g.apiToken);
   const base = normalizeBase(g.baseUrl);
   const timeoutMs = g.timeoutSec * 1000;
 
@@ -1095,10 +1264,17 @@ async function embedding(
         // Redaction and screening point: strip the token, bound, and screen
         // before any response body reaches a classification or a stored error
         // message.
+        // The submitted input is passed as a second secret to strip: an
+        // endpoint that quotes the request it rejected ("cannot embed
+        // '<your text>'") would otherwise park the caller's content in an
+        // `infinite`-lifetime `error` field, which is the same leak the token
+        // redaction exists to prevent and is not covered by it.
         const safeBody = safeRemoteText(
           body.text,
           g.apiToken,
           MAX_CLASSIFY_SCAN,
+          body.truncated,
+          a.input,
         );
         const c = classifyHttpError(response.status, safeBody);
         if (c.kind === "unauthorized") {
@@ -1208,6 +1384,9 @@ async function completion(
 ) {
   const a = CompletionArgsSchema.parse(args);
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  // Cross-field check, before the id is logged, tagged, stored, or turned
+  // into a storage path: see assertModelIsNotToken().
+  assertModelIsNotToken(a.model, g.apiToken);
   const base = normalizeBase(g.baseUrl);
   const timeoutMs = g.timeoutSec * 1000;
 
@@ -1318,6 +1497,9 @@ async function capabilities(
 ) {
   const a = CapabilitiesArgsSchema.parse(args);
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  // Cross-field check, before the id is logged, tagged, stored, or turned
+  // into a storage path: see assertModelIsNotToken().
+  assertModelIsNotToken(a.model, g.apiToken);
   const base = normalizeBase(g.baseUrl);
   const timeoutMs = g.timeoutSec * 1000;
 
@@ -1512,11 +1694,16 @@ async function capabilities(
  */
 export const model = {
   type: "@jpisgeek/lmstudio/probe",
-  version: "2026.08.25.1",
+  version: "2026.09.05.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.08.25.1",
     description: "Tighten probe validation with no argument schema changes",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.09.05.1",
+    description:
+      "Security hardening without renaming arguments or changing destinations; existing values are preserved and must pass current validation",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
 

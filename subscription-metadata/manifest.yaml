@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/subscription-metadata"
-version: 2026.08.25.2
+version: 2026.09.05.1
 description: >
   Explicit operator-supplied subscription plan metadata normalized into
   dashboard bundle v1 without scraping, quota inference, or fictional usage

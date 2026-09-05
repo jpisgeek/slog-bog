@@ -194,9 +194,14 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
+  // Evidence links are persisted and rendered; reject embedded credentials.
   url: z.string().url().refine(
-    (value) => new URL(value).protocol === "https:",
-    "evidence URLs must use https",
+    (value) => {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" && parsed.username === "" &&
+        parsed.password === "";
+    },
+    "evidence URLs must use https and must not carry credentials",
   ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
@@ -434,34 +439,88 @@ const StatusSchema = z.object({
   errorKind: z.string(),
   message: z.string(),
 });
+const RefreshStateSchema = z.enum(["absent", "observed", "invalid"]);
+type RefreshState = z.infer<typeof RefreshStateSchema>;
 const SnapshotSchema = z.object({
   provider: z.literal("anthropic"),
   accountKind: z.enum(["platform", "enterprise"]),
   collectedAt: z.iso.datetime(),
   coverageStart: z.iso.datetime(),
   coverageEnd: z.iso.datetime(),
-  dataRefreshedAt: z.iso.datetime().nullable(),
+  // Required, with no default and no inference from the timestamp beside it,
+  // and one pair per dimension.
+  //
+  // The collector used to discard a present-but-unusable data_refreshed_at and
+  // store null, which was also what it stored when Anthropic sent no refresh
+  // evidence at all. This report then wrote `observedAt: s.dataRefreshedAt ??
+  // s.collectedAt` and labelled the section fresh, so a response whose freshness
+  // claim was garbage rendered as a healthy, recently-refreshed dashboard.
+  //
+  // The pair was also shared by both sections, so a usage timestamp was
+  // rendered as the cost section's freshness too. Each section is now drawn
+  // from the evidence of the endpoint it reports on, and neither borrows the
+  // other's.
+  //
+  // A snapshot that does not state which of the three cases each dimension is
+  // in cannot be rendered honestly, so it does not parse at all: read() returns
+  // null and the bundle reports both dimensions unavailable. That is loud and
+  // fail-safe, which is the correct direction — inferring "absent" from a null
+  // timestamp would silently restore the exact substitution these fields exist
+  // to stop.
+  usageRefreshedAt: z.iso.datetime().nullable(),
+  usageRefreshState: RefreshStateSchema,
+  costRefreshedAt: z.iso.datetime().nullable(),
+  costRefreshState: RefreshStateSchema,
   usageStatus: StatusSchema,
   costStatus: StatusSchema,
+  // The breakdown rows mirror the collector's own row schemas rather than
+  // standing in as an array of anything. Only their count is rendered, but a
+  // count is a completeness claim: `z.array(z.unknown())` counted whatever
+  // happened to be in the array, so a snapshot whose rows were not the rows this
+  // report describes still produced an exact-looking "observed" figure.
+  // The totals carry the same constraints the collector applied when it wrote
+  // them. `z.number()` here was laxer than the writer: a negative or fractional
+  // token count — impossible from the collector, so evidence the snapshot was
+  // edited or produced by something else — parsed cleanly and was rendered as
+  // an observed metric with `confidence: "exact"`. A reader that is more
+  // permissive than the writer turns a corrupted file into a confident number.
   usage: z.object({
-    uncachedInputTokens: z.number(),
-    cacheCreation5mTokens: z.number(),
-    cacheCreation1hTokens: z.number(),
-    cacheReadTokens: z.number(),
-    outputTokens: z.number(),
-    requests: z.number().nullable(),
-    breakdowns: z.array(z.unknown()),
+    uncachedInputTokens: z.number().int().nonnegative(),
+    cacheCreation5mTokens: z.number().int().nonnegative(),
+    cacheCreation1hTokens: z.number().int().nonnegative(),
+    cacheReadTokens: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    requests: z.number().int().nonnegative().nullable(),
+    breakdowns: z.array(z.object({
+      product: z.string().nullable(),
+      model: z.string().nullable(),
+      workspaceId: z.string().nullable(),
+      uncachedInputTokens: z.number().int().nonnegative(),
+      cacheCreation5mTokens: z.number().int().nonnegative(),
+      cacheCreation1hTokens: z.number().int().nonnegative(),
+      cacheReadTokens: z.number().int().nonnegative(),
+      outputTokens: z.number().int().nonnegative(),
+      requests: z.number().int().nonnegative().nullable(),
+    })),
     groupedTop100Cap: z.boolean(),
   }).nullable(),
   costs: z.object({
-    // `amount`, not `amountMinor`: the collector stores the Cost Report's own
-    // decimal in the currency's major unit ("1.25" is 1.25 USD). The old name
-    // and the old "minor units" summary string invited a consumer to divide by
-    // 100 — a 100x underreport — because nothing ever scaled the value.
+    // The collector retains fractional cents as decimal strings. The report
+    // preserves exact strings even when a numeric metric cannot represent one.
     totals: z.array(
-      z.object({ currency: z.string(), amount: z.string() }),
+      z.object({
+        currency: z.string().regex(/^[A-Z]{3}$/),
+        amountMinor: z.string().regex(/^\d+(\.\d+)?$/),
+      }),
     ),
-    breakdowns: z.array(z.unknown()),
+    breakdowns: z.array(z.object({
+      product: z.string().nullable(),
+      model: z.string().nullable(),
+      workspaceId: z.string().nullable(),
+      description: z.string().nullable(),
+      amountMinor: z.string().regex(/^\d+(\.\d+)?$/),
+      currency: z.string().regex(/^[A-Z]{3}$/),
+    })),
     groupedTop100Cap: z.boolean(),
   }).nullable(),
 });
@@ -490,6 +549,154 @@ const sensitivity = {
   redacted: false,
   note: "Breakdowns can reveal internal workspaces and workloads",
 };
+/**
+ * Bundle-level sensitivity has to cover the producer block as well as the
+ * Anthropic breakdowns.
+ *
+ * `producer.modelName` is the operator's own Swamp model name and
+ * `producer.modelId` its instance ID. Neither comes from Anthropic; both name
+ * the operator's local infrastructure, and both are written into the exportable
+ * dashboard JSON. They were emitted while this field list mentioned only the
+ * Anthropic dimensions, so an operator deciding what was safe to publish read a
+ * list that omitted the two identifiers describing their own host. The bundle
+ * contract requires modelName, so the fix is disclosure rather than omission:
+ * anyone who must redact before publishing now knows exactly which paths to
+ * strip, and the README says the same thing in prose.
+ */
+const bundleSensitivity = {
+  classification: "operational" as const,
+  fields: [
+    "workspaceId",
+    "model",
+    "product",
+    "description",
+    "producer.modelName",
+    "producer.modelId",
+  ],
+  redacted: false,
+  note:
+    "Breakdowns can reveal internal workspaces and workloads; the producer block additionally names the local Swamp model and its instance ID",
+};
+/**
+ * Vendor freshness evidence, rendered as the three distinct things it can be.
+ *
+ * Only an `observed` refresh timestamp produces a fresh observation. An
+ * `invalid` one — Anthropic sent a data_refreshed_at that is not a usable
+ * timestamp — produces unknown freshness with a reason, which
+ * deriveOverallState escalates so the bundle cannot read healthy on freshness
+ * evidence that was malformed. `absent` keeps the collection timestamp, because
+ * that really is when this observation was made, but says so in the reason
+ * instead of presenting it as the vendor's own refresh time.
+ */
+const REFRESH_INVALID_REASON =
+  "Anthropic returned a data refresh timestamp that is not a usable RFC 3339 value, so vendor freshness cannot be established";
+function freshness(
+  state: RefreshState,
+  observed: string | null,
+  collectedAt: string,
+) {
+  if (state === "invalid") {
+    return { state: "unknown", reason: REFRESH_INVALID_REASON };
+  }
+  if (state === "observed" && observed) {
+    return { state: "fresh", observedAt: observed };
+  }
+  return {
+    state: "fresh",
+    observedAt: collectedAt,
+    reason:
+      "Anthropic reported no data refresh timestamp for this dimension; this is the collection time, not a vendor refresh time",
+  };
+}
+/** The exception raised on a section whose own freshness evidence is junk. */
+function refreshExceptions(state: RefreshState, subject: string) {
+  if (state !== "invalid") return [];
+  return [{
+    id: "anthropic:refresh:invalid-response",
+    severity: "warning",
+    subject,
+    headline: "Vendor refresh timestamp is unreadable",
+    detail: REFRESH_INVALID_REASON,
+    source: "@jpisgeek/anthropic-usage",
+    suppressed: false,
+    suppressReason: "",
+    sensitivity: "operational",
+  }];
+}
+/** Malformed freshness evidence must not leave its section reading healthy. */
+function withRefreshState(
+  state: DashboardState,
+  refresh: RefreshState,
+): DashboardState {
+  return refresh === "invalid" && state === "healthy" ? "unknown" : state;
+}
+/** Decimal string as an exact integer numerator at `places` decimal places. */
+function scaled(amountMinor: string, places: number): bigint {
+  const [whole, fraction = ""] = amountMinor.split(".");
+  return BigInt(whole + fraction.padEnd(places, "0"));
+}
+/**
+ * Whether each stated total is the sum of the breakdown rows under it.
+ *
+ * A total is a claim about those rows, and this report renders it as an exact
+ * observed metric while rendering the row count as exact completeness beside
+ * it. The collector derives both from the same rows, so a snapshot where they
+ * disagree did not come from the collector this report describes: it was
+ * edited, truncated, or written by something else. Rendering it would put a
+ * confident figure on the dashboard that nothing underneath supports, so the
+ * snapshot is refused whole and both sections report unavailable — the same
+ * fail-safe path an unparseable snapshot already takes.
+ *
+ * Cost is compared as scaled integers rather than as doubles: "0.1" + "0.2" is
+ * the textbook case where a float comparison would reject an honest snapshot.
+ */
+function totalsMatchBreakdowns(s: Snapshot): boolean {
+  const usage = s.usage;
+  if (usage) {
+    const sum = (
+      pick: (
+        row: NonNullable<Snapshot["usage"]>["breakdowns"][number],
+      ) => number,
+    ) => usage.breakdowns.reduce((n, row) => n + pick(row), 0);
+    if (
+      sum((r) => r.uncachedInputTokens) !== usage.uncachedInputTokens ||
+      sum((r) => r.cacheCreation5mTokens) !== usage.cacheCreation5mTokens ||
+      sum((r) => r.cacheCreation1hTokens) !== usage.cacheCreation1hTokens ||
+      sum((r) => r.cacheReadTokens) !== usage.cacheReadTokens ||
+      sum((r) => r.outputTokens) !== usage.outputTokens ||
+      // Platform reports no request count and stores null for both the total
+      // and every row, which is agreement, not a mismatch.
+      (usage.requests !== null &&
+        sum((r) => r.requests ?? 0) !== usage.requests)
+    ) return false;
+  }
+  const costs = s.costs;
+  if (costs) {
+    const places = Math.max(
+      0,
+      ...costs.breakdowns.map((r) =>
+        (r.amountMinor.split(".")[1] ?? "").length
+      ),
+      ...costs.totals.map((t) => (t.amountMinor.split(".")[1] ?? "").length),
+    );
+    const sums = new Map<string, bigint>();
+    for (const row of costs.breakdowns) {
+      sums.set(
+        row.currency,
+        (sums.get(row.currency) ?? 0n) + scaled(row.amountMinor, places),
+      );
+    }
+    // A currency present on one side only is a mismatch in either direction: a
+    // total with no rows behind it, or rows whose currency no total covers.
+    if (sums.size !== costs.totals.length) return false;
+    for (const total of costs.totals) {
+      if (sums.get(total.currency) !== scaled(total.amountMinor, places)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 async function read(ctx: Context): Promise<Snapshot | null> {
   const handle = ctx.dataHandles.find((h) => h.specName === "snapshot") ??
     ctx.dataHandles[0];
@@ -502,7 +709,10 @@ async function read(ctx: Context): Promise<Snapshot | null> {
   );
   if (!bytes) return null;
   try {
-    return SnapshotSchema.parse(JSON.parse(new TextDecoder().decode(bytes)));
+    const snapshot = SnapshotSchema.parse(
+      JSON.parse(new TextDecoder().decode(bytes)),
+    );
+    return totalsMatchBreakdowns(snapshot) ? snapshot : null;
   } catch {
     return null;
   }
@@ -635,7 +845,7 @@ function usageSection(s: Snapshot) {
   return DashboardSectionSchema.parse({
     id: "usage",
     title: "Token usage",
-    state: sectionState,
+    state: withRefreshState(sectionState, s.usageRefreshState),
     impact: "required",
     summary: `${
       s.usage.uncachedInputTokens + s.usage.outputTokens
@@ -649,10 +859,11 @@ function usageSection(s: Snapshot) {
         ? "Grouped Enterprise buckets may omit groups beyond the documented top-100 cap"
         : undefined,
     },
-    freshness: {
-      state: "fresh",
-      observedAt: s.dataRefreshedAt ?? s.collectedAt,
-    },
+    freshness: freshness(
+      s.usageRefreshState,
+      s.usageRefreshedAt,
+      s.collectedAt,
+    ),
     completeness: completeness(
       s.usageStatus,
       s.usage.breakdowns.length,
@@ -666,24 +877,27 @@ function usageSection(s: Snapshot) {
       confidence: "exact",
       sensitivity: "operational",
     }],
-    exceptions: partial
-      ? [{
-        id: `anthropic:usage:${s.usageStatus.errorKind || "partial"}`,
-        severity: sectionState === "unauthorized" ? "critical" : "warning",
-        subject: "Token usage",
-        headline: sectionState === "unauthorized"
-          ? "Organization API authorization rejected"
-          : sectionState === "unsupported"
-          ? "Usage capability unsupported"
-          : "Usage coverage is partial",
-        detail: s.usageStatus.message ||
-          "Grouped Enterprise results have a documented top-100 cap",
-        source: "@jpisgeek/anthropic-usage",
-        suppressed: false,
-        suppressReason: "",
-        sensitivity: "operational",
-      }]
-      : [],
+    exceptions: [
+      ...(partial
+        ? [{
+          id: `anthropic:usage:${s.usageStatus.errorKind || "partial"}`,
+          severity: sectionState === "unauthorized" ? "critical" : "warning",
+          subject: "Token usage",
+          headline: sectionState === "unauthorized"
+            ? "Organization API authorization rejected"
+            : sectionState === "unsupported"
+            ? "Usage capability unsupported"
+            : "Usage coverage is partial",
+          detail: s.usageStatus.message ||
+            "Grouped Enterprise results have a documented top-100 cap",
+          source: "@jpisgeek/anthropic-usage",
+          suppressed: false,
+          suppressReason: "",
+          sensitivity: "operational",
+        }]
+        : []),
+      ...refreshExceptions(s.usageRefreshState, "Token usage"),
+    ],
     references: [],
     sensitivity,
   });
@@ -700,15 +914,36 @@ function costSection(s: Snapshot) {
     : partial
     ? "partial"
     : "healthy";
-  const metrics: Json[] = s.costs.totals.map((t) => ({
-    id: `cost-${t.currency.toLowerCase()}`,
-    label: `Cost (${t.currency})`,
-    unit: "currency",
-    availability: "observed",
-    value: Number(t.amount),
-    confidence: partial ? "unknown" : "exact",
-    sensitivity: "operational",
-  }));
+  const metrics: Json[] = s.costs.totals.map((t) => {
+    const value = Number(t.amountMinor);
+    const canonical = (decimal: string) => {
+      const [whole, fraction = ""] = decimal.split(".");
+      const tail = fraction.replace(/0+$/, "");
+      const head = whole.replace(/^0+(?=\d)/, "");
+      return tail ? `${head}.${tail}` : head;
+    };
+    const common = {
+      id: `cost-${t.currency.toLowerCase()}`,
+      label: `Cost (${t.currency} minor units)`,
+      unit: "custom:currency-minor",
+      sensitivity: "operational",
+    };
+    return Number.isFinite(value) &&
+        canonical(String(value)) === canonical(t.amountMinor)
+      ? {
+        ...common,
+        availability: "observed",
+        value,
+        confidence: partial ? "unknown" : "exact",
+      }
+      : {
+        ...common,
+        availability: "unknown",
+        confidence: "unknown",
+        reason:
+          "The exact minor-unit decimal is retained in the summary and fact; it cannot be represented losslessly as a numeric metric",
+      };
+  });
   if (missing) {
     metrics.push({
       id: "cost-total",
@@ -723,28 +958,24 @@ function costSection(s: Snapshot) {
   return DashboardSectionSchema.parse({
     id: "costs",
     title: "Authoritative cost",
-    state: missing ? "unknown" : sectionState,
+    state: missing
+      ? "unknown"
+      : withRefreshState(sectionState, s.costRefreshState),
     impact: "required",
     summary: missing
       ? "No authoritative currency total was returned"
-      // "1.25 USD", not "1.25 USD minor units". The value is a major-unit
-      // decimal; the old suffix described a conversion no code performed and
-      // sat in the same bundle as openai-usage, which emits plain dollars under
-      // the same unit:"currency" tag.
-      : s.costs.totals.map((t) => `${t.amount} ${t.currency}`).join(", "),
+      : s.costs.totals.map((t) => `${t.amountMinor} ${t.currency} minor units`)
+        .join(", "),
     coverage: {
       kind: partial ? "sample" : "exact",
       start: s.coverageStart,
       end: s.coverageEnd,
       scope: `Anthropic ${s.accountKind} organization cost`,
       notes: s.accountKind === "enterprise"
-        ? "Amounts are the Cost Report's decimal values in the currency's major unit; Enterprise values can be revised for 30 days"
-        : "Amounts are the Cost Report's decimal values in the currency's major unit",
+        ? "Amounts are the Cost Report's decimal values in minor units (fractional cents for USD); Enterprise values can be revised for 30 days"
+        : "Amounts are the Cost Report's decimal values in minor units (fractional cents for USD)",
     },
-    freshness: {
-      state: "fresh",
-      observedAt: s.dataRefreshedAt ?? s.collectedAt,
-    },
+    freshness: freshness(s.costRefreshState, s.costRefreshedAt, s.collectedAt),
     completeness: missing
       ? { state: "unknown", reason: "No currency total" }
       : completeness(
@@ -753,35 +984,62 @@ function costSection(s: Snapshot) {
         s.costs.groupedTop100Cap,
       ),
     metrics,
-    facts: [{
-      id: "currency-count",
-      label: "Currencies observed",
-      value: s.costs.totals.length,
-      confidence: partial ? "unknown" : "exact",
-      sensitivity: "operational",
-    }],
-    exceptions: partial
-      ? [{
-        id: `anthropic:costs:${s.costStatus.errorKind || "partial"}`,
-        severity: sectionState === "unauthorized" ? "critical" : "warning",
-        subject: "Authoritative cost",
-        headline: sectionState === "unauthorized"
-          ? "Organization API authorization rejected"
-          : sectionState === "unsupported"
-          ? "Cost capability unsupported"
-          : "Cost coverage is partial",
-        detail: s.costStatus.message ||
-          "Grouped Enterprise results have a documented top-100 cap",
-        source: "@jpisgeek/anthropic-usage",
-        suppressed: false,
-        suppressReason: "",
+    facts: [
+      ...s.costs.totals.map((t) => ({
+        id: `cost-${t.currency.toLowerCase()}-exact`,
+        label: `Exact cost (${t.currency} minor units)`,
+        value: t.amountMinor,
+        confidence: partial ? "unknown" : "exact",
         sensitivity: "operational",
-      }]
-      : [],
+      })),
+      {
+        id: "currency-count",
+        label: "Currencies observed",
+        value: s.costs.totals.length,
+        confidence: partial ? "unknown" : "exact",
+        sensitivity: "operational",
+      },
+    ],
+    exceptions: [
+      ...(partial
+        ? [{
+          id: `anthropic:costs:${s.costStatus.errorKind || "partial"}`,
+          severity: sectionState === "unauthorized" ? "critical" : "warning",
+          subject: "Authoritative cost",
+          headline: sectionState === "unauthorized"
+            ? "Organization API authorization rejected"
+            : sectionState === "unsupported"
+            ? "Cost capability unsupported"
+            : "Cost coverage is partial",
+          detail: s.costStatus.message ||
+            "Grouped Enterprise results have a documented top-100 cap",
+          source: "@jpisgeek/anthropic-usage",
+          suppressed: false,
+          suppressReason: "",
+          sensitivity: "operational",
+        }]
+        : []),
+      ...refreshExceptions(s.costRefreshState, "Authoritative cost"),
+    ],
     references: [],
     sensitivity,
   });
 }
+/** Stable producer namespace; a full digest avoids raw model IDs in bundle IDs. */
+async function bundleId(modelId: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      `@jpisgeek/anthropic-usage\0bundle-id\0${modelId}`,
+    ),
+  );
+  const hex = Array.from(
+    new Uint8Array(digest),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `anthropic-organization-${hex}`;
+}
+
 export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
   const s = await read(ctx);
   const missing: Status = {
@@ -796,12 +1054,12 @@ export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
   ];
   return DashboardBundleV1Schema.parse({
     schemaVersion: DASHBOARD_BUNDLE_VERSION,
-    id: "anthropic-organization",
+    id: await bundleId(ctx.modelId),
     title: "Anthropic organization usage",
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/anthropic-usage",
-      extensionVersion: "2026.08.25.2",
+      extensionVersion: "2026.09.05.1",
       modelType: String(ctx.modelType),
       modelName: ctx.definition.name,
       modelId: ctx.modelId,
@@ -811,7 +1069,7 @@ export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
     state: deriveOverallState(sections),
     sections,
     exceptions: [],
-    sensitivity,
+    sensitivity: bundleSensitivity,
     extensions: {
       "jpisgeek/anthropic-usage": {
         accountKind: s?.accountKind ?? "unknown",

@@ -9,14 +9,20 @@ llama.cpp server, a gateway in front of one) before you trust it in a workflow.
 reasoning-budget and context-exhaustion diagnostics, and a short capability
 battery.
 
-**Version** `2026.08.25.1` · **License** MIT · **Source**
+**Version** `2026.09.05.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/lmstudio
 
 ## Install
 
+Clone this GitHub repository and register this extension's source in your Swamp
+repo. Replace the example path with the canonical location of your clone:
+
+```sh
+swamp extension source add /example/slog-bog/lmstudio --only models
 ```
-swamp extension pull @jpisgeek/lmstudio
-```
+
+This repaired version is distributed through GitHub source, not a registry
+release.
 
 ## `@jpisgeek/lmstudio/endpoint`
 
@@ -49,10 +55,10 @@ No arguments.
 
 ### Data written
 
-| resource | lifetime | fields                                                                                  | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| -------- | -------- | --------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `models` | infinite | `modelIds`, `modelCount`, `syncedAt`                                                    | Every model id currently served by /v1/models, plus a count. A 401/403 on this call is thrown as a distinct UNAUTHORIZED error rather than written as data -- a bad token is a config problem, not an operational fact worth recording as a normal result. Model ids are remote-controlled text, so they are length-bounded and screened for control, bidi, and zero-width characters, and an oversized list or an unscreenable id is refused as MALFORMED_RESPONSE rather than stored. |
-| `health` | infinite | `reachable`, `authorized`, `httpStatus`, `latencyMs`, `errorKind`, `error`, `checkedAt` | Reachability and auth as two independent booleans, with HTTP status and latency recorded separately, so 'host is down' and 'host is up but rejects the token' never collapse into one generic failure. An unreachable, unauthorized, or slow endpoint is recorded as data, not thrown -- the one exception is caller cancellation, which throws rather than being written as a misleading 'timeout' observation.                                                                        |
+| resource | lifetime | fields                                                                                  | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------- | -------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `models` | infinite | `modelIds`, `modelCount`, `syncedAt`                                                    | Every model id currently served by /v1/models, plus a count. A 401/403 on this call is thrown as a distinct UNAUTHORIZED error rather than written as data -- a bad token is a config problem, not an operational fact worth recording as a normal result. Model ids are remote-controlled text, so they are length-bounded and screened for control, bidi, and zero-width characters, and an oversized list or an unscreenable id is refused as MALFORMED_RESPONSE rather than stored.                                                                                                                                                                                                                       |
+| `health` | infinite | `reachable`, `authorized`, `httpStatus`, `latencyMs`, `errorKind`, `error`, `checkedAt` | Reachability and auth recorded independently, with HTTP status and latency separate, so 'host is down' and 'host is up but rejects the token' never collapse into one generic failure. `authorized` is true only after a 2xx, false only for an explicit 401/403, and null whenever authorization was never determined -- a 500, a timeout, or a refused connection leaves it null rather than claiming the token was rejected. `httpStatus` is null when no HTTP response arrived at all, never 0. An unreachable, unauthorized, or slow endpoint is recorded as data, not thrown -- the one exception is caller cancellation, which throws rather than being written as a misleading 'timeout' observation. |
 
 ## `@jpisgeek/lmstudio/probe`
 
@@ -125,11 +131,11 @@ remaining capabilities absent.
 
 ### Arguments
 
-| argument    | type    | required | default | description                                                                                           |
-| ----------- | ------- | -------- | ------- | ----------------------------------------------------------------------------------------------------- |
-| `lmsBinary` | string  | no       | `"lms"` | LM Studio CLI executable path or name                                                                 |
-| `timeoutMs` | integer | no       | `15000` | Maximum time for each lms command                                                                     |
-| `host`      | string  | no       |         | Optional remote LM Studio host accepted by lms ps --host; omit when running this model beside llmster |
+| argument    | type    | required | default | description                                                                                                                                                                                                                                                             |
+| ----------- | ------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lmsBinary` | string  | no       | `"lms"` | LM Studio CLI executable path or name                                                                                                                                                                                                                                   |
+| `timeoutMs` | integer | no       | `15000` | Maximum time for each lms command                                                                                                                                                                                                                                       |
+| `host`      | string  | no       |         | Optional remote LM Studio host accepted by lms ps --host. Must be a loopback address, with or without a port: lms speaks cleartext, so remote daemons are reached by pointing this at the local end of an encrypted tunnel. Omit when running this model beside llmster |
 
 ### Methods
 
@@ -185,6 +191,15 @@ record everything with an `errorKind`. All of them throw on caller cancellation
 rather than writing it, including a cancellation that lands after the response
 headers have already arrived.
 
+On `health`, `authorized` and `httpStatus` are nullable, and null means "not
+determined" rather than "no". `authorized` is true only after a 2xx, false only
+for an explicit 401/403, and null for everything else -- a 500, a timeout, a
+refused connection. `httpStatus` is null when no HTTP response arrived at all;
+it is never 0. Consumers that read `authorized == false` as "this token is bad"
+and `httpStatus == 0` as a status code need updating: earlier versions of this
+extension wrote exactly that for outcomes in which the token was never actually
+judged.
+
 `contextExhausted` is a heuristic (finish_reason "length" under the requested
 cap) and remains unknown when the endpoint omits valid token usage.
 `honorsResponseFormat` means the model returned a JSON object, not that it
@@ -207,7 +222,12 @@ names instead of being overwritten -- compare `checkedAt` if you find two for
 one model.
 
 The daemon model runs `lms ps --json` beside llmster. Set its optional `host`
-argument only when deliberately using LM Studio's supported remote CLI mode.
+argument only when deliberately using LM Studio's supported remote CLI mode, and
+note that it accepts loopback addresses only (`localhost`, `127.0.0.0/8`, `::1`,
+with or without a port): `lms --host` speaks cleartext and offers no TLS, so a
+remote daemon is reached by pointing `host` at the local end of a tunnel you
+terminate yourself -- WireGuard, `ssh -L`, stunnel. A directly named remote host
+is refused when the model is configured, not silently sent in the clear.
 `lmsBinary` names whatever executable you point it at, and the model runs it
 with its own process permissions; leave it at `lms` unless you have a specific
 reason not to.
@@ -227,9 +247,13 @@ Every HTTP response body is read under a byte cap rather than buffered whole, so
 a hostile endpoint cannot stream an unbounded reply inside the request deadline;
 an oversized body is refused, never parsed from its prefix. Every scrap of
 endpoint-supplied text that reaches a stored `error` or a thrown message is
-token-redacted, screened for control, bidi, zero-width, and surrogate
-characters, and length-bounded first, so a proxy error page cannot drive the
-terminal of whoever reads that data later.
+screened for control, bidi, zero-width, and surrogate characters, then
+token-redacted, then length-bounded -- in that order, over the whole response --
+so a proxy error page cannot drive the terminal of whoever reads that data
+later. The order is not cosmetic: screening first means a token echoed back with
+a zero-width character wedged into it is still recognised and removed, and
+bounding last means no cut can split the token into a prefix that the redaction
+pass no longer matches.
 
 The endpoint's own words are kept rather than replaced with a canned status
 line, because they are what makes a failure diagnosable -- "no embedding model
@@ -238,14 +262,22 @@ finding. One consequence, stated plainly: this extension never writes your
 prompt to a resource, but an endpoint that echoes your request back inside its
 own error body can put a screened, bounded fragment of it in the `error` field.
 If your prompts are sensitive and your endpoint is not trusted, do not run the
-completion probe against it.
+completion probe against it. The embedding probe does not carry that exposure:
+`input` is stripped from the endpoint's error text the same way the bearer token
+is, in the same position -- after screening, before bounding -- so an echoed
+embedding input reaches the stored `error` as `[REDACTED]`. Both `input` and
+`prompt` are marked sensitive arguments.
 
 Model ids are treated as remote text on both sides: bounded to 256 characters
 and screened for control, bidi, and zero-width characters, whether they arrive
 from `/v1/models` or from a caller's argument, because they are stored, tagged,
 logged, and folded into an instance name that maps to a storage path. An
 oversized model list, or an id that fails the screen, is refused as
-`MALFORMED_RESPONSE` rather than stored.
+`MALFORMED_RESPONSE` rather than stored. A model id that contains the configured
+API token is refused too, in both directions -- an endpoint answering
+`/v1/models` with your bearer token as a model id, and a caller passing it as a
+probe's `model` argument -- because a model id is stored as a measurement and
+never goes through redaction.
 
 Written data: served model ids, latencies, optional token counts, boolean
 findings, and short screened endpoint error text. Daemon observations retain
@@ -257,7 +289,11 @@ length-bounded and screened for control, bidi, and zero-width characters, and an
 unscreenable, oversized, or cap-overflowing payload is refused as
 `invalid-response` instead of being stored or misread as an unreachable host.
 The `timeoutMs` argument is a hard bound: the CLI is sent SIGTERM, escalated to
-SIGKILL, and abandoned outright if it still has not released its pipes.
+SIGKILL, and abandoned outright if it still has not released its pipes. The CLI
+is spawned with a cleared environment: it inherits nothing but `PATH` (to
+resolve the binary and its runtime) and `HOME` (for `~/.lmstudio`), so no other
+value the runtime happens to hold reaches the executable named by `lmsBinary`.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the release gates every version passes before it reaches the registry.
+for the repository's security review requirements. This version is shared as
+GitHub source and is not published to the Swamp registry.

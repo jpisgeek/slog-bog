@@ -1,5 +1,6 @@
 /** Provider-neutral, network-free dashboard bundle renderer. */
 import { z } from "npm:zod@4";
+import { createHash } from "node:crypto";
 // BEGIN INLINED DASHBOARD CONTRACT V1
 /** Current bundle schema version emitted by v1 producers. */
 export const DASHBOARD_BUNDLE_VERSION = "1.0.0" as const;
@@ -180,9 +181,14 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
+  // Evidence links are persisted and rendered; reject embedded credentials.
   url: z.string().url().refine(
-    (value) => new URL(value).protocol === "https:",
-    "evidence URLs must use https",
+    (value) => {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" && parsed.username === "" &&
+        parsed.password === "";
+    },
+    "evidence URLs must use https and must not carry credentials",
   ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
@@ -443,6 +449,10 @@ const RenderedExceptionSchema = z.object({
   suppressReason: z.string(),
   truncated: z.boolean(),
 });
+const ExceptionResourceNameSchema = z.string().regex(
+  /^exception-[a-z0-9][a-z0-9-]{0,47}-[0-9a-f]{64}$/,
+  "only current dashboard exception resource names are valid cleanup targets",
+);
 const RenderSchema = z.object({
   outputPath: z.string(),
   bytes: z.number().int().nonnegative(),
@@ -454,9 +464,9 @@ const RenderSchema = z.object({
   bundlesValid: z.number().int().nonnegative(),
   bundleIds: z.array(z.string()),
   coverageStates: z.record(z.string(), z.string()),
-  exceptionResources: z.array(z.string()),
+  exceptionResources: z.array(ExceptionResourceNameSchema).max(200),
   renderedAt: z.iso.datetime(),
-});
+}).strict();
 
 interface Exc {
   id: string;
@@ -567,20 +577,15 @@ function esc(value: unknown): string {
   return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-function fnv1a(value: string): string {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < value.length; i++) {
-    hash ^= value.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
+function identityHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 function resourceName(id: string): string {
   const slug = id.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(
     /^-+|-+$/g,
     "",
   ).slice(0, 48) || "condition";
-  return `exception-${slug}-${fnv1a(id)}`;
+  return `exception-${slug}-${identityHash(id)}`;
 }
 function tupleId(...parts: string[]): string {
   return parts.map((part) => `${part.length}:${part}`).join("");
@@ -602,7 +607,7 @@ function scopedExceptionId(bundleId: string, exceptionId: string): string {
  */
 function capId(value: string): string {
   if (value.length <= MAX_ID) return value;
-  return `${value.slice(0, MAX_ID - 9)}~${fnv1a(value)}`;
+  return `${value.slice(0, MAX_ID - 65)}~${identityHash(value)}`;
 }
 function makeExc(
   input:
@@ -639,6 +644,70 @@ function stateSeverity(state: string): Exc["severity"] {
     : state === "partial" || state === "stale"
     ? "warning"
     : "info";
+}
+
+/** Bound validation work before the recursive bundle schema sees untrusted data. */
+function assertInputBudget(input: unknown): void {
+  const pending: Array<{ value: unknown; depth: number }> = [{
+    value: input,
+    depth: 0,
+  }];
+  const seen = new WeakSet<object>();
+  let nodes = 0;
+  let chars = 0;
+  while (pending.length) {
+    const { value, depth } = pending.pop()!;
+    if (++nodes > 50_000 || depth > 32) {
+      throw new Error("bundle exceeds input budget");
+    }
+    if (typeof value === "string") {
+      chars += value.length;
+      if (chars > 2 * 1024 * 1024) {
+        throw new Error("bundle exceeds input budget");
+      }
+    } else if (value !== null && typeof value === "object") {
+      if (seen.has(value)) throw new Error("bundle contains a repeated object");
+      seen.add(value);
+      const remaining = 50_000 - nodes - pending.length;
+      if (Array.isArray(value) && value.length > remaining) {
+        throw new Error("bundle exceeds input budget");
+      }
+      // Never materialize an unbounded entries/key/value-pair array. Account
+      // for each own enumerable key before reading or queuing its value.
+      for (const key in value) {
+        if (!Object.hasOwn(value, key)) continue;
+        if (nodes + pending.length >= 50_000) {
+          throw new Error("bundle exceeds input budget");
+        }
+        chars += key.length;
+        if (chars > 2 * 1024 * 1024) {
+          throw new Error("bundle exceeds input budget");
+        }
+        pending.push({
+          value: (value as Record<string, unknown>)[key],
+          depth: depth + 1,
+        });
+      }
+    }
+  }
+}
+
+class DuplicateIdentityError extends Error {}
+
+/** Ambiguous source identities invalidate the bundle instead of hiding a row. */
+function assertUniqueIdentities(bundle: DashboardBundleV1): void {
+  const sectionIds = new Set<string>();
+  const exceptionIds = new Set<string>();
+  const addException = (id: string) => {
+    if (exceptionIds.has(id)) throw new DuplicateIdentityError();
+    exceptionIds.add(id);
+  };
+  for (const item of bundle.exceptions) addException(item.id);
+  for (const section of bundle.sections) {
+    if (sectionIds.has(section.id)) throw new DuplicateIdentityError();
+    sectionIds.add(section.id);
+    for (const item of section.exceptions) addException(item.id);
+  }
 }
 
 function parseInputs(inputs: unknown[]) {
@@ -678,7 +747,9 @@ function parseInputs(inputs: unknown[]) {
   }
   for (const [index, input] of accepted.entries()) {
     try {
+      assertInputBudget(input);
       const bundle = parseDashboardBundle(input);
+      assertUniqueIdentities(bundle);
       if (bundleIds.has(bundle.id)) {
         issues.push(makeExc({
           id: syntheticId(
@@ -701,6 +772,7 @@ function parseInputs(inputs: unknown[]) {
       bundles.push(bundle);
     } catch (error) {
       const unsupported = error instanceof UnsupportedBundleVersionError;
+      const duplicate = error instanceof DuplicateIdentityError;
       issues.push(makeExc({
         id: syntheticId(
           "input",
@@ -712,9 +784,13 @@ function parseInputs(inputs: unknown[]) {
         subject: `Bundle ${index + 1}`,
         headline: unsupported
           ? "Unsupported dashboard bundle version"
+          : duplicate
+          ? "Duplicate dashboard identity"
           : "Invalid dashboard bundle",
         detail: unsupported
           ? `This renderer does not support bundle version ${error.version}.`
+          : duplicate
+          ? "Section IDs and exception IDs must each be unique within a bundle; ambiguous observations were rejected."
           : "The value failed bundle-v1 validation; inspect its normalization report.",
         source: "renderer",
         suppressed: false,
@@ -1025,7 +1101,7 @@ td{padding:7px 18px 7px 0;border-bottom:1px solid var(--line)}footer{margin-top:
 /** The provider-neutral @jpisgeek/dashboard model. */
 export const model = {
   type: "@jpisgeek/dashboard",
-  version: "2026.08.25.2",
+  version: "2026.09.05.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     exception: {
@@ -1051,6 +1127,35 @@ export const model = {
       execute: async (_args: unknown, ctx: any) => {
         const g = GlobalArgsSchema.parse(ctx.globalArgs);
         const parsed = parseInputs(g.bundles);
+        let priorNames: string[] = [];
+        let invalidPrior = false;
+        try {
+          const prior = await ctx.readResource("render");
+          if (prior !== null && prior !== undefined) {
+            assertInputBudget(prior);
+            const validated = RenderSchema.safeParse(prior);
+            if (validated.success) {
+              priorNames = [...new Set(validated.data.exceptionResources)];
+            } else {
+              invalidPrior = true;
+            }
+          }
+        } catch {
+          invalidPrior = true;
+        }
+        if (invalidPrior) {
+          parsed.issues.push(makeExc({
+            id: syntheticId("cleanup", "invalid-prior-render"),
+            severity: "warning",
+            subject: "Dashboard cleanup",
+            headline: "Previous render cleanup skipped",
+            detail:
+              "Stored render metadata could not be validated; previous resources were retained.",
+            source: "renderer",
+            suppressed: false,
+            suppressReason: "",
+          }));
+        }
         const exceptions = collectExceptions(
           parsed.bundles,
           parsed.issues,
@@ -1071,7 +1176,6 @@ export const model = {
         }
         await Deno.writeTextFile(g.outputPath, html);
 
-        const prior = await ctx.readResource("render");
         const handles = [];
         const currentNames: string[] = [];
         for (const exception of exceptions) {
@@ -1088,11 +1192,6 @@ export const model = {
             }),
           );
         }
-        const priorNames = Array.isArray(prior?.exceptionResources)
-          ? prior.exceptionResources.filter((name: unknown): name is string =>
-            typeof name === "string"
-          )
-          : [];
         for (const name of priorNames) {
           if (!currentNames.includes(name)) await ctx.deleteResource(name);
         }

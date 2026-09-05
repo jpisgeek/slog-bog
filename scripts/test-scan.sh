@@ -20,6 +20,9 @@ expect_rule() { # rule file  — the named rule must fire on that fixture file
 
 echo "== dirty fixtures: every rule must fire =="
 expect_rule ip-private    ip.ts
+expect_rule ip-private    loopback-address.ts
+expect_rule ip-private    loopback-prefix.ts
+expect_rule host-local    loopback-name.ts
 expect_rule host-local    hosts.yaml
 expect_rule path-local    paths.ts
 expect_rule secret-shape  secrets.ts

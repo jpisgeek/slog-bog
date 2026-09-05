@@ -1,4 +1,5 @@
 /** Normalize scoped @jpisgeek/lmstudio execution output into bundle v1. */
+import { createHash } from "node:crypto";
 // BEGIN INLINED DASHBOARD CONTRACT V1
 /**
  * Provider-neutral dashboard bundle contract.
@@ -194,9 +195,14 @@ export const EvidenceReferenceSchema = z.object({
   modelName: z.string().min(1).optional(),
   dataName: z.string().min(1).optional(),
   dataVersion: z.number().int().positive().optional(),
+  // Evidence links are persisted and rendered; reject embedded credentials.
   url: z.string().url().refine(
-    (value) => new URL(value).protocol === "https:",
-    "evidence URLs must use https",
+    (value) => {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" && parsed.username === "" &&
+        parsed.password === "";
+    },
+    "evidence URLs must use https and must not carry credentials",
   ).optional(),
 }).superRefine((reference, ctx) => {
   if (reference.kind === "url" && !reference.url) {
@@ -456,21 +462,93 @@ interface ReportContext {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Source-record invariants.
+//
+// Every schema below describes a record written by a collector that talked to
+// an untrusted endpoint. The collector is not the attacker, but it is the last
+// place the endpoint's answer was touched, and a collector that mis-sets one
+// field is indistinguishable here from one that was lied to. Before these
+// cross-field rules a record could assert two contradictory things at once and
+// this report believed the reassuring half: a 500 response carrying an empty
+// errorKind derived "healthy" because the only success test was `errorKind ===
+// ""`, and a daemon reporting daemonRunning:false with loaded models derived
+// "healthy" because loadedModelCount was the only thing consulted.
+//
+// A record that fails one of these rules is a ZodError, which normalize()
+// already turns into invalidRecordSection: a visible partial observation, not
+// a silently believed one. That is deliberately the same treatment a
+// structurally malformed record gets, because a self-contradicting record is
+// exactly as unusable as a malformed one.
+// ---------------------------------------------------------------------------
+
+/** A status a real HTTP response can carry. 0 is this collector's "no response". */
+function isHttpStatus(status: number): boolean {
+  return Number.isInteger(status) && status >= 100 && status <= 599;
+}
+
+/** Success is the 2xx range only: 3xx, 4xx and 5xx are not a working endpoint. */
+function isSuccessStatus(status: number): boolean {
+  return Number.isInteger(status) && status >= 200 && status <= 299;
+}
+
 const HealthSchema = z.object({
   reachable: z.boolean(),
   authorized: z.boolean(),
   httpStatus: z.number(),
-  latencyMs: z.number(),
+  latencyMs: z.number().nonnegative(),
   errorKind: z.string(),
   error: z.string(),
   checkedAt: z.iso.datetime(),
+}).strict().superRefine((value, ctx) => {
+  if (value.httpStatus !== 0 && !isHttpStatus(value.httpStatus)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "httpStatus must be 0 (no response) or in the range 100-599",
+      path: ["httpStatus"],
+    });
+  }
+  // "Unreachable" means no HTTP exchange happened at all, so there is no status
+  // to report and nothing could have authorized the caller. A record claiming
+  // both an unreachable endpoint and a status code is describing two different
+  // requests, and whichever half a reader trusts is a coin flip.
+  if (!value.reachable && (value.httpStatus !== 0 || value.authorized)) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "an unreachable endpoint cannot report an HTTP status or authorization",
+      path: ["reachable"],
+    });
+  }
+  // An empty errorKind is the collector asserting success. Success has to agree
+  // with every other field, or the assertion is worthless: this is the exact
+  // combination (errorKind "" with httpStatus 500) that used to read healthy.
+  if (
+    value.errorKind === "" &&
+    (!value.reachable || !value.authorized ||
+      !isSuccessStatus(value.httpStatus))
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "an empty errorKind requires a reachable, authorized endpoint and a 2xx status",
+      path: ["errorKind"],
+    });
+  }
+  if (!value.authorized && value.errorKind === "") {
+    ctx.addIssue({
+      code: "custom",
+      message: "an unauthorized result requires an errorKind",
+      path: ["errorKind"],
+    });
+  }
 });
 
 const ModelsSchema = z.object({
   modelIds: z.array(z.string()),
   modelCount: z.number().int().nonnegative(),
   syncedAt: z.iso.datetime(),
-}).superRefine((value, ctx) => {
+}).strict().superRefine((value, ctx) => {
   if (value.modelCount !== value.modelIds.length) {
     ctx.addIssue({
       code: "custom",
@@ -485,11 +563,13 @@ const DaemonSchema = z.object({
   daemonRunning: z.boolean(),
   status: z.enum(["running", "not-running", "unknown"]),
   loadedModelCount: z.number().int().nonnegative(),
-  loadedModels: z.array(z.object({
-    identifier: z.string().min(1),
-    type: z.string(),
-    architecture: z.string(),
-  })),
+  loadedModels: z.array(
+    z.object({
+      identifier: z.string().min(1),
+      type: z.string(),
+      architecture: z.string(),
+    }).strict(),
+  ),
   observedAt: z.iso.datetime(),
   errorKind: z.enum([
     "",
@@ -500,12 +580,57 @@ const DaemonSchema = z.object({
     "invalid-response",
   ]),
   error: z.string(),
-}).superRefine((value, ctx) => {
+}).strict().superRefine((value, ctx) => {
   if (value.loadedModelCount !== value.loadedModels.length) {
     ctx.addIssue({
       code: "custom",
       message: "loadedModelCount must match loadedModels length",
       path: ["loadedModelCount"],
+    });
+  }
+  // A daemon that is not running holds nothing in memory. Accepting the pair
+  // (daemonRunning false, loadedModelCount 5) let a dead runtime derive
+  // "healthy", because the only input to that branch was the model count.
+  if (!value.daemonRunning && value.loadedModelCount > 0) {
+    ctx.addIssue({
+      code: "custom",
+      message: "a daemon that is not running cannot have models loaded",
+      path: ["loadedModelCount"],
+    });
+  }
+  // `status` and `daemonRunning` are two encodings of one fact. When they
+  // disagree the record cannot say whether the runtime was observed at all.
+  if ((value.status === "running") !== value.daemonRunning) {
+    ctx.addIssue({
+      code: "custom",
+      message: "status running must agree with daemonRunning",
+      path: ["status"],
+    });
+  }
+  // An unknown status is a failed observation, and a failed observation names
+  // its reason. Without this, "unknown" plus an empty errorKind is a record
+  // that admits it saw nothing while claiming nothing went wrong.
+  if (value.status === "unknown" && value.errorKind === "") {
+    ctx.addIssue({
+      code: "custom",
+      message: "an unknown daemon status requires an errorKind",
+      path: ["errorKind"],
+    });
+  }
+  if ((value.errorKind === "cli-unavailable") !== !value.cliAvailable) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "cliAvailable false must be reported as errorKind cli-unavailable",
+      path: ["cliAvailable"],
+    });
+  }
+  if (value.errorKind === "" && (!value.cliAvailable || !value.daemonRunning)) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "an empty errorKind requires an available CLI and a running daemon",
+      path: ["errorKind"],
     });
   }
 });
@@ -520,6 +645,59 @@ const EmbeddingSchema = z.object({
   errorKind: z.string(),
   error: z.string(),
   checkedAt: z.iso.datetime(),
+}).strict().superRefine((value, ctx) => {
+  if (value.httpStatus !== 0 && !isHttpStatus(value.httpStatus)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "httpStatus must be 0 (no response) or in the range 100-599",
+      path: ["httpStatus"],
+    });
+  }
+  if (value.httpStatus === 0 && value.errorKind === "") {
+    ctx.addIssue({
+      code: "custom",
+      message: "a probe with no HTTP response requires an errorKind",
+      path: ["errorKind"],
+    });
+  }
+  // A capability finding is only worth as much as the exchange that produced
+  // it. `servesEmbeddings: true` after a 500, or alongside an errorKind, is a
+  // claim the probe never observed, and this section used to promote exactly
+  // that pair to "healthy".
+  if (
+    value.servesEmbeddings &&
+    (value.errorKind !== "" || !isSuccessStatus(value.httpStatus))
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message: "servesEmbeddings requires a 2xx response and no errorKind",
+      path: ["servesEmbeddings"],
+    });
+  }
+  if (value.errorKind === "" && !isSuccessStatus(value.httpStatus)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "an empty errorKind requires a 2xx status",
+      path: ["errorKind"],
+    });
+  }
+  // The dimension flag and the number it describes are one observation. A
+  // known dimension of 0, or an unknown dimension carrying 768, means the
+  // metric and its availability disagree about whether anything was measured.
+  if (value.dimensionKnown !== (value.measuredDimension > 0)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "dimensionKnown must agree with a positive measuredDimension",
+      path: ["dimensionKnown"],
+    });
+  }
+  if (value.dimensionKnown && !value.servesEmbeddings) {
+    ctx.addIssue({
+      code: "custom",
+      message: "a measured dimension requires servesEmbeddings",
+      path: ["dimensionKnown"],
+    });
+  }
 });
 
 const CompletionSchema = z.object({
@@ -539,7 +717,7 @@ const CompletionSchema = z.object({
   errorKind: z.string(),
   error: z.string(),
   checkedAt: z.iso.datetime(),
-}).superRefine((value, ctx) => {
+}).strict().superRefine((value, ctx) => {
   if (
     !value.errorKind && value.totalTokens !== null &&
     value.promptTokens !== null && value.completionTokens !== null &&
@@ -558,6 +736,52 @@ const CompletionSchema = z.object({
       path: ["contextExhausted"],
     });
   }
+  if (value.httpStatus !== 0 && !isHttpStatus(value.httpStatus)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "httpStatus must be 0 (no response) or in the range 100-599",
+      path: ["httpStatus"],
+    });
+  }
+  // A completion that succeeded returned a status in the 2xx range and a
+  // finish reason to explain how it stopped. Believing errorKind alone made a
+  // 503 with an unset errorKind a healthy completion carrying observed token
+  // metrics that no request had ever produced.
+  if (
+    value.errorKind === "" &&
+    (!isSuccessStatus(value.httpStatus) || value.finishReason === "")
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message: "an empty errorKind requires a 2xx status and a finish reason",
+      path: ["errorKind"],
+    });
+  }
+  if (value.httpStatus === 0 && value.errorKind === "") {
+    ctx.addIssue({
+      code: "custom",
+      message: "a probe with no HTTP response requires an errorKind",
+      path: ["errorKind"],
+    });
+  }
+  // Reasoning evidence is the whole basis of the emptyContentWithReasoning
+  // finding, and "empty content" is the other half. A record asserting it with
+  // visible content, or with no reasoning evidence of either kind, contradicts
+  // the thing it is being consulted about. Reasoning tokens count as evidence
+  // on their own: the collector sets this flag when a model reported reasoning
+  // usage without emitting any reasoning text.
+  if (
+    value.emptyContentWithReasoning &&
+    ((value.reasoningChars === 0 && (value.reasoningTokens ?? 0) === 0) ||
+      value.contentChars > 0)
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "emptyContentWithReasoning requires reasoning characters and no content",
+      path: ["emptyContentWithReasoning"],
+    });
+  }
 });
 
 const CapabilitySchema = z.object({
@@ -573,9 +797,54 @@ const CapabilitySchema = z.object({
   errorKind: z.string(),
   error: z.string(),
   checkedAt: z.iso.datetime(),
+}).strict().superRefine((value, ctx) => {
+  // The battery runs its three checks in order, so a check that never ran
+  // cannot have been truncated and cannot have produced a positive finding.
+  // Without this, a record could report emitsReasoning:true from zero
+  // completed checks and this section would publish it as an exact fact.
+  const checks: Array<[boolean, boolean, number, string]> = [
+    [value.emitsReasoning, value.reasoningCheckTruncated, 1, "emitsReasoning"],
+    [
+      value.honorsResponseFormat,
+      value.formatCheckTruncated,
+      2,
+      "honorsResponseFormat",
+    ],
+    [
+      value.wrapsInCodeFences,
+      value.fenceCheckTruncated,
+      3,
+      "wrapsInCodeFences",
+    ],
+  ];
+  for (const [finding, truncated, needed, field] of checks) {
+    if ((finding || truncated) && value.checksCompleted < needed) {
+      ctx.addIssue({
+        code: "custom",
+        message: `${field} requires at least ${needed} completed checks`,
+        path: [field],
+      });
+    }
+  }
+  // An incomplete battery stopped for a reason. An empty errorKind with fewer
+  // than three checks is a record that cannot say why it gave up.
+  if (value.checksCompleted < 3 && value.errorKind === "") {
+    ctx.addIssue({
+      code: "custom",
+      message: "an incomplete capability battery requires an errorKind",
+      path: ["errorKind"],
+    });
+  }
 });
 
-const sensitivity = {
+/**
+ * Sensitivity block for a section that carried no untrusted endpoint text.
+ *
+ * Sections that do carry it build their own from a Screen ledger, so the
+ * `redacted` flag is a record of what the code actually did rather than a
+ * constant the reader has to take on faith.
+ */
+const defaultSensitivity = {
   classification: "operational" as const,
   fields: [] as string[],
   redacted: false,
@@ -656,6 +925,7 @@ function commonSection(
   facts: Json[],
   exceptions: Json[],
   coverage: Json = {},
+  sensitivity: Json = defaultSensitivity,
 ) {
   return DashboardSectionSchema.parse({
     id,
@@ -720,7 +990,22 @@ function unavailableMetric(
 }
 
 // ---------------------------------------------------------------------------
-// Untrusted-record clamps.
+// Untrusted-record clamps and screening.
+//
+// Length was only the first of the ways this text is dangerous, and clamping
+// alone was never sanitization: `clampText` cut a two-megabyte error to 2048
+// characters and published every one of them verbatim. The endpoint chooses
+// that text. It routinely contains the URL the collector called (userinfo,
+// query string and internal hostname included), the filesystem path of a model
+// file, a proxy echoing back an `Authorization: Bearer ...` header, and — from a
+// hostile endpoint — ESC sequences that rewrite the terminal of whoever runs
+// `swamp data list`, or bidi overrides that make two different messages render
+// identically. All of it landed in a stored bundle, a rendered dashboard, and a
+// Markdown summary marked `redacted: false`.
+//
+// So every untrusted string now goes through screenText() before it reaches a
+// fact, summary, exception detail, or id, and each section reports through a
+// Screen ledger which of its fields actually had something removed.
 //
 // A report is a trust boundary. Every field clamped below arrives from whatever
 // the configured LM Studio endpoint or `lms` CLI answered, and nothing upstream
@@ -751,17 +1036,358 @@ const MAX_FACT_TEXT = 256;
 /** Longest untrusted free text permitted in a summary or exception detail. */
 const MAX_FREE_TEXT = 2048;
 
-/** Longest untrusted fragment spliced into an exception id. */
-const MAX_ID_TEXT = 64;
+/**
+ * Largest stored resource this report will decode and parse.
+ *
+ * Sized well above any real observation: a 200-model inventory with long ids
+ * is tens of kilobytes, and the largest legitimate record here is a daemon
+ * inventory of the same shape. Anything at a megabyte is a broken or hostile
+ * source, and refusing it costs one comparison against a length swamp already
+ * knows, where parsing it costs the whole document.
+ */
+const MAX_RECORD_BYTES = 1024 * 1024;
 
 /** Clamp untrusted text, marking the cut so a reader cannot mistake it. */
 function clampText(value: string, limit = MAX_FACT_TEXT): string {
   return value.length <= limit ? value : `${value.slice(0, limit)} [truncated]`;
 }
 
-/** Clamp a fragment spliced into an id. Ids carry no truncation marker. */
-function clampId(value: string): string {
-  return value.slice(0, MAX_ID_TEXT);
+// C0/C1 controls and the Unicode line separators. Left in place, these drive
+// the terminal of anyone who cats a stored bundle and split a single-line
+// summary into several lines that each look like their own record.
+// deno-lint-ignore no-control-regex
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+
+// Zero-width and bidi-formatting characters. Two distinct values containing
+// these render identically to an operator, and a zero-width space inside a
+// hostname would otherwise walk straight through the redaction patterns below,
+// which is why this pass runs before them and not after.
+const INVISIBLE_CHARS = /[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g;
+
+/**
+ * Structured redaction, applied in order.
+ *
+ * Each pattern removes a class of value that identifies infrastructure or
+ * grants access to it. The order matters: a whole URL is taken out in one
+ * piece before the bare-host and path patterns can rewrite its pieces
+ * separately and leave the interesting half behind.
+ *
+ * These are deliberately greedy. Over-redaction costs a line of diagnostic
+ * detail; under-redaction publishes a credential or an internal hostname into
+ * a dashboard that may be shared. A model id containing a dot-separated suffix
+ * can be caught by the host pattern, and that is the direction to fail in.
+ *
+ * Every quantifier here is bounded, and screenText() clamps its input before
+ * running them, so no pattern can be walked into quadratic backtracking by a
+ * megabyte-long error string.
+ */
+const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
+  // Absolute URLs first, whole. Userinfo, query string, path and host are all
+  // identifying and the endpoint decides all four, so the URL is taken out in
+  // one piece — before any narrower pattern can carve a credential out of its
+  // query string and leave the rest of the URL standing.
+  [/\b[a-z][a-z0-9+.-]{0,32}:\/\/\S{1,4096}/gi, "[url redacted]"],
+  // Scheme-less userinfo, the form curl and proxy errors print.
+  [/\b[\w.+-]{1,128}:[^\s:@/]{1,128}@[\w.-]{1,255}/g, "[credential redacted]"],
+  // Named credentials. A reverse proxy in front of LM Studio commonly echoes
+  // the request headers it rejected, so the caller's own bearer token comes
+  // back inside the error body the collector stored. The optional scheme word
+  // is part of the match: without it `authorization: Bearer sk-...` consumed
+  // only "Bearer" and published the token that followed it.
+  [
+    /\b(?:proxy-)?authorization\b\s*[:=]\s*(?:[A-Za-z][A-Za-z0-9-]{0,20}\s+)?\S{1,4096}/gi,
+    "[credential redacted]",
+  ],
+  // The separator is optional because a credential is just as exposed when it
+  // is announced in prose: `API key sk-...` and `password hunter2` carry no
+  // `:` or `=` at all, and requiring one published both of them intact.
+  [
+    /\b(?:api[-_ ]?key|access[-_ ]?token|auth[-_ ]?token|token|secret|password|passwd|pwd)\b\s*[:=]?\s*(?:[A-Za-z][A-Za-z0-9-]{0,20}\s+)?\S{1,4096}/gi,
+    "[credential redacted]",
+  ],
+  [
+    /\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,4096}/gi,
+    "[credential redacted]",
+  ],
+  // Unlabelled tokens. A key pasted into an error body arrives with no name in
+  // front of it, so the shape has to be enough: the issuer prefixes every
+  // provider stamps on its keys, then any long mixed-class opaque run.
+  [
+    /\b(?:sk|pk|rk|hf|ghp|gho|ghu|ghs|ghr|glpat|xox[abprs])[-_][A-Za-z0-9_-]{8,4096}\b/gi,
+    "[credential redacted]",
+  ],
+  [
+    /\b(?:AKIA|ASIA)[0-9A-Z]{12,20}\b/g,
+    "[credential redacted]",
+  ],
+  [
+    /\b(?=[A-Za-z0-9_-]{32,4096}\b)(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,4096}\b/g,
+    "[credential redacted]",
+  ],
+  // Filesystem paths. LM Studio's own errors name the model file on disk,
+  // which carries the operator's username and local library layout.
+  [/\b[A-Za-z]:\\[^\s"']{0,4096}/g, "[path redacted]"],
+  [
+    /(^|[\s"'(<[])(~?(?:\/[\w.@+-]{1,255}){2,}\/?)/g,
+    "$1[path redacted]",
+  ],
+  // Mail addresses, before the host patterns get to them: redacting the domain
+  // alone leaves the local part standing, and that half is a person.
+  [/\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\b/g, "[email redacted]"],
+  // Hardware addresses. A MAC names one machine permanently, and it is the
+  // form an ARP or bridge error prints. Ahead of the IPv6 pattern, which would
+  // otherwise swallow the colon form and label it a host.
+  [
+    /\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b|\b(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b/g,
+    "[host redacted]",
+  ],
+  // IPv4, IPv6 bracketed and bare, dotted hostnames, and the local aliases. A
+  // private address or an internal FQDN is infrastructure detail, not an
+  // observation. Brackets are a URL convention, not part of the address: an
+  // `lms` or socket error prints `link-local IPv6 prefix:1` with none, so requiring them
+  // published every address that did not come out of a URL.
+  [/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b/g, "[host redacted]"],
+  [/\[[0-9A-Fa-f:]{2,45}\](?::\d{1,5})?/g, "[host redacted]"],
+  [
+    /(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![\w:.])/g,
+    "[host redacted]",
+  ],
+  [
+    /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){1,8}[a-z]{2,24}(?::\d{1,5})?\b/gi,
+    "[host redacted]",
+  ],
+  [/\blocalhost(?::\d{1,5})?\b/gi, "[host redacted]"],
+  // Undotted machine names, which is what a homelab actually runs on. There is
+  // no shape that separates a bare hostname from an ordinary word, so the two
+  // contexts that do name one are taken instead: a naming keyword in front of
+  // it, and the host:port form.
+  [
+    /\b(?:host|hostname|server|node|machine)\b\s*[:=]?\s*[A-Za-z0-9][\w.-]{0,254}/gi,
+    "[host redacted]",
+  ],
+  [
+    /(?<![\w.:@/-])[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?:\d{1,5}(?![\w.-])/g,
+    "[host redacted]",
+  ],
+];
+
+/** Strip characters that can drive a terminal, hide text, or forge identity. */
+function screenChars(value: string): string {
+  return value
+    .replace(CONTROL_CHARS, " ")
+    .replace(INVISIBLE_CHARS, "")
+    // Lone surrogates survive JSON.parse and decode to the same replacement
+    // character, so two distinct values can end up looking like one.
+    .replace(/[\ud800-\udbff](?![\udc00-\udfff])/g, "\ufffd")
+    .replace(/(^|[^\ud800-\udbff])([\udc00-\udfff])/g, "$1\ufffd")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Screened text plus whether anything at all was removed from the input. */
+interface Screened {
+  text: string;
+  redacted: boolean;
+}
+
+/**
+ * Make one untrusted string safe to persist.
+ *
+ * Character screening runs first so nothing invisible can hide a hostname from
+ * the redaction patterns; the clamp runs next so the patterns only ever see a
+ * bounded string; redaction runs last on that bounded, visible text.
+ *
+ * The flag compares against the original input, not against the clamped text.
+ * Measured from the clamp, a value whose ESC sequence was stripped or whose
+ * two megabytes were cut to 256 characters came back `redacted: false`, and an
+ * operator reading the sensitivity block was told the stored text was exactly
+ * what the endpoint sent. Every transformation is a removal and is reported.
+ */
+function screenText(value: string, limit = MAX_FACT_TEXT): Screened {
+  const clamped = clampText(screenChars(value), limit);
+  let text = clamped;
+  for (const [pattern, replacement] of REDACTIONS) {
+    text = text.replace(pattern, replacement);
+  }
+  return { text, redacted: text !== value };
+}
+
+/**
+ * One section's record of what it removed.
+ *
+ * The bundle's sensitivity block is what an operator reads when deciding
+ * whether a dashboard can be shared. Every section used to declare
+ * `redacted: false` while publishing endpoint text that had never been through
+ * a redaction pass, so that block was a claim nothing enforced. Now the flag
+ * and the field list are produced by the same call that does the removing.
+ */
+class Screen {
+  readonly #fields = new Set<string>();
+
+  /** Record intentional omission of a sensitive source field. */
+  omit(field: string): void {
+    this.#fields.add(field);
+  }
+
+  /** Screen one source field, naming it if anything was removed from it. */
+  text(field: string, value: string, limit = MAX_FACT_TEXT): string {
+    // Arbitrary diagnostic prose has no safe structural guarantee: a short,
+    // unlabelled password can evade every pattern. Discard the entire field.
+    if (field === "error" && value !== "") {
+      this.#fields.add(field);
+      return "Collector diagnostic text was redacted; inspect the protected source record.";
+    }
+    const { text, redacted } = screenText(value, limit);
+    if (redacted) this.#fields.add(field);
+    return text;
+  }
+
+  /**
+   * The sensitivity block describing what this screen actually did, merged
+   * over a block already produced elsewhere.
+   *
+   * The base exists for the bundle, which screens its own producer fields and
+   * republishes a section that screened its own: the reader needs one block
+   * naming every field either pass touched, not whichever was written last.
+   */
+  sensitivity(base: Json = defaultSensitivity): Json {
+    const inherited = Array.isArray(base.fields) ? base.fields as string[] : [];
+    const fields = [...new Set([...inherited, ...this.#fields])].sort();
+    return fields.length === 0 ? base : {
+      classification: "operational",
+      fields,
+      redacted: true,
+      note:
+        "untrusted text was screened before persistence: control or invisible characters, over-length text, credentials, URLs, hosts, mail addresses, or filesystem paths were removed",
+    };
+  }
+}
+
+/** Collision-resistant digest of an unambiguously encoded source tuple. */
+function identityDigest(parts: readonly string[]): string {
+  const raw = parts.map((part) => `${part.length}:${part}`).join("");
+  return createHash("sha256").update(raw).digest("hex").slice(0, 32);
+}
+
+/**
+ * The error kinds the scoped collectors document, plus the tokens this report
+ * raises on its own.
+ *
+ * `errorKind` is a free-form string on every schema but the daemon's, and it
+ * used to be spliced into an exception id after nothing but a 64-character
+ * slice. That gave an endpoint two ways to forge identity: `errorKind` values
+ * carrying `:` split the id into different fields than intended, and two long
+ * kinds sharing their first 64 characters produced one id, so one condition's
+ * suppression and history silently covered the other. An id is identity, so
+ * only known tokens are ever used literally; anything else is named by a hash
+ * of the whole value, which cannot be truncated into a neighbour and cannot
+ * carry a delimiter.
+ */
+const KNOWN_ERROR_KINDS: ReadonlySet<string> = new Set([
+  // endpoint and probe collectors
+  "unauthorized",
+  "unreachable",
+  "timeout",
+  "cancelled",
+  "http_error",
+  "model_not_found",
+  "malformed_response",
+  "empty_response",
+  "rate_limited",
+  "server_error",
+  "no_embedding_capability",
+  // daemon collector
+  "cli-unavailable",
+  "command-failed",
+  "invalid-response",
+  // conditions this report names itself, where the source reported no kind
+  "no-loaded-models",
+  "unknown-dimension",
+  "unsuccessful-status",
+  "invalid-record",
+  "record-oversized",
+  "truncated",
+  "none",
+  "usage-unavailable",
+  "context-exhausted",
+  "max-tokens-hit",
+  "reasoning-only-empty",
+  "capabilities-partial",
+  "capabilities-truncated",
+]);
+
+/** An id-safe token for an error kind. Unknown kinds are named, never quoted. */
+function kindToken(kind: string): string {
+  if (KNOWN_ERROR_KINDS.has(kind)) return kind;
+  return `unclassified-${identityDigest([kind])}`;
+}
+
+/** Readable half of a section id, bounded to what IdentifierSchema accepts. */
+function familySlug(value: string): string {
+  const slug = value.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "").slice(0, 32);
+  return slug || "method";
+}
+
+/**
+ * The section family for a source, resolved from the source type and method
+ * together.
+ *
+ * One function rather than a literal in each builder, because the family is
+ * part of the identity: if the failure path derived a family from the method
+ * name while the success path hard-coded one (`observe` versus `daemon`), the
+ * same daemon would write its healthy observations under one id and its
+ * rejected ones under another, and the history of a flapping source would come
+ * apart into two half-series. An unrecognised pair still gets a stable, bounded
+ * family from its method name.
+ */
+const SECTION_FAMILIES: Readonly<Record<string, string>> = {
+  "@jpisgeek/lmstudio/daemon.observe": "daemon",
+  "@jpisgeek/lmstudio/endpoint.health": "health",
+  "@jpisgeek/lmstudio/endpoint.models": "models",
+  "@jpisgeek/lmstudio/probe.embedding": "embedding",
+  "@jpisgeek/lmstudio/probe.completion": "completion",
+  "@jpisgeek/lmstudio/probe.capabilities": "capabilities",
+};
+
+function sectionFamily(ctx: ReportContext): string {
+  return SECTION_FAMILIES[`${String(ctx.modelType)}.${ctx.methodName}`] ??
+    familySlug(ctx.methodName);
+}
+
+/**
+ * Identity for one observed source, not for one method.
+ *
+ * The bundle id and the section id were fixed strings per method
+ * (`lmstudio-health` for every endpoint that exists), so two model definitions
+ * pointing at two different LM Studio hosts produced byte-identical resource
+ * identities. Downstream that is not a cosmetic clash: the renderer and the
+ * datastore key history on the id, so the second endpoint's record overwrote
+ * the first one's and an operator watching a "healthy" endpoint was watching
+ * whichever probe happened to run last.
+ *
+ * Identity therefore comes from the inputs that make the observation what it
+ * is — source type, model definition, model id, method, and the specific model
+ * the probe addressed — hashed through the length-prefixed encoding above so
+ * no two distinct tuples can land on one digest. The readable family stays in
+ * front of the digest so an id is still legible in a dashboard.
+ */
+function sourceIdentity(ctx: ReportContext, family: string, subject: string) {
+  const digest = identityDigest([
+    String(ctx.modelType),
+    ctx.definition.name,
+    ctx.modelId,
+    ctx.methodName,
+    family,
+    subject,
+  ]);
+  return {
+    /** Section and bundle id: unique per observed source. */
+    id: `lmstudio-${family}-${digest}`,
+    /** Build an exception id in the same identity space. */
+    exceptionId: (kind: string) =>
+      `lmstudio:${family}:${kindToken(kind)}:${digest}`,
+  };
 }
 
 /** Cut an untrusted list to the fact-expansion cap, reporting what was cut. */
@@ -804,9 +1430,11 @@ function truncationException(id: string, subject: string, total: number) {
 function failedSection(ctx: ReportContext) {
   const failure = classifyExecutionFailure(ctx.errorMessage);
   const state = failureState(failure.kind);
+  const family = sectionFamily(ctx);
+  const identity = sourceIdentity(ctx, family, "");
   return commonSection(
-    `lmstudio-${ctx.methodName}`,
-    `Local inference ${ctx.methodName}`,
+    identity.id,
+    `Local inference ${family}`,
     state,
     failure.detail,
     undefined,
@@ -814,7 +1442,7 @@ function failedSection(ctx: ReportContext) {
     [],
     [],
     [exception(
-      `lmstudio:${ctx.methodName}:${failure.kind}`,
+      identity.exceptionId(failure.kind),
       failureSeverity(failure.kind),
       failure.kind === "unauthorized"
         ? "Endpoint token rejected"
@@ -828,9 +1456,11 @@ function failedSection(ctx: ReportContext) {
 function invalidRecordSection(ctx: ReportContext) {
   const detail =
     "The scoped LM Studio resource did not match its published source contract.";
+  const family = sectionFamily(ctx);
+  const identity = sourceIdentity(ctx, family, "");
   return commonSection(
-    `lmstudio-${ctx.methodName}`,
-    `Local inference ${ctx.methodName}`,
+    identity.id,
+    `Local inference ${family}`,
     "partial",
     detail,
     undefined,
@@ -838,7 +1468,7 @@ function invalidRecordSection(ctx: ReportContext) {
     [],
     [],
     [exception(
-      `lmstudio:${ctx.methodName}:invalid-record`,
+      identity.exceptionId("invalid-record"),
       "warning",
       "Probe record rejected",
       detail,
@@ -847,38 +1477,84 @@ function invalidRecordSection(ctx: ReportContext) {
   );
 }
 
-function healthSection(value: z.infer<typeof HealthSchema>) {
+/**
+ * A resource too large to parse, reported as the partial observation it is.
+ *
+ * The size is the only thing said about it: nothing inside an oversized
+ * response has been decoded, so there is nothing else this report knows.
+ */
+function oversizedRecordSection(ctx: ReportContext, bytes: number) {
+  const detail =
+    `The scoped LM Studio resource is ${bytes} bytes, over the ${MAX_RECORD_BYTES}-byte cap this report will parse.`;
+  const family = sectionFamily(ctx);
+  const identity = sourceIdentity(ctx, family, "");
+  return commonSection(
+    identity.id,
+    `Local inference ${family}`,
+    "partial",
+    detail,
+    undefined,
+    { state: "partial", observed: 0, expected: 1, rejected: 1, reason: detail },
+    [],
+    [],
+    [exception(
+      identity.exceptionId("record-oversized"),
+      "warning",
+      "Probe record too large to parse",
+      detail,
+    )],
+    { kind: "unknown", notes: detail },
+  );
+}
+
+function healthSection(
+  ctx: ReportContext,
+  value: z.infer<typeof HealthSchema>,
+) {
   // errorKind and error are the collector's classification of an untrusted
-  // endpoint response and are both unbounded strings in HealthSchema. Clamp
-  // before one is spliced into an exception id and the other into a detail.
+  // endpoint response and are both unbounded strings in HealthSchema. Screen
+  // and clamp before one names an exception and the other becomes a detail.
+  const screen = new Screen();
   const kind = value.errorKind;
-  const errorDetail = clampText(value.error, MAX_FREE_TEXT);
+  const errorDetail = screen.text("error", value.error, MAX_FREE_TEXT);
+  const identity = sourceIdentity(ctx, sectionFamily(ctx), "");
+  // Health is derived positively: every field that could contradict a healthy
+  // endpoint has to agree, and the HTTP exchange has to have actually
+  // succeeded. Asking only whether errorKind was empty meant a 500 response
+  // whose kind the collector never set was published as a healthy endpoint,
+  // with no exception raised at all because the exception list keyed on the
+  // same empty string.
+  const successful = value.reachable && value.authorized && kind === "" &&
+    isSuccessStatus(value.httpStatus);
   const state: DashboardState = !value.reachable
     ? "critical"
     : !value.authorized
     ? kind === "unauthorized" ? "unauthorized" : "degraded"
-    : kind
-    ? failureState(kind)
-    : "healthy";
-  const exceptions = kind
-    ? [exception(
-      `lmstudio:health:${clampId(kind)}`,
-      failureSeverity(kind),
-      kind === "unauthorized"
-        ? "Endpoint reachable but token rejected"
-        : !value.reachable
-        ? "Endpoint unreachable"
-        : "Endpoint health degraded",
-      errorDetail || `health probe reported ${clampId(kind)}`,
-    )]
-    : [];
+    : successful
+    ? "healthy"
+    : failureState(kind);
+  const exceptions = successful ? [] : [exception(
+    identity.exceptionId(kind || "unsuccessful-status"),
+    failureSeverity(kind),
+    kind === "unauthorized"
+      ? "Endpoint reachable but token rejected"
+      : !value.reachable
+      ? "Endpoint unreachable"
+      : "Endpoint health degraded",
+    errorDetail ||
+      `health probe reported ${
+        kind ? kindToken(kind) : `HTTP ${value.httpStatus}`
+      }`,
+  )];
   return commonSection(
-    "lmstudio-health",
+    identity.id,
     "Local inference endpoint",
     state,
     value.reachable
       ? value.authorized
-        ? "Endpoint reachable and authorized"
+        ? successful
+          ? "Endpoint reachable and authorized"
+          : `Endpoint reachable and authorized but answered HTTP ${value.httpStatus}`
         : "Endpoint reachable but not authorized"
       : "Endpoint unreachable",
     value.checkedAt,
@@ -913,14 +1589,21 @@ function healthSection(value: z.infer<typeof HealthSchema>) {
       },
     ],
     exceptions,
+    {},
+    screen.sensitivity(),
   );
 }
 
-function modelsSection(value: z.infer<typeof ModelsSchema>) {
+function modelsSection(
+  ctx: ReportContext,
+  value: z.infer<typeof ModelsSchema>,
+) {
+  const screen = new Screen();
+  const identity = sourceIdentity(ctx, sectionFamily(ctx), "");
   const state: DashboardState = value.modelCount > 0 ? "healthy" : "degraded";
   const { listed, dropped } = clampList(value.modelIds);
   return commonSection(
-    "lmstudio-models",
+    identity.id,
     "Available local models",
     state,
     value.modelCount > 0
@@ -938,53 +1621,75 @@ function modelsSection(value: z.infer<typeof ModelsSchema>) {
       "count",
       value.modelCount,
     )],
+    // A model id is endpoint-chosen text: it reaches a fact value verbatim and
+    // from there a rendered table cell, so it is screened like any other
+    // untrusted string rather than trusted because it looks like a name.
     listed.map((model, index) => ({
       id: `model-${index}`,
       label: `Model ${index + 1}`,
-      value: clampText(model),
+      value: screen.text("modelIds", model),
       confidence: "exact",
       sensitivity: "operational",
     })),
     dropped > 0
       ? [truncationException(
-        "lmstudio:models:truncated",
+        identity.exceptionId("truncated"),
         "Available model",
         value.modelCount,
       )]
       : value.modelCount === 0
       ? [
         exception(
-          "lmstudio:models:none",
+          identity.exceptionId("none"),
           "warning",
           "No models available",
           "The endpoint returned an empty model list.",
         ),
       ]
       : [],
+    {},
+    screen.sensitivity(),
   );
 }
 
-function daemonSection(value: z.infer<typeof DaemonSchema>) {
+function daemonSection(
+  ctx: ReportContext,
+  value: z.infer<typeof DaemonSchema>,
+) {
+  const screen = new Screen();
+  const identity = sourceIdentity(ctx, sectionFamily(ctx), "");
+  // Healthy means the CLI answered, the runtime is up, and it is holding
+  // something. Deriving from loadedModelCount alone let a record that said
+  // daemonRunning:false publish a healthy runtime; the schema now rejects that
+  // pair outright, and this derivation no longer depends on it having done so.
+  const running = value.cliAvailable && value.daemonRunning &&
+    value.status === "running";
   const state: DashboardState = value.errorKind === "cli-unavailable"
     ? "unsupported"
     : value.errorKind === "unreachable" || value.errorKind === "timeout"
     ? "critical"
     : value.errorKind
     ? "partial"
+    : !running
+    ? "critical"
     : value.loadedModelCount === 0
     ? "degraded"
     : "healthy";
-  // `error` is unbounded free text from `lms ps` and lands in both the section
-  // summary (min-1 string, otherwise uncapped) and an exception detail.
-  const summary = clampText(value.error, MAX_FREE_TEXT) ||
+  // `error` is unbounded free text from `lms ps`, which reports the failure of
+  // a local process: its messages carry model file paths and the runtime's own
+  // host and port. It lands in both the section summary (min-1 string,
+  // otherwise uncapped) and an exception detail.
+  const summary = screen.text("error", value.error, MAX_FREE_TEXT) ||
     (value.loadedModelCount > 0
       ? `${value.loadedModelCount} model(s) loaded in LM Studio memory`
-      : "LM Studio is running with no models loaded");
+      : running
+      ? "LM Studio is running with no models loaded"
+      : "The LM Studio runtime is not running");
   const { listed, dropped } = clampList(value.loadedModels);
   const exceptions: ReturnType<typeof exception>[] = state === "healthy"
     ? []
     : [exception(
-      `lmstudio:daemon:${value.errorKind || "no-loaded-models"}`,
+      identity.exceptionId(value.errorKind || "no-loaded-models"),
       state === "critical" ? "critical" : "warning",
       value.errorKind === "cli-unavailable"
         ? "LM Studio CLI unavailable"
@@ -999,13 +1704,13 @@ function daemonSection(value: z.infer<typeof DaemonSchema>) {
     )];
   if (dropped > 0) {
     exceptions.push(truncationException(
-      "lmstudio:daemon:truncated",
+      identity.exceptionId("truncated"),
       "Loaded model",
       value.loadedModelCount,
     ));
   }
   return commonSection(
-    "lmstudio-daemon",
+    identity.id,
     "LM Studio headless daemon",
     state,
     summary,
@@ -1045,7 +1750,7 @@ function daemonSection(value: z.infer<typeof DaemonSchema>) {
       ...listed.map((model, index) => ({
         id: `loaded-model-${index}`,
         label: `Loaded model ${index + 1}`,
-        value: clampText(model.identifier),
+        value: screen.text("loadedModels", model.identifier),
         confidence: "exact",
         sensitivity: "operational",
       })),
@@ -1058,22 +1763,33 @@ function daemonSection(value: z.infer<typeof DaemonSchema>) {
       notes:
         "This is a point-in-time inventory, not aggregate request or token accounting.",
     },
+    screen.sensitivity(),
   );
 }
 
-function embeddingSection(value: z.infer<typeof EmbeddingSchema>) {
-  const state: DashboardState = value.errorKind
-    ? failureState(value.errorKind)
-    : value.servesEmbeddings && value.dimensionKnown
-    ? "healthy"
-    : "partial";
+function embeddingSection(
+  ctx: ReportContext,
+  value: z.infer<typeof EmbeddingSchema>,
+) {
   // model, error, and errorKind are all unbounded strings in EmbeddingSchema
   // and all three reach the summary, a fact value, or an exception id.
-  const model = clampText(value.model);
-  const reason = clampText(value.error, MAX_FREE_TEXT) ||
+  const screen = new Screen();
+  const model = screen.text("model", value.model);
+  const reason = screen.text("error", value.error, MAX_FREE_TEXT) ||
     "Embedding dimension was not observed";
+  // The probe model is part of the identity: one definition can probe several
+  // models, and each of those is a different observation with its own history.
+  const identity = sourceIdentity(ctx, sectionFamily(ctx), value.model);
+  // Healthy requires the exchange that produced the finding to have succeeded,
+  // not merely for errorKind to be empty.
+  const state: DashboardState = value.errorKind
+    ? failureState(value.errorKind)
+    : value.servesEmbeddings && value.dimensionKnown &&
+        isSuccessStatus(value.httpStatus)
+    ? "healthy"
+    : "partial";
   return commonSection(
-    "lmstudio-embedding",
+    identity.id,
     "Embedding probe",
     state,
     state === "healthy"
@@ -1121,23 +1837,34 @@ function embeddingSection(value: z.infer<typeof EmbeddingSchema>) {
       },
     ],
     state === "healthy" ? [] : [exception(
-      `lmstudio:embedding:${clampId(value.errorKind) || "unknown-dimension"}`,
+      identity.exceptionId(value.errorKind || "unknown-dimension"),
       failureSeverity(value.errorKind),
       value.errorKind === "model_not_found"
         ? "Embedding model not found"
         : "Embedding capability unavailable",
       reason,
     )],
+    {},
+    screen.sensitivity(),
   );
 }
 
-function completionSection(value: z.infer<typeof CompletionSchema>) {
+function completionSection(
+  ctx: ReportContext,
+  value: z.infer<typeof CompletionSchema>,
+) {
   // model, finishReason, error, and errorKind are unbounded strings in
   // CompletionSchema and reach the summary, fact values, and exception ids.
-  const model = clampText(value.model);
-  const finishReason = clampText(value.finishReason);
-  const errorDetail = clampText(value.error, MAX_FREE_TEXT);
-  const successful = value.errorKind === "";
+  const screen = new Screen();
+  const model = screen.text("model", value.model);
+  const finishReason = screen.text("finishReason", value.finishReason);
+  const errorDetail = screen.text("error", value.error, MAX_FREE_TEXT);
+  const identity = sourceIdentity(ctx, sectionFamily(ctx), value.model);
+  // A completion counts as successful only if the HTTP exchange succeeded too.
+  // With errorKind as the sole test, a 503 whose kind the collector left empty
+  // published observed token metrics for a request that never ran.
+  const successful = value.errorKind === "" &&
+    isSuccessStatus(value.httpStatus);
   const usageKnown = value.promptTokens !== null &&
     value.completionTokens !== null && value.totalTokens !== null;
   let state: DashboardState = successful
@@ -1147,7 +1874,7 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
   if (successful && value.contextExhausted) {
     state = "degraded";
     exceptions.push(exception(
-      "lmstudio:completion:context-exhausted",
+      identity.exceptionId("context-exhausted"),
       "warning",
       "Context window exhausted",
       "The completion stopped for length before reaching the requested output-token cap; this is a heuristic from one request.",
@@ -1155,7 +1882,7 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
   } else if (successful && value.maxTokensHit) {
     state = "degraded";
     exceptions.push(exception(
-      "lmstudio:completion:max-tokens-hit",
+      identity.exceptionId("max-tokens-hit"),
       "warning",
       "Output-token cap reached",
       "The completion used the requested output-token allowance and stopped with finish reason length.",
@@ -1164,7 +1891,7 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
   if (successful && value.emptyContentWithReasoning) {
     state = "degraded";
     exceptions.push(exception(
-      "lmstudio:completion:reasoning-only-empty",
+      identity.exceptionId("reasoning-only-empty"),
       "warning",
       "Reasoning consumed the response budget",
       "The model produced reasoning evidence but no visible answer content.",
@@ -1172,18 +1899,23 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
   }
   if (!successful) {
     exceptions.push(exception(
-      `lmstudio:completion:${clampId(value.errorKind)}`,
+      identity.exceptionId(value.errorKind || "unsuccessful-status"),
       failureSeverity(value.errorKind),
       value.errorKind === "model_not_found"
         ? "Completion model not found"
         : "Completion probe failed",
-      errorDetail || `completion probe reported ${clampId(value.errorKind)}`,
+      errorDetail ||
+        `completion probe reported ${
+          value.errorKind
+            ? kindToken(value.errorKind)
+            : `HTTP ${value.httpStatus}`
+        }`,
     ));
   }
   if (successful && !usageKnown) {
     state = "partial";
     exceptions.push(exception(
-      "lmstudio:completion:usage-unavailable",
+      identity.exceptionId("usage-unavailable"),
       "warning",
       "Token usage unavailable",
       "The endpoint completed the request without valid token accounting.",
@@ -1217,7 +1949,7 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
         successful ? absentReason : tokenReason,
       );
   return commonSection(
-    "lmstudio-completion",
+    identity.id,
     "Completion probe",
     state,
     successful
@@ -1299,13 +2031,19 @@ function completionSection(value: z.infer<typeof CompletionSchema>) {
       notes:
         "one instrumented probe request; not runtime-wide or aggregate token accounting",
     },
+    screen.sensitivity(),
   );
 }
 
-function capabilitySection(value: z.infer<typeof CapabilitySchema>) {
+function capabilitySection(
+  ctx: ReportContext,
+  value: z.infer<typeof CapabilitySchema>,
+) {
   // model and errorKind are unbounded strings in CapabilitySchema and reach
   // the summary, a fact value, and an exception detail.
-  const model = clampText(value.model);
+  const screen = new Screen();
+  const model = screen.text("model", value.model);
+  const identity = sourceIdentity(ctx, sectionFamily(ctx), value.model);
   const truncated = value.reasoningCheckTruncated ||
     value.formatCheckTruncated || value.fenceCheckTruncated;
   const complete = value.checksCompleted === 3 && !value.errorKind;
@@ -1319,24 +2057,27 @@ function capabilitySection(value: z.infer<typeof CapabilitySchema>) {
   const exceptions = [];
   if (!complete) {
     exceptions.push(exception(
-      "lmstudio:capabilities:partial",
+      identity.exceptionId("capabilities-partial"),
       "warning",
       "Capability battery incomplete",
+      // The kind is named by its token, not quoted: an endpoint-chosen kind
+      // reaching a detail verbatim is the same untrusted text every other
+      // field here is screened for.
       `${value.checksCompleted} of 3 checks completed${
-        value.errorKind ? `; ${clampId(value.errorKind)}` : ""
+        value.errorKind ? `; ${kindToken(value.errorKind)}` : ""
       }.`,
     ));
   }
   if (truncated) {
     exceptions.push(exception(
-      "lmstudio:capabilities:truncated",
+      identity.exceptionId("capabilities-truncated"),
       "warning",
       "Capability response truncated",
       "At least one capability check stopped for length; negative findings from that check are not conclusive.",
     ));
   }
   return commonSection(
-    "lmstudio-capabilities",
+    identity.id,
     "Model capabilities",
     state,
     complete
@@ -1406,7 +2147,28 @@ function capabilitySection(value: z.infer<typeof CapabilitySchema>) {
       },
     ],
     exceptions,
+    {},
+    screen.sensitivity(),
   );
+}
+
+/**
+ * A resource this report refuses to parse, reported rather than thrown.
+ *
+ * Carries the observed size because that is the only thing known about a
+ * record nothing has decoded.
+ */
+class OversizedRecordError extends Error {
+  /** Size of the resource that was refused. */
+  readonly bytes: number;
+
+  constructor(bytes: number) {
+    super(
+      `resource is ${bytes} bytes, over the ${MAX_RECORD_BYTES}-byte parse cap`,
+    );
+    this.name = "OversizedRecordError";
+    this.bytes = bytes;
+  }
 }
 
 async function readRecord(ctx: ReportContext): Promise<Json | null> {
@@ -1419,6 +2181,17 @@ async function readRecord(ctx: ReportContext): Promise<Json | null> {
     handle.version,
   );
   if (!content) return null;
+  // The expansion caps further down bound the OUTPUT, not the work: they are
+  // applied to an already-decoded, already-parsed, already-validated value.
+  // A collector that stored a gigabyte-long array of model ids (which
+  // ModelsSchema accepts, since modelCount is derived from that same array)
+  // therefore cost a gigabyte of decoded UTF-16, a full JSON.parse, and a
+  // whole-array Zod walk before clampList ever saw it, in a report process
+  // that has no other reason to allocate at that scale. The cap belongs here,
+  // ahead of the decode, where refusing is still cheap.
+  if (content.byteLength > MAX_RECORD_BYTES) {
+    throw new OversizedRecordError(content.byteLength);
+  }
   return JSON.parse(new TextDecoder().decode(content));
 }
 
@@ -1434,15 +2207,25 @@ export async function normalize(
       "@jpisgeek/lmstudio/daemon",
     ].includes(modelType)
   ) {
-    throw new Error(`unsupported LM Studio source ${modelType}`);
+    throw new Error("unsupported LM Studio source type");
   }
   let section;
   let record: Json | null = null;
   try {
     record = await readRecord(ctx);
   } catch (error) {
-    if (!(error instanceof SyntaxError)) throw error;
-    section = invalidRecordSection(ctx);
+    if (error instanceof OversizedRecordError) {
+      section = oversizedRecordSection(ctx, error.bytes);
+    } else if (error instanceof SyntaxError || error instanceof RangeError) {
+      // SyntaxError is malformed JSON. RangeError is what V8's recursive JSON
+      // parser raises on a deeply nested document, which is the other way a
+      // record that fits under the byte cap can still refuse to parse; both
+      // are the same thing to a reader — a record that could not be read.
+      section = invalidRecordSection(ctx);
+    } else {
+      // Repository errors can quote credentials and paths. Keep a coverage gap.
+      section = invalidRecordSection(ctx);
+    }
   }
   if (section) {
     // Malformed JSON is a visible invalid record, not a leaked parser error.
@@ -1454,35 +2237,35 @@ export async function normalize(
         modelType === "@jpisgeek/lmstudio/daemon" &&
         ctx.methodName === "observe"
       ) {
-        section = daemonSection(DaemonSchema.parse(record));
+        section = daemonSection(ctx, DaemonSchema.parse(record));
       } else if (
         modelType === "@jpisgeek/lmstudio/endpoint" &&
         ctx.methodName === "health"
       ) {
-        section = healthSection(HealthSchema.parse(record));
+        section = healthSection(ctx, HealthSchema.parse(record));
       } else if (
         modelType === "@jpisgeek/lmstudio/endpoint" &&
         ctx.methodName === "models"
       ) {
-        section = modelsSection(ModelsSchema.parse(record));
+        section = modelsSection(ctx, ModelsSchema.parse(record));
       } else if (
         modelType === "@jpisgeek/lmstudio/probe" &&
         ctx.methodName === "embedding"
       ) {
-        section = embeddingSection(EmbeddingSchema.parse(record));
+        section = embeddingSection(ctx, EmbeddingSchema.parse(record));
       } else if (
         modelType === "@jpisgeek/lmstudio/probe" &&
         ctx.methodName === "completion"
       ) {
-        section = completionSection(CompletionSchema.parse(record));
+        section = completionSection(ctx, CompletionSchema.parse(record));
       } else if (
         modelType === "@jpisgeek/lmstudio/probe" &&
         ctx.methodName === "capabilities"
       ) {
-        section = capabilitySection(CapabilitySchema.parse(record));
+        section = capabilitySection(ctx, CapabilitySchema.parse(record));
       } else {
         throw new Error(
-          `unsupported LM Studio method ${modelType}.${ctx.methodName}`,
+          "unsupported LM Studio source method",
         );
       }
     } catch (error) {
@@ -1490,6 +2273,16 @@ export async function normalize(
       section = invalidRecordSection(ctx);
     }
   }
+  // The producer names the model definition and instance this bundle came
+  // from, and both are free-form operator-configured strings. A definition
+  // named after the host it points at, or one carrying a key someone pasted
+  // into the wrong field, was published here verbatim while the section beside
+  // it had every equivalent string screened. They go through the same pass —
+  // after identity is derived, which is why sourceIdentity() still hashes the
+  // raw values: screening first would map two distinct sources onto one id.
+  const producerScreen = new Screen();
+  producerScreen.omit("producer.modelName");
+  producerScreen.omit("producer.modelId");
   const bundle = {
     schemaVersion: DASHBOARD_BUNDLE_VERSION,
     id: section.id,
@@ -1497,17 +2290,21 @@ export async function normalize(
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/dashboard-lmstudio",
-      extensionVersion: "2026.08.25.3",
+      extensionVersion: "2026.09.05.1",
       modelType,
-      modelName: ctx.definition.name,
-      modelId: ctx.modelId,
+      modelName: "lmstudio-observation",
       dataName: "report-jpisgeek-dashboard-lmstudio-json",
       reportName: "@jpisgeek/dashboard-lmstudio",
     },
     state: deriveOverallState([section]),
     sections: [section],
     exceptions: [],
-    sensitivity,
+    // The bundle inherits the section's own sensitivity block, because the
+    // bundle-level Markdown carries that section's summary. A fixed
+    // `redacted: false` here would have contradicted a section that had just
+    // redacted a credential out of the very string being republished. The
+    // producer's own screening is merged in for the same reason.
+    sensitivity: producerScreen.sensitivity(section.sensitivity),
     extensions: {
       "jpisgeek/local-inference": {
         accountingScope: ctx.methodName === "completion"

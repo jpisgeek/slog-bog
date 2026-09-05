@@ -1,6 +1,45 @@
 /** Observe an LM Studio headless daemon through the supported `lms` CLI. */
 import { z } from "npm:zod@4";
 
+/**
+ * The transport check on `--host`, and the reason remote mode is loopback-only.
+ *
+ * `lms ps --host <host>` talks to the far end over plain HTTP: the CLI offers
+ * no TLS option, no certificate to verify, and no way for this extension to
+ * establish one on its behalf. Naming a remote host directly therefore puts
+ * the daemon exchange -- the host's loaded model inventory, and whatever the
+ * far end sends back -- on the wire in cleartext, on a link this code cannot
+ * see. The only remote configuration whose confidentiality can actually be
+ * asserted is one where the encryption is somebody else's job and already
+ * terminated locally: a WireGuard interface, an `ssh -L` forward, an stunnel
+ * listener. All of those present as a loopback address, and everything else
+ * is refused at config-parse time rather than silently downgraded.
+ *
+ * Accepts the bare host, `host:port`, and the bracketed IPv6 form.
+ */
+function isLoopbackHost(value: string): boolean {
+  let host = value;
+  if (host.startsWith("[")) {
+    // [::1] or [::1]:1234 -- the brackets exist precisely so the colons
+    // inside the address are not read as a port separator.
+    const end = host.indexOf("]");
+    host = end === -1 ? host.slice(1) : host.slice(1, end);
+  } else if ((host.match(/:/g) ?? []).length === 1) {
+    // Exactly one colon is host:port. More than one is a bare IPv6 literal,
+    // which has no port to strip.
+    host = host.slice(0, host.indexOf(":"));
+  }
+  host = host.toLowerCase();
+  if (host === "localhost" || host === "::1" || host === "0:0:0:0:0:0:0:1") {
+    return true;
+  }
+  const octets = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!octets) return false;
+  const parts = octets.slice(1).map(Number);
+  // The whole 127.0.0.0/8 block supports distinct local tunnel endpoints.
+  return parts.every((o) => o <= 255) && parts[0] === 127;
+}
+
 const GlobalArgsSchema = z.object({
   lmsBinary: z.string().min(1).default("lms").describe(
     "LM Studio CLI executable path or name",
@@ -13,8 +52,15 @@ const GlobalArgsSchema = z.object({
     {
       message: "host must not contain whitespace or begin with a hyphen",
     },
-  ).optional().describe(
-    "Optional remote LM Studio host accepted by lms ps --host; omit when running this model beside llmster",
+  ).refine(isLoopbackHost, {
+    message:
+      "host must be a loopback address (localhost, 127.0.0.0/8, or ::1), " +
+      "optionally with a port: `lms --host` speaks cleartext HTTP, so a " +
+      "remote daemon must be reached through the local end of an encrypted " +
+      "tunnel (WireGuard, an ssh -L forward, stunnel) rather than named " +
+      "directly",
+  }).optional().describe(
+    "Optional remote LM Studio host accepted by lms ps --host. Must be a loopback address, with or without a port: lms speaks cleartext, so remote daemons are reached by pointing this at the local end of an encrypted tunnel. Omit when running this model beside llmster",
   ),
 });
 
@@ -221,6 +267,37 @@ async function readCapped(
 }
 
 /**
+ * The complete list of environment variables `lms` is allowed to inherit.
+ *
+ * Two, both load-bearing for the CLI and neither of them secret-carrying:
+ * PATH, because a bare `lms` (and the node/electron helpers it re-execs) is
+ * resolved through it and a cleared environment would otherwise leave the
+ * child unable to find its own runtime; HOME, because `lms` keeps its client
+ * state under `~/.lmstudio` and without it writes to, or fails at, the wrong
+ * place. Anything added here is another value handed to an operator-chosen
+ * executable, so add only with a stated reason.
+ */
+const LMS_ENV_ALLOWLIST = ["PATH", "HOME"] as const;
+
+/** Build the child environment from the allowlist, and nothing else. */
+function lmsChildEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of LMS_ENV_ALLOWLIST) {
+    let value: string | undefined;
+    try {
+      value = Deno.env.get(key);
+    } catch {
+      // Reading env needs a permission this model does not require. Not having
+      // PATH is a worse `lms` invocation, not a reason to refuse to spawn --
+      // and it is never a reason to fall back to inheriting everything.
+      value = undefined;
+    }
+    if (value) env[key] = value;
+  }
+  return env;
+}
+
+/**
  * Spawn `lms` and collect its output under two hard bounds: bytes, and time.
  *
  * The previous version had neither. It sent SIGTERM on abort and then went
@@ -240,6 +317,16 @@ async function readCapped(
 const defaultRunner: CommandRunner = async (binary, args, signal) => {
   const child = new Deno.Command(binary, {
     args,
+    // The child gets a built environment, never the inherited one. Deno.Command
+    // hands the spawned process the entire parent environment by default, and
+    // `lmsBinary` is operator-configured -- so whatever the swamp runtime is
+    // holding in env at that moment (other extensions' tokens, CI secrets, a
+    // vault password passed in by the host) was being handed to an arbitrary
+    // executable that has no use for any of it. `clearEnv` is what makes that
+    // impossible rather than merely unlikely; the allowlist below is what
+    // keeps `lms` working.
+    clearEnv: true,
+    env: lmsChildEnv(),
     stdin: "null",
     stdout: "piped",
     stderr: "piped",
@@ -316,13 +403,6 @@ const defaultRunner: CommandRunner = async (binary, args, signal) => {
     await collect.catch(() => {});
   }
 };
-
-let commandRunner: CommandRunner = defaultRunner;
-
-/** Test seam; production always uses an argv-only Deno.Command. */
-export function setCommandRunnerForTest(runner?: CommandRunner): void {
-  commandRunner = runner ?? defaultRunner;
-}
 
 /**
  * The real subprocess runner, exposed so the tests can exercise it directly.
@@ -412,6 +492,7 @@ async function runJson(
   args: string[],
   timeoutMs: number,
   callerSignal: AbortSignal,
+  commandRunner: CommandRunner,
 ): Promise<CommandResult> {
   const timeout = AbortSignal.timeout(timeoutMs);
   const signal = AbortSignal.any([callerSignal, timeout]);
@@ -427,10 +508,22 @@ async function runJson(
   }
 }
 
+interface ObservationContext {
+  globalArgs: unknown;
+  signal: AbortSignal;
+  /** Applies to this observation only; production uses the immutable runner. */
+  commandRunner?: CommandRunner;
+  writeResource(
+    spec: string,
+    name: string,
+    value: z.infer<typeof DaemonSchema>,
+    options?: { tags?: Record<string, string> },
+  ): Promise<unknown>;
+}
+
 async function observe(
   _args: z.infer<typeof ObserveArgsSchema>,
-  // deno-lint-ignore no-explicit-any
-  ctx: any,
+  ctx: ObservationContext,
 ) {
   const g = GlobalArgsSchema.parse(ctx.globalArgs);
   const observedAt = new Date().toISOString();
@@ -444,6 +537,7 @@ async function observe(
       ["ps", ...hostArgs, "--json"],
       g.timeoutMs,
       ctx.signal,
+      ctx.commandRunner ?? defaultRunner,
     );
     if (psResult.truncated) {
       // Checked before the !success branch below, and never handed to the
@@ -521,8 +615,14 @@ async function observe(
 /** LM Studio headless-daemon and loaded-model observation. */
 export const model = {
   type: "@jpisgeek/lmstudio/daemon",
-  version: "2026.08.25.1",
+  version: "2026.09.05.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [{
+    toVersion: "2026.09.05.1",
+    description:
+      "Preserve daemon configuration while advancing its version; remote host values still require current loopback validation and are never silently redirected",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }],
   resources: {
     daemon: {
       description:

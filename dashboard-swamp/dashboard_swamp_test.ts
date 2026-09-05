@@ -3,10 +3,71 @@ import {
   assertNotEquals,
   assertRejects,
 } from "jsr:@std/assert@1";
-import { normalize } from "./dashboard_swamp.ts";
-import { model, setCommandRunnerForTest } from "./swamp_observability.ts";
+import { normalize, report } from "./dashboard_swamp.ts";
+import { type CommandRunner, model } from "./swamp_observability.ts";
 
 type Json = Record<string, unknown>;
+
+Deno.test("handle overflow bounds repository work and reports omitted coverage", async () => {
+  const ctx = reportContext(complete());
+  const handle = ctx.dataHandles[0];
+  ctx.dataHandles = Array.from({ length: 100 }, () => ({ ...handle }));
+  const read = ctx.dataRepository.getContent;
+  let reads = 0;
+  ctx.dataRepository.getContent = (...args) => {
+    reads++;
+    return read(...args);
+  };
+  const result = await normalize(ctx);
+  assertEquals(reads, 16);
+  const coverage = result.sections.find((section) =>
+    section.title === "Observation coverage"
+  )!;
+  assertEquals(coverage.state, "partial");
+  assertEquals(coverage.impact, "required");
+  assertEquals(coverage.completeness.observed, 16);
+  assertEquals(coverage.completeness.expected, 100);
+  assertEquals(coverage.summary.includes("84 handles were omitted"), true);
+  assertEquals(result.state === "healthy", false);
+});
+
+Deno.test("separate observed repositories cannot share bundle or exception identities", async () => {
+  const first = await normalize(reportContext(complete()));
+  const other = reportContext(complete());
+  other.modelId = "another-example-observer";
+  const second = await normalize(other);
+  assertNotEquals(first.id, second.id);
+  const firstIds = new Set(first.sections.flatMap((section) => [
+    section.id,
+    ...section.exceptions.map((item) => item.id),
+  ]));
+  for (const section of second.sections) {
+    assertEquals(firstIds.has(section.id), false);
+    for (const item of section.exceptions) {
+      assertEquals(firstIds.has(item.id), false);
+    }
+  }
+  assertEquals(JSON.stringify(second).includes(other.modelId), false);
+});
+
+Deno.test("duplicate interface snapshots cannot overwrite a failed observation", async () => {
+  const items = complete();
+  items.push(items[0]);
+  const result = await normalize(reportContext(items));
+  const section = result.sections.find((item) =>
+    item.title === "Model and workflow runs"
+  )!;
+  assertEquals(section.state === "healthy", false);
+  assertEquals(section.exceptions.length > 0, true);
+});
+
+Deno.test("oversized stored snapshots are rejected before JSON decoding", async () => {
+  const ctx = reportContext(complete());
+  ctx.dataRepository.getContent = () =>
+    Promise.resolve(new Uint8Array(4 * 1024 * 1024 + 1));
+  const result = await normalize(ctx);
+  assertEquals(result.sections.every((item) => item.state !== "healthy"), true);
+});
 
 // Freshness is now derived by comparing observedAt against the clock, so the
 // default fixture has to represent what a normal run looks like: the collector
@@ -103,6 +164,31 @@ Deno.test("successful public interfaces remain visible beside heartbeat gap", as
   });
 });
 
+Deno.test("the bundle names the producer without naming the deployment", async () => {
+  // producer.modelName was `ctx.definition.name` and producer.modelId was the
+  // instance UUID, so a stored report artifact — the thing that gets published
+  // and handed to renderers — carried what the operator called their model and
+  // which deployment it was. The bundle needs to say what produced it; it never
+  // needed to say whose. Both identifiers are still used to READ the snapshots,
+  // and neither may appear in the output.
+  const context = {
+    ...reportContext(complete()),
+    modelId: "8b1d0e5a-private-instance-uuid",
+    definition: { name: "example-swamp-model", version: 3 },
+  };
+  const bundle = await normalize(context);
+  assertEquals(bundle.producer.modelName, "swamp-observability");
+  assertEquals(bundle.producer.modelId, undefined);
+  const serialized = JSON.stringify(bundle);
+  for (const identifier of ["example-swamp-model", "private-instance-uuid"]) {
+    assertEquals(serialized.includes(identifier), false, identifier);
+  }
+  // The snapshots were still read through those identifiers, so this is a
+  // redaction of the output rather than a report that stopped working.
+  assertEquals(bundle.sections.length, 5);
+  assertEquals(bundle.sections[0].state, "healthy");
+});
+
 Deno.test("published report contains the canonical contract verbatim", async () => {
   const entry = await Deno.readTextFile(
     new URL("./dashboard_swamp.ts", import.meta.url),
@@ -144,7 +230,7 @@ Deno.test("stale and orphaned diagnostics are critical", async () => {
 Deno.test("run-history stale flag wins over a running status", async () => {
   const bundle = await normalize(reportContext(complete({
     "run-history": observation("run-history", {
-      runs: [{ status: "running", stale: true }],
+      runs: [{ status: "active", stale: true }],
     }),
   })));
   assertEquals(bundle.sections[0].state, "critical");
@@ -166,7 +252,7 @@ Deno.test("missing orphan and report status fields are not normalized to zero", 
       stale: 0,
     }),
     "stored-reports": observation("stored-reports", {
-      results: [{ reportName: "@example/report" }],
+      results: [{ identified: true }],
     }),
   })));
   assertEquals(bundle.sections[1].state, "partial");
@@ -182,20 +268,33 @@ Deno.test("missing orphan and report status fields are not normalized to zero", 
   );
 });
 
-Deno.test("whitespace report status remains unavailable", async () => {
-  const bundle = await normalize(reportContext(complete({
-    "stored-reports": observation("stored-reports", {
-      results: [{ reportName: "@example/report", status: "   " }],
-    }),
-  })));
-  const section = bundle.sections[3];
-  assertEquals(section.state, "partial");
-  assertEquals(section.completeness.state, "partial");
-  assertEquals(
-    section.metrics.find((metric) => metric.id === "status-known")
-      ?.availability,
-    "unsupported",
-  );
+Deno.test("a payload field outside the projected shape becomes a coverage gap", async () => {
+  // Only the collector's projection may be persisted, so the report refuses a
+  // snapshot carrying anything else — a report name here, a status that is not
+  // a bounded token. Refusing it costs one interface, not the run: whatever
+  // that field holds is never read, normalized, or handed to a renderer.
+  for (
+    const results of [
+      [{ reportName: "@example/report" }],
+      [{ identified: true, status: "   " }],
+      [{ identified: true, status: "x".repeat(64) }],
+    ]
+  ) {
+    const bundle = await normalize(reportContext(complete({
+      "stored-reports": observation("stored-reports", { results }),
+    })));
+    const section = bundle.sections[3];
+    assertEquals(section.state, "partial");
+    assertEquals(section.coverage.kind, "unknown");
+    assertEquals(
+      section.exceptions[0].id.endsWith(
+        ":swamp:stored-reports:invalid-response",
+      ),
+      true,
+    );
+    // The interfaces that were projected correctly still render.
+    assertEquals(bundle.sections[0].state, "healthy");
+  }
 });
 
 Deno.test("missing stale count is unsupported rather than zero", async () => {
@@ -216,12 +315,16 @@ Deno.test("missing stale count is unsupported rather than zero", async () => {
 });
 
 Deno.test("malformed history and report records make coverage partial", async () => {
+  // `{}` is what the collector writes in place of a record it could not
+  // project — a non-object entry, or a status that was not a bounded token.
+  // The record is still counted so the population stays honest, and nothing it
+  // contained survives into the snapshot.
   const bundle = await normalize(reportContext(complete({
     "run-history": observation("run-history", {
-      runs: [{ status: "succeeded" }, "malformed", { status: 7 }],
+      runs: [{ status: "succeeded" }, {}, {}],
     }),
     "stored-reports": observation("stored-reports", {
-      results: [{ status: "succeeded" }, 42, { status: 7 }],
+      results: [{ status: "succeeded" }, {}, {}],
     }),
   })));
   for (const section of [bundle.sections[0], bundle.sections[3]]) {
@@ -245,29 +348,35 @@ Deno.test("every missing run diagnostic count remains unavailable", async () => 
   }
 });
 
-Deno.test("remote server requires credential-free HTTPS", () => {
-  for (
-    const server of [
-      "http://swamp.example.invalid",
-      "file:///tmp/swamp",
-      "https://user:token@swamp.example.invalid",
-      "https://swamp.example.invalid?token=private",
-      "https://swamp.example.invalid#private",
-    ]
-  ) {
-    const parsed = model.globalArguments.safeParse({
-      repoDir: "/tmp/synthetic-swamp-repo",
-      server,
-    });
-    assertEquals(parsed.success, false, server);
-  }
+Deno.test("the model exposes no remote destination for a credential to reach", () => {
+  // There is no https/userinfo validation left to test because there is no URL
+  // argument left to validate. A first-hop check could not survive a redirect
+  // issued by the server it validated, and the redirect was followed inside the
+  // Swamp executable, so the capability was removed instead.
   assertEquals(
-    model.globalArguments.safeParse({
-      repoDir: "/tmp/synthetic-swamp-repo",
-      server: "https://swamp.example.invalid",
-    }).success,
-    true,
+    Object.keys(model.globalArguments.shape).sort(),
+    ["repoDir", "swampBinary", "timeoutMs"],
   );
+});
+
+Deno.test("a negative diagnostic count can never render as healthy", async () => {
+  // `typeof value === "number"` accepted -1, so `stale: -1, orphaned: 0` was a
+  // complete response whose stale+orphaned sum was below zero: the section
+  // rendered healthy with exact coverage off a result that described nothing
+  // of the sort. A count outside nonnegative integers is now outside the
+  // snapshot contract entirely, so it is a coverage gap, not a clean bill.
+  const bundle = await normalize(reportContext(complete({
+    "run-doctor": observation("run-doctor", {
+      totalTracked: 3,
+      active: 0,
+      stale: -1,
+      orphaned: 0,
+    }),
+  })));
+  const section = bundle.sections[1];
+  assertEquals(section.state, "partial");
+  assertEquals(section.coverage.kind, "unknown");
+  assertNotEquals(bundle.state, "healthy");
 });
 
 Deno.test("empty history is unknown rather than healthy or zero activity", async () => {
@@ -299,9 +408,9 @@ Deno.test("unavailable and unauthorized interfaces remain distinct", async () =>
   assertEquals(unauthorized.state, "critical");
 });
 
-Deno.test("collector invokes documented commands without a shell or token argv", async () => {
+Deno.test("collector invokes documented commands with no shell, URL, or credential", async () => {
   const calls: Array<{ args: string[]; env: Record<string, string> }> = [];
-  setCommandRunnerForTest((_binary, args, options) => {
+  const runner: CommandRunner = (_binary, args, options) => {
     calls.push({ args, env: options.env });
     const command = args.slice(0, 2).join(" ");
     const payload = command === "run doctor"
@@ -315,33 +424,28 @@ Deno.test("collector invokes documented commands without a shell or token argv",
       stdout: JSON.stringify(payload),
       stderr: "",
     });
-  });
+  };
   const written: Json[] = [];
-  try {
-    await model.methods.observe.execute({}, {
-      globalArgs: {
-        repoDir: "/tmp/synthetic-swamp-repo",
-        swampBinary: "swamp",
-        server: "https://swamp.example.invalid",
-        token: "synthetic-secret",
-        timeoutMs: 1000,
-      },
-      signal: new AbortController().signal,
-      writeResource: (_spec: string, _name: string, data: Json) => {
-        written.push(data);
-        return Promise.resolve({});
-      },
-    });
-  } finally {
-    setCommandRunnerForTest();
-  }
+  await model.methods.observe.execute({}, {
+    commandRunner: runner,
+    globalArgs: {
+      repoDir: "/tmp/synthetic-swamp-repo",
+      swampBinary: "swamp",
+      timeoutMs: 1000,
+    },
+    signal: new AbortController().signal,
+    writeResource: (_spec: string, _name: string, data: Json) => {
+      written.push(data);
+      return Promise.resolve({});
+    },
+  });
   assertEquals(calls.length, 4);
   assertEquals(
-    calls.every((call) => !call.args.includes("synthetic-secret")),
+    calls.every((call) => call.args.every((arg) => !arg.includes("://"))),
     true,
   );
   assertEquals(
-    calls.every((call) => call.env.SWAMP_SERVER_TOKEN === "synthetic-secret"),
+    calls.every((call) => Object.keys(call.env).length === 0),
     true,
   );
   assertEquals(written.length, 5);
@@ -350,38 +454,35 @@ Deno.test("collector invokes documented commands without a shell or token argv",
 
 Deno.test("collector cancellation aborts instead of recording unavailability", async () => {
   const controller = new AbortController();
-  setCommandRunnerForTest((_binary, _args, options) => {
+  const runner: CommandRunner = (_binary, _args, options) => {
     controller.abort(new Error("cancelled"));
     return Promise.reject(options.signal.reason);
-  });
-  try {
-    await assertRejects(() =>
-      model.methods.observe.execute({}, {
-        globalArgs: {
-          repoDir: "/tmp/synthetic-swamp-repo",
-          swampBinary: "swamp",
-        },
-        signal: controller.signal,
-        writeResource: () => Promise.resolve({}),
-      })
-    );
-  } finally {
-    setCommandRunnerForTest();
-  }
+  };
+  await assertRejects(() =>
+    model.methods.observe.execute({}, {
+      commandRunner: runner,
+      globalArgs: {
+        repoDir: "/tmp/synthetic-swamp-repo",
+        swampBinary: "swamp",
+      },
+      signal: controller.signal,
+      writeResource: () => Promise.resolve({}),
+    })
+  );
 });
 
-Deno.test("compound statuses are never laundered into successes", async () => {
-  // The old classifier used unanchored substring probes with the success test
-  // ahead of the failure test, so "completed_with_errors" matched /completed/
-  // and "unsuccessful" matched /success/ — both landed in counts.succeeded and
-  // the section rendered healthy. Whole-token matching sends the first to
-  // unknown and the second to failed; neither may ever count as a success.
+Deno.test("an unrecognized bucket is counted as unknown, never as a success", async () => {
+  // The vocabulary itself is exercised in the collector's tests, where the
+  // response text still exists. What this report must guarantee is that the
+  // `unknown` bucket — everything the collector could not recognize, with its
+  // text discarded — is carried through as unknown and degrades the section,
+  // rather than being folded into the healthy majority.
   const bundle = await normalize(reportContext(complete({
     "run-history": observation("run-history", {
       runs: [
-        { status: "completed_with_errors" },
-        { status: "unsuccessful" },
-        { status: "pending_failure" },
+        { status: "unknown" },
+        { status: "failed" },
+        { status: "unknown" },
       ],
     }),
   })));
@@ -395,14 +496,14 @@ Deno.test("compound statuses are never laundered into successes", async () => {
   assertEquals(section.state, "degraded");
 });
 
-Deno.test("plain success and failure vocabularies still classify correctly", async () => {
+Deno.test("each bucket lands in its own count", async () => {
   const bundle = await normalize(reportContext(complete({
     "run-history": observation("run-history", {
       runs: [
         { status: "succeeded" },
-        { status: "Completed" },
-        { status: "running" },
-        { status: "cancelled" },
+        { status: "succeeded" },
+        { status: "active" },
+        { status: "failed" },
       ],
     }),
   })));
@@ -415,6 +516,25 @@ Deno.test("plain success and failure vocabularies still classify correctly", asy
   assertEquals(value("unknown"), 0);
 });
 
+Deno.test("free-text status in a stored snapshot is refused, not displayed", async () => {
+  // The read-side half of the redaction. A snapshot from a drifted or tampered
+  // collector carrying a credential-shaped status must not be normalized into
+  // a bundle a renderer will show; the interface becomes a coverage gap and
+  // the text is never read.
+  const bundle = await normalize(reportContext(complete({
+    "run-history": observation("run-history", {
+      runs: [{ status: "sk-live-9f2c1d4b8e" }],
+    }),
+  })));
+  const section = bundle.sections[0];
+  assertEquals(section.state, "partial");
+  assertEquals(
+    section.exceptions[0].id.endsWith(":swamp:run-history:invalid-response"),
+    true,
+  );
+  assertEquals(JSON.stringify(bundle).includes("sk-live"), false);
+});
+
 Deno.test("a wholly failed report inventory does not render as healthy", async () => {
   // hasStatus was a presence probe only: every stored-reports branch keyed off
   // "is a status string there", never its value, so an inventory in which every
@@ -423,16 +543,16 @@ Deno.test("a wholly failed report inventory does not render as healthy", async (
   const failed = await normalize(reportContext(complete({
     "stored-reports": observation("stored-reports", {
       results: [
-        { reportName: "@jpisgeek/dashboard-swamp", status: "failed" },
-        { reportName: "@jpisgeek/other", status: "failed" },
+        { identified: true, status: "failed" },
+        { identified: true, status: "failed" },
       ],
     }),
   })));
   const succeeded = await normalize(reportContext(complete({
     "stored-reports": observation("stored-reports", {
       results: [
-        { reportName: "@jpisgeek/dashboard-swamp", status: "succeeded" },
-        { reportName: "@jpisgeek/other", status: "succeeded" },
+        { identified: true, status: "succeeded" },
+        { identified: true, status: "succeeded" },
       ],
     }),
   })));
@@ -461,7 +581,7 @@ Deno.test("a wholly failed report inventory does not render as healthy", async (
 Deno.test("an unrecognized report status degrades rather than passing", async () => {
   const bundle = await normalize(reportContext(complete({
     "stored-reports": observation("stored-reports", {
-      results: [{ reportName: "@example/report", status: "completed_early" }],
+      results: [{ identified: true, status: "unknown" }],
     }),
   })));
   const section = bundle.sections[3];
@@ -477,7 +597,7 @@ Deno.test("stored report status stays a capability probe, not a verdict", async 
   // and unsupported metrics — never a health judgement in either direction.
   const bundle = await normalize(reportContext(complete({
     "stored-reports": observation("stored-reports", {
-      results: [{ reportName: "@example/report" }],
+      results: [{ identified: true }],
     }),
   })));
   const section = bundle.sections[3];
@@ -523,6 +643,117 @@ Deno.test("an aged observation reports stale freshness instead of claiming fresh
   }
 });
 
+Deno.test("a snapshot cannot claim health it does not have, or print its own text", async () => {
+  // Three shapes the flat, non-strict snapshot schema used to accept, all of
+  // them from the same finding. The first claims `available: true` while
+  // carrying a failure classification and a healthy payload — a failure wearing
+  // the shape of health. The second is a legitimately unavailable snapshot
+  // whose stored `error` string was copied verbatim into the summary, the
+  // coverage note, the completeness reason, the exception detail and the report
+  // Markdown, so whatever a drifted or tampered collector wrote there reached
+  // every renderer downstream. The third carries an unexpected top-level field
+  // the README already promised was rejected.
+  const context = reportContext(complete({
+    "run-history": observation("run-history", {
+      runs: [{ status: "succeeded" }],
+    }, {
+      errorKind: "unauthorized",
+      error: "token=synthetic-secret",
+    }),
+    "stored-reports": observation("stored-reports", null, {
+      available: false,
+      errorKind: "unreachable",
+      error: "<img src=x onerror=alert(1)> nas.internal.lan",
+    }),
+    "workflow-history": observation("workflow-history", { results: [] }, {
+      smuggled: "extra-top-level-field",
+    }),
+  }));
+  const { markdown, json } = await report.execute(context);
+  assertEquals(json.sections[0].state, "partial");
+  assertEquals(
+    json.sections[0].exceptions[0].id.endsWith(
+      ":swamp:run-history:invalid-response",
+    ),
+    true,
+  );
+  assertEquals(json.sections[2].state, "partial");
+  assertEquals(json.sections[3].state, "partial");
+  assertNotEquals(json.state, "healthy");
+  const rendered = `${markdown}\n${JSON.stringify(json)}`;
+  for (
+    const leaked of [
+      "synthetic-secret",
+      "onerror",
+      "nas.internal.lan",
+      "extra-top-level-field",
+    ]
+  ) {
+    assertEquals(rendered.includes(leaked), false, leaked);
+  }
+  // Refusing three snapshots costs three interfaces, not the run.
+  assertEquals(json.sections[1].state, "healthy");
+});
+
+Deno.test("an observation dated in the future is not evidence of freshness", async () => {
+  // Freshness was a one-sided comparison, so a future timestamp — negative age
+  // — passed it most comfortably of all, and a snapshot dated next year could
+  // keep asserting "observed moments ago" forever.
+  const bundle = await normalize(reportContext(complete({
+    "run-history": observation("run-history", {
+      runs: [{ status: "succeeded" }],
+    }, { observedAt: new Date(Date.now() + 3_600_000).toISOString() }),
+  })));
+  const freshness = bundle.sections[0].freshness;
+  assertEquals(freshness.state, "unknown");
+  assertEquals(freshness.observedAt, undefined);
+  assertEquals(typeof freshness.reason, "string");
+  // The snapshot that is genuinely seconds old still reads as fresh.
+  assertEquals(bundle.sections[1].freshness.state, "fresh");
+});
+
+Deno.test("run diagnostic counts that cannot all be true are refused", async () => {
+  // Each count was validated alone and never against the others, so
+  // totalTracked: 1 beside active: 5 was a healthy section with exact
+  // coverage — a diagnosis of a repository that cannot exist.
+  const bundle = await normalize(reportContext(complete({
+    "run-doctor": observation("run-doctor", {
+      totalTracked: 1,
+      active: 5,
+      stale: 0,
+      orphaned: 0,
+    }),
+  })));
+  const section = bundle.sections[1];
+  assertEquals(section.state, "partial");
+  assertEquals(section.coverage.kind, "unknown");
+  assertEquals(
+    section.exceptions[0].id.endsWith(":swamp:run-doctor:invalid-response"),
+    true,
+  );
+  assertNotEquals(bundle.state, "healthy");
+  // A snapshot whose counts are consistent is untouched.
+  assertEquals(bundle.sections[0].state, "healthy");
+});
+
+Deno.test("an unexpected model type is refused without being repeated", async () => {
+  // A model type names an extension the operator installed, often a private
+  // one, and a misconfiguration is precisely how this branch is reached — so
+  // reflecting it wrote that name into whatever log or stored failure caught
+  // the throw.
+  const error = await assertRejects(
+    () =>
+      normalize({
+        ...reportContext(complete()),
+        modelType: "@private-org/undisclosed-collector",
+      }),
+    Error,
+  );
+  for (const identifier of ["private-org", "undisclosed-collector"]) {
+    assertEquals(error.message.includes(identifier), false, identifier);
+  }
+});
+
 Deno.test("an unreadable snapshot degrades one interface, not the whole report", async () => {
   // readObservations parsed each stored resource unguarded and normalize() did
   // not catch, so a single snapshot this report version could not parse threw
@@ -535,7 +766,10 @@ Deno.test("an unreadable snapshot degrades one interface, not the whole report",
   assertEquals(broken.state, "partial");
   assertEquals(broken.coverage.kind, "unknown");
   assertEquals(broken.freshness.state, "unknown");
-  assertEquals(broken.exceptions[0].id, "swamp:run-history:invalid-response");
+  assertEquals(
+    broken.exceptions[0].id.endsWith(":swamp:run-history:invalid-response"),
+    true,
+  );
   // The interfaces that parsed cleanly still carry their evidence.
   assertEquals(bundle.sections[1].state, "healthy");
   assertEquals(bundle.sections[3].state, "healthy");

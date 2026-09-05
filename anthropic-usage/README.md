@@ -7,14 +7,20 @@ Platform Usage and Cost Admin API or the separate Claude Enterprise Analytics
 API. Product and credential capabilities are explicit, and unavailable,
 unsupported, partial, or capped coverage never becomes zero.
 
-**Version** `2026.08.25.2` · **License** MIT · **Source**
+**Version** `2026.09.05.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/anthropic-usage
 
 ## Install
 
+Clone this GitHub repository and register this extension's source in your Swamp
+repo. Replace the example path with the canonical location of your clone:
+
+```sh
+swamp extension source add /example/slog-bog/anthropic-usage --only models,reports
 ```
-swamp extension pull @jpisgeek/anthropic-usage
-```
+
+This repaired version is distributed through GitHub source, not a registry
+release.
 
 ## `@jpisgeek/anthropic-usage`
 
@@ -41,9 +47,9 @@ and window.
 
 ### Data written
 
-| resource   | lifetime | fields                                                                                                                                     | description                                                                                         |
-| ---------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `snapshot` | 90d      | `provider`, `accountKind`, `collectedAt`, `coverageStart`, `coverageEnd`, `dataRefreshedAt`, `usageStatus`, `costStatus`, `usage`, `costs` | Anthropic organization usage, authoritative cost, product capability, refresh, and coverage states. |
+| resource   | lifetime | fields                                                                                                                                                                                                  | description                                                                                         |
+| ---------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `snapshot` | 90d      | `provider`, `accountKind`, `collectedAt`, `coverageStart`, `coverageEnd`, `usageRefreshedAt`, `usageRefreshState`, `costRefreshedAt`, `costRefreshState`, `usageStatus`, `costStatus`, `usage`, `costs` | Anthropic organization usage, authoritative cost, product capability, refresh, and coverage states. |
 
 ## Example
 
@@ -51,7 +57,7 @@ and window.
 globalArguments:
   accountKind: platform
   authentication: api-key
-  credential: ${{ vault.get("example-vault", "ANTHROPIC_ADMIN_KEY") }}
+  credential: ${{ vault.get('<your-vault>', '<your-anthropic-admin-key-item>') }}
   timeoutMs: 15000
 reports:
   require:
@@ -62,22 +68,50 @@ reports:
 
 ## Caveats
 
+After upgrading from versions before 2026.09.05.1, collect a fresh snapshot:
+costs now use `amountMinor`, and usage and cost each carry their own refresh
+timestamp and state. Old snapshots are reported unavailable until refreshed.
 Platform and Enterprise credentials are not interchangeable. Platform usage
 reports do not expose request counts. Enterprise cost and usage are available
 only to eligible plans; grouped buckets can omit groups beyond Anthropic's
 documented top-100 cap, and recent values may be revised for 30 days. Cost
-amounts are the Cost Report's own decimal strings in the currency's major unit,
-so "1.25" is 1.25 USD and not 1.25 cents. This extension does not inspect
-personal subscriptions, infer remaining quota, or calculate cost from a mutable
-public price table.
+amounts are retained exactly as decimal strings in provider minor units
+(fractional cents for USD), under `amountMinor`. Dashboard numeric metrics use
+`custom:currency-minor`; a decimal that cannot round-trip through a number
+remains an exact string fact and summary, with its numeric metric unknown. This
+extension does not inspect personal subscriptions, infer remaining quota, or
+calculate cost from a mutable public price table. Responses are validated
+strictly, per endpoint and per account kind: every grouping this package
+requests must come back on every row, pagination must state itself as a real
+boolean, and a page, bucket, or result row carrying a field this version does
+not model is treated as a response it cannot fully vouch for, so that dimension
+is reported `invalid-response` rather than totalled from the part it recognised.
+If Anthropic adds a field to these result objects, expect that dimension to read
+`invalid-response` until this package models it. An absent cache-creation
+sub-field is still read as zero, since a grouping with no cache activity may
+omit it; a present but wrongly typed or explicitly null one is refused.
+Anthropic's own `data_refreshed_at` is reported as one of three states — absent,
+observed, or invalid — and only an observed timestamp produces a vendor refresh
+observation. Absent evidence is explicitly labelled with the collection time.
+Walks stop at 500 pages or five minutes and retain partial coverage; each
+request is bounded by the remaining walk deadline.
 
 ## Security
 
 Supply credentials through a Swamp vault expression. They are marked sensitive,
 sent only to the fixed official HTTPS API origin, and never persisted in
 resources, errors, report output, or URLs. Response bodies and server error text
-are discarded. Workspace, model, product, and description breakdowns may reveal
-internal workload names, so protect stored data and dashboards accordingly.
+are discarded. Transport injection is scoped to the caller of one collection; no
+exported setter can redirect another caller's key. Workspace, model, product,
+and description breakdowns may reveal internal workload names, so protect stored
+data and dashboards accordingly. Bundle IDs use a domain-separated SHA-256 of
+the producing model ID, so different instances retain distinct, stable
+observations. The dashboard JSON report additionally records the local Swamp
+model name and instance ID that produced it, under `producer.modelName` and
+`producer.modelId`; neither comes from Anthropic, both name the operator's own
+infrastructure, and both are listed in the bundle's sensitivity metadata so they
+can be stripped before a bundle is published anywhere.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the release gates every version passes before it reaches the registry.
+for the repository's security review requirements. This version is shared as
+GitHub source and is not published to the Swamp registry.
