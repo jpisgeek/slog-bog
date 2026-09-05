@@ -1,0 +1,91 @@
+id: 25612b09-0e93-4d5a-ab8a-7d407af62f8d
+name: "@jpisgeek/example-video-pipeline"
+description: Synthetic text-only adapter contract demo; does not generate video or audio.
+tags: {}
+jobs:
+  - name: main
+    description: Seven bridge stages with a receipt assertion before delivery.
+    steps:
+      - name: prepare
+        task:
+          type: model_method
+          modelIdOrName: example-video
+          methodName: prepare
+      - name: narrate
+        dependsOn:
+          - step: prepare
+            condition: { type: succeeded }
+        task:
+          type: model_method
+          modelIdOrName: example-video
+          methodName: narrate
+          inputs:
+            inputHash: ${{ data.latest("example-video", "prepare").attributes.inputHash }}
+      - name: render
+        dependsOn:
+          - step: narrate
+            condition: { type: succeeded }
+        task:
+          type: model_method
+          modelIdOrName: example-video
+          methodName: render
+          inputs:
+            inputHash: ${{ data.latest("example-video", "prepare").attributes.inputHash }}
+      - name: inspect
+        dependsOn:
+          - step: render
+            condition: { type: succeeded }
+        task:
+          type: model_method
+          modelIdOrName: example-video
+          methodName: inspect
+          inputs:
+            inputHash: ${{ data.latest("example-video", "prepare").attributes.inputHash }}
+      - name: package
+        dependsOn:
+          - step: inspect
+            condition: { type: succeeded }
+        task:
+          type: model_method
+          modelIdOrName: example-video
+          methodName: package
+          inputs:
+            inputHash: ${{ data.latest("example-video", "prepare").attributes.inputHash }}
+      - name: verify
+        dependsOn:
+          - step: package
+            condition: { type: succeeded }
+        task:
+          type: model_method
+          modelIdOrName: example-video
+          methodName: verify
+          inputs:
+            inputHash: ${{ data.latest("example-video", "prepare").attributes.inputHash }}
+      - name: assert-receipt
+        description: This validates synthetic file receipts, not media quality.
+        dependsOn:
+          - step: verify
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            data.latest("example-video", "verify").attributes.metrics.verified == true
+            && data.latest("example-video", "verify").attributes.inputHash == data.latest("example-video", "prepare").attributes.inputHash
+            && data.latest("example-video", "verify").attributes.metrics.fileCount == size(data.latest("example-video", "verify").attributes.artifacts)
+            && data.latest("example-video", "verify").attributes.artifacts.exists(a, a.sha256 == data.latest("example-video", "verify").attributes.videoSha256)
+          message: Synthetic release receipt must match the prepared input and declared artifact hash.
+          severity: high
+      - name: deliver
+        dependsOn:
+          - step: assert-receipt
+            condition: { type: succeeded }
+        task:
+          type: model_method
+          modelIdOrName: example-video
+          methodName: deliver
+          inputs:
+            inputHash: ${{ data.latest("example-video", "prepare").attributes.inputHash }}
+            videoSha256: ${{ data.latest("example-video", "verify").attributes.videoSha256 }}
+    dependsOn: []
+    weight: 0
+version: 1

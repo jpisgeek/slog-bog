@@ -20,6 +20,8 @@
 //   example:   |                            a model YAML using PLACEHOLDERS only
 //     ...
 //   caveats:   optional markdown
+//   install:   optional install Markdown (defaults to fenced registry pull)
+//   publicationNote: optional distribution-specific security footer
 //   security:  markdown — transport, what is sensitive, what is written
 //
 // (`types:` in older vars files is ignored — types are discovered from the
@@ -33,7 +35,7 @@ type Json = Record<string, unknown>;
 
 const argv = [...Deno.args];
 const check = argv.includes("--check");
-let names = argv.filter((a) => !a.startsWith("--"));
+const names = argv.filter((a) => !a.startsWith("--"));
 if (names.length === 0) {
   // Every top-level directory holding a manifest.yaml is an extension.
   for await (const e of Deno.readDir(".")) {
@@ -268,6 +270,12 @@ for (const name of names) {
   const repoRoot = repository.replace(/\/tree\/[^/]+\/.*$/, "");
   const ctx: Json = {
     package: vars.package,
+    install: vars.install === undefined
+      ? `\`\`\`\nswamp extension pull ${vars.package}\n\`\`\``
+      : String(vars.install).trim(),
+    publicationNote: vars.publicationNote === undefined
+      ? "for the release gates every version passes before it reaches the registry."
+      : String(vars.publicationNote).trim(),
     purpose: String(vars.purpose).trim(),
     version: manifest.version ?? "",
     repository,

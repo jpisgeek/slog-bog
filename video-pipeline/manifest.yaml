@@ -1,0 +1,35 @@
+manifestVersion: 1
+name: "@jpisgeek/video-pipeline"
+version: 2026.09.04.1
+description: >
+  Typed Swamp adapter for an operator-owned video production bridge, with
+  content-checked stage receipts, explicit dependency checks, and cancellation.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/video-pipeline
+paths:
+  base: manifest
+models:
+  - video_pipeline.ts
+workflows:
+  - examples/workflow-example-video.yaml
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - readme.vars.yaml
+  - LICENSE
+  - video_pipeline_test.ts
+  - integration_test.ts
+  - examples/USAGE.md
+  - examples/synthetic/scenes.json
+  - examples/synthetic/build/swamp-step.py.txt
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - video
+  - pipeline
+  - workflow
+  - artifacts
+dependencies: []

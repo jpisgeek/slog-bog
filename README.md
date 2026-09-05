@@ -1,9 +1,10 @@
 # slog-bog
 
-Public [swamp](https://github.com/swamp-club/swamp) extensions, published to the
-registry as `@jpisgeek/*`. Thin, unopinionated building blocks for workflows
-that run over a homelab or small fleet. The opinions (thresholds, node lists,
-dashboards) belong in your own models, not here.
+Public [swamp](https://github.com/swamp-club/swamp) extension source, using the
+`@jpisgeek/*` namespace. See each extension's install instructions for its
+distribution method. Thin, unopinionated building blocks for workflows that run
+over a homelab or small fleet. The opinions (thresholds, node lists, dashboards)
+belong in your own models, not here.
 
 <!-- extensions:start -->
 
@@ -24,6 +25,7 @@ dashboards) belong in your own models, not here.
 | `@jpisgeek/proton-pass`           | `2026.08.30.1` | [`proton-pass/`](proton-pass/)                     | Proton Pass vault provider: resolves ${{ vault.get('<vault>', 'KEY') }} live through the official pass-cli at run time.                               |
 | `@jpisgeek/subscription-metadata` | `2026.08.25.2` | [`subscription-metadata/`](subscription-metadata/) | Explicit operator-supplied subscription plan metadata normalized into dashboard bundle v1 without scraping, quota inference, or fictional usage cost. |
 | `@jpisgeek/truenas`               | `2026.08.23.1` | [`truenas/`](truenas/)                             | Read-only TrueNAS SCALE inventory and health over the JSON-RPC 2.0 WebSocket API.                                                                     |
+| `@jpisgeek/video-pipeline`        | `2026.09.04.1` | [`video-pipeline/`](video-pipeline/)               | Typed Swamp adapter for an operator-owned video production bridge, with content-checked stage receipts, explicit dependency checks, and cancellation. |
 
 <!-- extensions:end -->
 
@@ -33,16 +35,19 @@ for arguments, methods, and data written.
 
 ## Using one
 
+Follow the install instructions in the extension's README. Some packages have
+registry releases; source-only packages use a local source checkout. After
+installation, create a model using that extension's type:
+
 ```
-swamp extension pull @jpisgeek/<name>
 swamp model create @jpisgeek/<type> <your-model-name>
 ```
 
 ## Trust
 
-Everything here passes the same gates before publish: format and tests, registry
-quality score, a generated-README drift check, a mechanical scan for private
-identifiers, and a model-driven secrets & security review whose PASS verdict is
-committed under `reviews/` against the exact content hash that shipped. Details
-in [SECURITY.md](SECURITY.md); how to contribute in
+The release gates cover formatting and tests, Swamp quality checks, generated
+README drift, private identifier scanning, and a model-driven secrets and
+security review. Review verdicts in `reviews/` are bound to exact content
+hashes; the current checks determine whether a version is eligible for release.
+Details in [SECURITY.md](SECURITY.md); how to contribute in
 [CONTRIBUTING.md](CONTRIBUTING.md).
