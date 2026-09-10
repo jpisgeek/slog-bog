@@ -1,0 +1,23 @@
+manifestVersion: 1
+name: "@jpisgeek/caddy"
+version: 2026.09.04.1
+description: Manage individual routes in an existing systemd Caddy wildcard site through Swamp SSH, with drift checks, validation, private backups and rollback.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/caddy
+paths:
+  base: manifest
+models:
+  - caddy.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+  - linux-aarch64
+labels: [caddy, infrastructure, reverse-proxy]
+dependencies: []

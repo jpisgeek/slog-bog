@@ -1,0 +1,25 @@
+package: "@jpisgeek/caddy"
+purpose: Manage a single route in an existing systemd Caddy wildcard site through your configured Swamp SSH model.
+example: |
+  globalArguments:
+    sshModel: proxy-access
+    host: proxy
+    configPath: /etc/caddy/Caddyfile
+    caddyBinary: /usr/bin/caddy
+    systemctlBinary: /usr/bin/systemctl
+caveats: >-
+  Requires Swamp and an installed @swamp/ssh model on the runner, Python 3 and
+  noninteractive sudo on the proxy. Supports exactly one plain wildcard site
+  header; imported configurations are refused. Environment-dependent validation
+  needs inspection before use. Run inspect, plan, apply in a serial Swamp workflow. Supply the
+  inspected digest to plan and apply. An interrupted reload requires a fresh
+  inspection; the verified original remains in a private backup directory.
+  DNS and backend networking are separate infrastructure operations.
+security: >-
+  Reuses the SSH model's existing authentication. No new SSH keys or TLS
+  credentials. Full Caddyfiles and command diagnostics stay on the proxy.
+  Refuses existing unmanaged host entries, stale digests, universal client
+  CIDRs, symlinked Caddyfiles and malformed route markers. Output contains only
+  route configuration, digests, status and a private backup path.
+  The community @evrardjp/caddy 2026.08.12.1 was reviewed as a design reference;
+  no source was copied. This implementation targets the existing systemd service.
