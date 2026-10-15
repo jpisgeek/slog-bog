@@ -41,8 +41,8 @@ const DecimalSchema = z.string().regex(/^\d{1,15}(\.\d{1,4})?$/).refine(
 );
 // Rejecting userinfo, queries, and fragments left the two places a URL most
 // often IS the secret: a hostname label (a per-account or tunnel subdomain such
-// as https://a1b2c3d4.trycloudflare.com) and a path segment (an invite or share
-// capability such as /invite/AbCd3fGh1JkLmN0pQrS). Both validated, persisted
+// as https://tunnel.example.com) and a path segment (an invite or share
+// capability such as /invite/YOUR_INVITE_TOKEN). Both validated, persisted
 // into a snapshot with a 365-day lifetime, and were re-emitted by the report as
 // a reference. No test on the shape of an arbitrary URL can demonstrate that it
 // carries no secret, so the set of storable references is finite and written
@@ -57,99 +57,75 @@ const ALLOWED_REFERENCE_ORIGINS = new Set([
   "https://github.com",
 ]);
 const ALLOWED_REFERENCE_PATHS = new Set(["/", "/pricing", "/plans"]);
-const ReferenceSchema = z.string().url().refine(
-  (value) => {
-    const url = new URL(value);
-    return url.protocol === "https:" && !url.username && !url.password &&
-      !url.search && !url.hash &&
-      ALLOWED_REFERENCE_ORIGINS.has(url.origin) &&
-      ALLOWED_REFERENCE_PATHS.has(url.pathname);
-  },
+// Literal membership also rejects whitespace before a URL parser can trim it.
+const ReferenceSchema = z.string().refine(
+  (value) =>
+    ALLOWED_REFERENCE_ORIGINS.has(value) ||
+    [...ALLOWED_REFERENCE_ORIGINS].some((origin) =>
+      [...ALLOWED_REFERENCE_PATHS].some((path) => value === origin + path)
+    ),
   "sourceReference must be one of the allowed public vendor origins with an allowed non-secret path, must use https, and must not contain credentials, query parameters, or fragments",
 );
-/**
- * Latin lookalikes, as source/target character pairs, for the Cyrillic and
- * Greek letters that can spell the forbidden words.
- */
-const CONFUSABLE_PAIRS = "аaеeоoрpсcуyхxіiјjѕsмmтtкkвbнhαaεeοoρpνvιiκkτt";
-const CONFUSABLES = new Map<string, string>();
-for (let index = 0; index < CONFUSABLE_PAIRS.length; index += 2) {
-  CONFUSABLES.set(CONFUSABLE_PAIRS[index], CONFUSABLE_PAIRS[index + 1]);
-}
-
-/**
- * Fold a declared string to the form the forbidden-pattern test runs against.
- * The old guard tested the raw string with a bare ASCII regex, so two spellings
- * a human reads as the forbidden phrase parsed cleanly: "rem<U+200B>aining
- * tokens", where a zero-width space splits the word, and "rem<U+0430>ining
- * quota", where Cyrillic U+0430 renders as a Latin "a". NFKC collapses
- * compatibility forms, the Cf/Cc strip removes zero-width and control
- * characters, and the confusable map collapses the lookalike letters.
- */
-function foldDeclaredText(value: string): string {
-  const stripped = value.normalize("NFKC").replace(/\p{Cf}|\p{Cc}/gu, "")
-    .toLowerCase();
-  return [...stripped].map((char) => CONFUSABLES.get(char) ?? char).join("");
-}
-
-/**
- * Declarations this package refuses to persist. "remain" and "avail" are stems
- * rather than whole words on purpose: the old /available/ never matched
- * "availability", which the README explicitly promises is rejected, and
- * /remaining/ never matched "remainder". The bounded gaps in the per-token
- * alternatives catch the spellings operators actually write, such as
- * "usd-per-1k-tokens".
- */
-const FORBIDDEN_DECLARATION =
-  /remain|avail|left|per.{0,8}tokens?|tokens?.{0,8}price/;
+// Free-form wording cannot establish capacity semantics: a denylist missed
+// ordinary labels such as "quota balance" and "token cost". Only these named
+// capacity/unit pairs and periods are supported, on both write and read. Names
+// are case-insensitive; extra words, homoglyphs and invisible characters fail.
+const CAPACITY_UNITS = new Map([
+  ["included requests", "requests"],
+  ["context window", "tokens"],
+  ["throughput", "tokens-per-second"],
+  ["seats included", "count"],
+]);
+const CAPACITY_PERIODS = new Set([
+  "minute",
+  "hour",
+  "day",
+  "week",
+  "month",
+  "year",
+  "billing cycle",
+]);
+const LabelSchema = z.string().min(1).max(120).refine(
+  (value) =>
+    /[\p{L}\p{N}]/u.test(value) &&
+    !/[\p{C}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u.test(value),
+  "Labels require a visible letter or number and no non-printing controls",
+);
 const LimitSchema = z.object({
-  name: z.string().min(1).describe("Provider-declared limit name"),
-  value: z.number().nonnegative().finite().describe(
-    "Declared numeric limit; explicit zero is preserved",
+  name: z.string().min(1).describe(
+    "Supported capacity: Included requests, Context window, Throughput, or Seats included (case-insensitive)",
+  ),
+  value: z.number().int().nonnegative().describe(
+    "Declared nonnegative safe-integer capacity; explicit zero is preserved",
   ),
   unit: z.string().regex(/^[a-z][a-z0-9._-]*$/).describe(
-    "Provider-declared unit",
+    "Capacity unit: requests, tokens, tokens-per-second, or count, matching the name",
   ),
   period: z.string().min(1).optional().describe(
-    "Optional reset or measurement period",
+    "Optional period: minute, hour, day, week, month, year, or billing cycle",
   ),
-  // Marked sensitive for the same reason as the top-level argument below: an
-  // operator reference is commercial provenance and is classified as such by
-  // the report, so the rendered config must not carry it in the clear either.
+  // Only literal public-page URLs pass the finite policy above. These are not
+  // secrets or vault locators; marking them sensitive would make Swamp replace
+  // persisted URLs with vault expressions that the report cannot validate.
   sourceReference: ReferenceSchema.optional().describe(
-    "Optional authorized stable API or operator reference",
-  ).meta({ sensitive: true }),
+    "Optional allowed public vendor pricing/plans page; unverified provenance only",
+  ),
   // .strict() here, not just on the snapshot: the outer object was strict while
   // this one silently stripped unknown nested keys, so the report's copy of this
   // schema — which is strict — rejected limits that capture had happily written.
   // The two copies must return the same verdict on the same bytes or the read
   // path stops being a re-check of the write path's guarantee.
 }).strict().superRefine((limit, ctx) => {
-  // This guard is what backs the README's central promise: "never derives
-  // remaining quota or per-token cost". It used to test limit.name only. The
-  // unit and the period are declarations too, so ordinary, non-adversarial
-  // entries carried the forbidden fact straight past it:
-  //   {name: "Rate", value: 0.002, unit: "usd-per-token"}
-  //   {name: "Included", value: 500, unit: "requests-remaining"}
-  //   {name: "Budget", value: 5, unit: "usd", period: "per token remaining"}
-  // Each of those validated, persisted into the 365-day snapshot, and rendered
-  // on the dashboard as an exact observed metric — a per-token price published
-  // under a guarantee that says per-token prices are rejected. All three fields
-  // are checked now, and each is folded first so an invisible character or a
-  // homoglyph cannot break a word the reader still sees intact.
-  for (const field of ["name", "unit", "period"] as const) {
-    const declared = limit[field];
-    if (
-      declared !== undefined &&
-      FORBIDDEN_DECLARATION.test(foldDeclaredText(declared))
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        path: [field],
-        message:
-          "remaining quota and per-token price declarations are forbidden",
-      });
-    }
+  if (
+    CAPACITY_UNITS.get(limit.name.toLowerCase()) !== limit.unit ||
+    (limit.period !== undefined && !CAPACITY_PERIODS.has(limit.period))
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["name"],
+      message:
+        "Unsupported capacity declaration; remaining quota and per-token price declarations are forbidden",
+    });
   }
 });
 /**
@@ -162,13 +138,17 @@ const LimitSchema = z.object({
 function limitIdentity(
   limit: { name: string; unit: string; period?: string },
 ): string {
-  return JSON.stringify([limit.name, limit.unit, limit.period ?? null]);
+  return JSON.stringify([
+    limit.name.toLowerCase(),
+    limit.unit,
+    limit.period ?? null,
+  ]);
 }
 const GlobalArgsSchema = z.object({
-  provider: z.string().min(1).describe(
+  provider: LabelSchema.describe(
     "Subscription provider or product family",
   ),
-  planName: z.string().min(1).optional(),
+  planName: LabelSchema.optional(),
   billingCadence: z.enum([
     "monthly",
     "annual",
@@ -186,10 +166,10 @@ const GlobalArgsSchema = z.object({
   seats: z.number().int().nonnegative().optional().describe(
     "Declared seat count; explicit zero is preserved",
   ),
-  declaredLimits: z.array(LimitSchema).default([]),
+  declaredLimits: z.array(LimitSchema).max(50).default([]),
   sourceReference: ReferenceSchema.optional().describe(
-    "Optional authorized stable API or operator reference",
-  ).meta({ sensitive: true }),
+    "Optional allowed public vendor pricing/plans page; unverified provenance only",
+  ),
 }).strict().superRefine((value, ctx) => {
   if ((value.priceMinor === undefined) !== (value.currency === undefined)) {
     ctx.addIssue({
@@ -249,6 +229,9 @@ interface Context {
   ): Promise<unknown>;
 }
 async function capture(_args: z.infer<typeof CaptureArgsSchema>, ctx: Context) {
+  // Swamp merges globals before the outer method parser, which must strip
+  // those globals. Validate the resulting method-only payload here as well.
+  CaptureArgsSchema.strict().parse(_args);
   const declared = GlobalArgsSchema.parse(ctx.globalArgs);
   const snapshot = SnapshotSchema.parse({
     ...declared,
@@ -274,7 +257,7 @@ async function capture(_args: z.infer<typeof CaptureArgsSchema>, ctx: Context) {
 }
 export const model = {
   type: "@jpisgeek/subscription-metadata",
-  version: "2026.09.05.1",
+  version: "2026.10.14.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     snapshot: {

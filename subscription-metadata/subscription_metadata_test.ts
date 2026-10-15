@@ -1,5 +1,4 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
-import { z } from "npm:zod@4";
 import { model } from "./subscription_metadata.ts";
 type Json = Record<string, unknown>;
 async function run(globalArgs: Json) {
@@ -74,7 +73,7 @@ Deno.test("remaining quota and token price declarations are rejected", async () 
 // operator would type, not an evasion attempt.
 Deno.test("forbidden declarations carried by unit or period are rejected", async () => {
   const forbidden = [
-    { name: "Rate", value: 0.002, unit: "usd-per-token" },
+    { name: "Rate", value: 2, unit: "usd-per-token" },
     { name: "Included", value: 500, unit: "requests-remaining" },
     { name: "Bucket", value: 100, unit: "tokens", period: "per token" },
     { name: "Budget", value: 5, unit: "usd", period: "tokens remaining" },
@@ -118,7 +117,8 @@ Deno.test("invisible characters and homoglyphs do not evade the guard", async ()
 // README's own example uses, and they must still capture.
 Deno.test("legitimate limit declarations still capture", async () => {
   const snapshot = await run({
-    provider: "Example AI",
+    provider: "Équipe 🦊",
+    planName: "Plan–4",
     declaredLimits: [
       {
         name: "Included requests",
@@ -137,6 +137,8 @@ Deno.test("legitimate limit declarations still capture", async () => {
     ],
   });
   assertEquals((snapshot.declaredLimits as Json[]).length, 4);
+  assertEquals(snapshot.provider, "Équipe 🦊");
+  assertEquals(snapshot.planName, "Plan–4");
 });
 
 // priceMinor had no digit bound, so a 500-digit paste persisted for 365 days and
@@ -305,6 +307,11 @@ Deno.test("source references reject embedded secrets and signed queries", async 
       // validate and persist for 365 days.
       "https://www.anthropic.com/invite/AbCd3fGh1JkLmN0pQrS",
       "https://a1b2c3d4.trycloudflare.com/",
+      "https://openai.com/pricing\u0000",
+      "https://openai.com/pricing\u0001",
+      "https://ope\nnai.com/pricing",
+      " https://openai.com/pricing",
+      "https://openai.com/other/../pricing",
     ]
   ) {
     await assertRejects(
@@ -315,24 +322,35 @@ Deno.test("source references reject embedded secrets and signed queries", async 
   }
 });
 
-// A reference this package will store is still commercial provenance, so the
-// argument carries the marker this repo uses for a secret; without it a
-// rendered model config prints the operator's reference in the clear. Both
-// arguments are checked: the nested one is as persistable as the top-level one.
-Deno.test("both source-reference arguments are marked sensitive", () => {
-  const schema = z.toJSONSchema(model.globalArguments, {
-    io: "input",
-  }) as unknown as {
-    properties: {
-      sourceReference: Json;
-      declaredLimits: { items: { properties: { sourceReference: Json } } };
-    };
-  };
-  assertEquals(schema.properties.sourceReference.sensitive, true);
-  assertEquals(
-    schema.properties.declaredLimits.items.properties.sourceReference.sensitive,
-    true,
-  );
+Deno.test("public reference declarations persist exactly without normalization", async () => {
+  for (
+    const sourceReference of [
+      "https://openai.com",
+      "https://openai.com/",
+      "https://proton.me/plans",
+      "https://github.com/pricing",
+    ]
+  ) {
+    const snapshot = await run({
+      provider: "Example AI",
+      sourceReference,
+      declaredLimits: [{
+        name: "Included requests",
+        value: 7,
+        unit: "requests",
+        sourceReference,
+      }],
+    });
+    assertEquals(snapshot.sourceReference, sourceReference);
+    assertEquals(
+      (snapshot.provenance as Json).sourceReference,
+      sourceReference,
+    );
+    assertEquals(
+      (snapshot.declaredLimits as Json[])[0].sourceReference,
+      sourceReference,
+    );
+  }
 });
 
 // Tags are resource metadata: listed, filtered, and logged apart from the

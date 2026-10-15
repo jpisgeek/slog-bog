@@ -470,18 +470,23 @@ const DecimalSchema = z.string().regex(/^\d{1,15}(\.\d{1,4})?$/).refine(
   decimalSurvivesNumberConversion,
   "priceMinor must survive the report's Number() conversion without loss",
 );
-const CONFUSABLE_PAIRS = "аaеeоoрpсcуyхxіiјjѕsмmтtкkвbнhαaεeοoρpνvιiκkτt";
-const CONFUSABLES = new Map<string, string>();
-for (let index = 0; index < CONFUSABLE_PAIRS.length; index += 2) {
-  CONFUSABLES.set(CONFUSABLE_PAIRS[index], CONFUSABLE_PAIRS[index + 1]);
-}
-function foldDeclaredText(value: string): string {
-  const stripped = value.normalize("NFKC").replace(/\p{Cf}|\p{Cc}/gu, "")
-    .toLowerCase();
-  return [...stripped].map((char) => CONFUSABLES.get(char) ?? char).join("");
-}
-const FORBIDDEN_DECLARATION =
-  /remain|avail|left|per.{0,8}tokens?|tokens?.{0,8}price/;
+// Match capture's closed capacity vocabulary. A semantic word blacklist cannot
+// rule out synonyms for balances/prices; unsupported declarations stay unknown.
+const CAPACITY_UNITS = new Map([
+  ["included requests", "requests"],
+  ["context window", "tokens"],
+  ["throughput", "tokens-per-second"],
+  ["seats included", "count"],
+]);
+const CAPACITY_PERIODS = new Set([
+  "minute",
+  "hour",
+  "day",
+  "week",
+  "month",
+  "year",
+  "billing cycle",
+]);
 // In agreement with the copy in subscription_metadata.ts: a hostname label or a
 // path segment can itself be a bearer capability, so only this finite set of
 // public vendor origins and non-secret paths is storable. Enforced here as well
@@ -495,43 +500,48 @@ const ALLOWED_REFERENCE_ORIGINS = new Set([
   "https://github.com",
 ]);
 const ALLOWED_REFERENCE_PATHS = new Set(["/", "/pricing", "/plans"]);
-const ReferenceSchema = z.string().url().refine(
-  (value) => {
-    const url = new URL(value);
-    return url.protocol === "https:" && !url.username && !url.password &&
-      !url.search && !url.hash &&
-      ALLOWED_REFERENCE_ORIGINS.has(url.origin) &&
-      ALLOWED_REFERENCE_PATHS.has(url.pathname);
-  },
+const ReferenceSchema = z.string().refine(
+  (value) =>
+    ALLOWED_REFERENCE_ORIGINS.has(value) ||
+    [...ALLOWED_REFERENCE_ORIGINS].some((origin) =>
+      [...ALLOWED_REFERENCE_PATHS].some((path) => value === origin + path)
+    ),
   "sourceReference must be one of the allowed public vendor origins with an allowed non-secret path, must use https, and must not contain credentials, query parameters, or fragments",
+);
+const LabelSchema = z.string().min(1).max(120).refine(
+  (value) =>
+    /[\p{L}\p{N}]/u.test(value) &&
+    !/[\p{C}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]/u.test(value),
+  "Labels require a visible letter or number and no non-printing controls",
 );
 const LimitSchema = z.object({
   name: z.string().min(1),
-  value: z.number().nonnegative().finite(),
+  value: z.number().int().nonnegative(),
   unit: z.string().regex(/^[a-z][a-z0-9._-]*$/),
   period: z.string().min(1).optional(),
   sourceReference: ReferenceSchema.optional(),
 }).strict().superRefine((limit, ctx) => {
-  for (const field of ["name", "unit", "period"] as const) {
-    const declared = limit[field];
-    if (
-      declared !== undefined &&
-      FORBIDDEN_DECLARATION.test(foldDeclaredText(declared))
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        path: [field],
-        message:
-          "remaining quota and per-token price declarations are forbidden",
-      });
-    }
+  if (
+    CAPACITY_UNITS.get(limit.name.toLowerCase()) !== limit.unit ||
+    (limit.period !== undefined && !CAPACITY_PERIODS.has(limit.period))
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["name"],
+      message:
+        "Unsupported capacity declaration; remaining quota and per-token price declarations are forbidden",
+    });
   }
 });
 /** Byte-identical to the copy in subscription_metadata.ts. */
 function limitIdentity(
   limit: { name: string; unit: string; period?: string },
 ): string {
-  return JSON.stringify([limit.name, limit.unit, limit.period ?? null]);
+  return JSON.stringify([
+    limit.name.toLowerCase(),
+    limit.unit,
+    limit.period ?? null,
+  ]);
 }
 /**
  * Metric id for one declared limit.
@@ -556,8 +566,8 @@ function limitMetricId(
   return `declared-limit-${hex}`;
 }
 const SnapshotSchema = z.object({
-  provider: z.string().min(1),
-  planName: z.string().min(1).optional(),
+  provider: LabelSchema,
+  planName: LabelSchema.optional(),
   billingCadence: z.enum([
     "monthly",
     "annual",
@@ -576,7 +586,7 @@ const SnapshotSchema = z.object({
   // a snapshot missing the key outright — the shape an older writer or a direct
   // Swamp data write produces — was rejected here, which is the same read/write
   // divergence the strictness fixes above close.
-  declaredLimits: z.array(LimitSchema).default([]),
+  declaredLimits: z.array(LimitSchema).max(50).default([]),
   sourceReference: ReferenceSchema.optional(),
   provenance: z.object({
     kind: z.literal("operator-config"),
@@ -669,31 +679,39 @@ const sectionSensitivity = {
   note:
     "Subscription and billing metadata is commercially sensitive: plan, price, renewal window, seats, declared limits, and the operator-supplied source URL are emitted as declared",
 };
-// modelId is the Swamp instance identifier and modelName is whatever the
-// operator named the model — both are private infrastructure identity, and
-// neither tells a dashboard reader anything about the subscription. modelName is
-// required by the bundle contract so it is carried and classified; modelId is
-// optional there, so the honest handling is to not emit it at all.
+// Neither the raw instance id nor the operator's model name tells a reader
+// anything about the subscription. Withhold both; the required modelName is a
+// constant display label. The stable bundle id still correlates one instance
+// across captures, so classification is not a claim of anonymity.
 const bundleSensitivity = {
   classification: "sensitive" as const,
-  fields: [...SENSITIVE_SNAPSHOT_FIELDS, "producer.modelName"],
+  fields: SENSITIVE_SNAPSHOT_FIELDS,
   redacted: true,
   note:
-    "Subscription and billing metadata is commercially sensitive; producer.modelId is withheld and producer.modelName is operator-chosen private identity",
+    "Commercially sensitive declarations; raw producer identity is withheld, but the stable bundle id permits correlation across captures",
 };
 async function read(ctx: Context): Promise<Snapshot | null> {
-  const handle = ctx.dataHandles.find((h) => h.specName === "snapshot") ??
-    ctx.dataHandles[0];
-  if (!handle) return null;
-  const bytes = await ctx.dataRepository.getContent(
-    ctx.modelType,
-    ctx.modelId,
-    handle.name,
-    handle.version,
+  if (
+    String(ctx.modelType) !== "@jpisgeek/subscription-metadata" ||
+    ctx.methodName !== "capture" || ctx.executionStatus !== "succeeded"
+  ) return null;
+  const handle = ctx.dataHandles.find((h) =>
+    h.specName === "snapshot" && h.name === "subscription-metadata"
   );
-  if (!bytes) return null;
+  if (
+    !handle || !Number.isSafeInteger(handle.version) || handle.version! < 1
+  ) return null;
   try {
-    return SnapshotSchema.parse(JSON.parse(new TextDecoder().decode(bytes)));
+    const bytes = await ctx.dataRepository.getContent(
+      ctx.modelType,
+      ctx.modelId,
+      handle.name,
+      handle.version,
+    );
+    if (!bytes || bytes.length > 1_000_000) return null;
+    return SnapshotSchema.parse(
+      JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
+    );
   } catch {
     return null;
   }
@@ -827,7 +845,12 @@ function section(snapshot: Snapshot | null) {
       notes:
         "Absence means unknown; no remaining quota or usage cost is inferred",
     },
-    freshness: { state: "fresh", observedAt: snapshot.provenance.capturedAt },
+    freshness: {
+      state: "unknown",
+      observedAt: snapshot.provenance.capturedAt,
+      reason:
+        "Capture time records the declaration, not verification of current billing facts; no age policy is defined",
+    },
     completeness: {
       state: "exact",
       observed: facts.length + metrics.length,
@@ -868,7 +891,7 @@ async function bundleId(modelId: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
     new TextEncoder().encode(
-      `@jpisgeek/subscription-metadata\0bundle-id\0${modelId}`,
+      JSON.stringify(["@jpisgeek/subscription-metadata", "bundle-id", modelId]),
     ),
   );
   let hex = "";
@@ -887,9 +910,9 @@ export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/subscription-metadata",
-      extensionVersion: "2026.09.05.1",
+      extensionVersion: "2026.10.14.1",
       modelType: String(ctx.modelType),
-      modelName: ctx.definition.name,
+      modelName: "Subscription metadata",
       // modelId is deliberately absent — see bundleSensitivity. It identified a
       // specific model instance in the operator's Swamp deployment and nothing
       // in this dashboard needs it, so the bundle does not carry it out.

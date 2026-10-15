@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import { normalize, report } from "./dashboard_subscription.ts";
 import { model } from "./subscription_metadata.ts";
 type Json = Record<string, unknown>;
@@ -47,6 +47,112 @@ Deno.test("unknown fields stay absent", async () => {
     false,
   );
 });
+Deno.test("capture time is provenance, never evidence of live freshness", async () => {
+  for (const capturedAt of ["2025-01-01T00:00:00Z", new Date().toISOString()]) {
+    const bundle = await normalize(context(snapshot({
+      provenance: { kind: "operator-config", capturedAt },
+    })));
+    assertEquals(bundle.sections[0].freshness.state, "unknown");
+    assertEquals(bundle.sections[0].freshness.observedAt, capturedAt);
+    assertEquals(bundle.sections[0].impact, "informational");
+    assertEquals(bundle.state, "unknown");
+  }
+});
+
+Deno.test("invalid labels, unsafe counts and case-variant duplicates fail capture and render unknown", async () => {
+  const limit = { name: "Included requests", unit: "requests", value: 1 };
+  for (
+    const invalid of [
+      { provider: "   " },
+      { provider: "Example\u0000AI" },
+      { provider: "\u200b" },
+      { provider: "\u0301" },
+      { provider: "\u2800" },
+      { planName: "Plan\u202eInjected" },
+      { planName: "\u3164" },
+      { planName: "x".repeat(121) },
+      { planName: "Plan\nInjected" },
+      { seats: Number.MAX_SAFE_INTEGER + 1 },
+      { declaredLimits: [{ ...limit, value: Number.MAX_SAFE_INTEGER + 1 }] },
+      {
+        declaredLimits: [{
+          name: "Throughput",
+          unit: "tokens-per-second",
+          value: 1.5,
+        }],
+      },
+      {
+        declaredLimits: [limit, {
+          ...limit,
+          name: "INCLUDED REQUESTS",
+          value: 2,
+        }],
+      },
+    ]
+  ) {
+    await assertRejects(() =>
+      model.methods.capture.execute({}, {
+        globalArgs: { provider: "Example AI", ...invalid },
+        writeResource: async () => ({}),
+      })
+    );
+    const bundle = await normalize(context(snapshot(invalid)));
+    assertEquals(bundle.sections[0].state, "unknown");
+    assertEquals(bundle.sections[0].metrics, []);
+  }
+  const lower = await normalize(context(snapshot({ declaredLimits: [limit] })));
+  const upper = await normalize(
+    context(
+      snapshot({ declaredLimits: [{ ...limit, name: "INCLUDED REQUESTS" }] }),
+    ),
+  );
+  assertEquals(
+    lower.sections[0].metrics[0].id,
+    upper.sections[0].metrics[0].id,
+  );
+});
+
+Deno.test("report accepts only this successful capture's exact versioned snapshot", async () => {
+  const original = context(snapshot({ seats: 4 }));
+  for (
+    const override of [
+      { methodName: "other" },
+      { executionStatus: "failed" as const },
+      { modelType: { toString: () => "@example/unrelated" } },
+      {
+        dataHandles: [{
+          name: "subscription-metadata",
+          specName: "other",
+          version: 1,
+        }],
+      },
+      { dataHandles: [{ name: "other", specName: "snapshot", version: 1 }] },
+      {
+        dataHandles: [{
+          name: "subscription-metadata",
+          specName: "snapshot",
+          version: 0,
+        }],
+      },
+    ]
+  ) {
+    const bundle = await normalize({ ...original, ...override });
+    assertEquals(bundle.sections[0].state, "unknown");
+    assertEquals(bundle.sections[0].metrics, []);
+  }
+  const bundle = await normalize({
+    ...original,
+    dataRepository: {
+      getContent: (_type, _id, _name, version) =>
+        Promise.resolve(
+          new TextEncoder().encode(
+            JSON.stringify(snapshot({ seats: version === 1 ? 4 : 99 })),
+          ),
+        ),
+    },
+  });
+  assertEquals(bundle.sections[0].metrics[0].value, 4);
+});
 Deno.test("explicit zero seats and limits remain observed zero", async () => {
   const bundle = await normalize(
     context(
@@ -88,6 +194,42 @@ Deno.test("missing snapshot is informational unknown", async () => {
   const bundle = await normalize(context(null));
   assertEquals(bundle.sections[0].state, "unknown");
   assertEquals(bundle.state, "unknown");
+});
+
+Deno.test("legacy references with normalized-away bytes are rejected on every read path", async () => {
+  for (
+    const sourceReference of [
+      "https://openai.com/pricing\u0000",
+      "https://ope\nnai.com/pricing",
+      "https://openai.com/other/../pricing",
+    ]
+  ) {
+    for (
+      const fields of [
+        { sourceReference },
+        {
+          declaredLimits: [{
+            name: "Included requests",
+            value: 7,
+            unit: "requests",
+            sourceReference,
+          }],
+        },
+        {
+          provenance: {
+            kind: "operator-config",
+            capturedAt: "2026-01-01T00:00:00Z",
+            sourceReference,
+          },
+        },
+      ]
+    ) {
+      const bundle = await normalize(context(snapshot(fields)));
+      assertEquals(bundle.sections[0].state, "unknown");
+      assertEquals(bundle.sections[0].metrics, []);
+      assertEquals(bundle.sections[0].references, []);
+    }
+  }
 });
 
 // The read path used to enforce less than the write path: its LimitSchema had
@@ -163,6 +305,53 @@ Deno.test("read path and write path accept and reject the same snapshots", async
         JSON.stringify(candidate)
       }: capture ${captureAccepted}, read ${readAccepted}`,
     );
+  }
+});
+
+// A word blacklist missed ordinary balance/price labels. Both new captures and
+// old persisted snapshots must fail closed; parity alone could miss both paths
+// wrongly accepting the same unsupported declaration.
+Deno.test("unsupported capacity declarations never persist or render exact metrics", async () => {
+  for (
+    const limit of [
+      { name: "token cost", value: 0.002, unit: "tokens" },
+      { name: "price/token", value: 0.003, unit: "count" },
+      { name: "quota balance", value: 13, unit: "requests" },
+      { name: "unused requests", value: 17, unit: "requests" },
+      { name: "Context window", value: 0.004, unit: "currency" },
+      { name: "Included requests", value: 19, unit: "tokens" },
+      {
+        name: "Throughput",
+        value: 23,
+        unit: "tokens-per-second",
+        period: "credit balance",
+      },
+      {
+        name: "Context window",
+        value: 29,
+        unit: "tokens",
+        period: "token cost",
+      },
+      { name: "Context wіndow", value: 31, unit: "tokens" }, // Cyrillic і
+      { name: "Included requests (unused)", value: 37, unit: "requests" },
+    ]
+  ) {
+    let writes = 0;
+    await assertRejects(() =>
+      model.methods.capture.execute({}, {
+        globalArgs: { provider: "Example AI", declaredLimits: [limit] },
+        writeResource: () => {
+          writes++;
+          return Promise.resolve({});
+        },
+      })
+    );
+    assertEquals(writes, 0);
+    const bundle = await normalize(
+      context(snapshot({ declaredLimits: [limit] })),
+    );
+    assertEquals(bundle.sections[0].state, "unknown");
+    assertEquals(bundle.sections[0].metrics, []);
   }
 });
 
@@ -374,7 +563,8 @@ Deno.test("commercial fields and model identity are classified sensitive", async
   // modelId identified a model instance inside the operator's deployment.
   assertEquals("modelId" in bundle.producer, false);
   assertEquals(JSON.stringify(bundle).includes("synthetic"), false);
-  assertEquals(bundle.sensitivity.fields.includes("producer.modelName"), true);
+  assertEquals(JSON.stringify(bundle).includes("example-plan"), false);
+  assertEquals(bundle.producer.modelName, "Subscription metadata");
   assertEquals(bundle.sensitivity.redacted, true);
 });
 

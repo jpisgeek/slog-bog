@@ -7,42 +7,36 @@ currency, renewal window, seats, and provider-declared limits. It keeps
 subscription facts separate from API metering and never derives remaining quota
 or per-token cost.
 
-**Version** `2026.09.05.1` · **License** MIT · **Source**
-https://github.com/jpisgeek/slog-bog/tree/main/subscription-metadata
+**Version** `2026.10.14.1` · **License** MIT · **Source**
+https://github.com/jpisgeek/slog-bog/tree/subscription-metadata-2026.10.14.1/subscription-metadata
 
 ## Install
 
-Clone this GitHub repository and register this extension's source in your Swamp
-repo. Replace the example path with the canonical location of your clone:
-
 ```sh
-swamp extension source add /example/slog-bog/subscription-metadata --only models,reports
+swamp extension pull @jpisgeek/subscription-metadata
 ```
-
-This repaired version is distributed through GitHub source, not a registry
-release.
 
 ## `@jpisgeek/subscription-metadata`
 
 ### Arguments
 
-| argument                           | type                                                                      | required | default | description                                          |
-| ---------------------------------- | ------------------------------------------------------------------------- | -------- | ------- | ---------------------------------------------------- |
-| `provider`                         | string                                                                    | yes      |         | Subscription provider or product family              |
-| `planName`                         | string                                                                    | no       |         |                                                      |
-| `billingCadence`                   | `monthly` \| `annual` \| `quarterly` \| `weekly` \| `one-time` \| `other` | no       |         |                                                      |
-| `priceMinor`                       | string                                                                    | no       |         | Declared recurring price in currency minor units     |
-| `currency`                         | string                                                                    | no       |         |                                                      |
-| `renewalStart`                     | string                                                                    | no       |         |                                                      |
-| `renewalEnd`                       | string                                                                    | no       |         |                                                      |
-| `seats`                            | integer                                                                   | no       |         | Declared seat count; explicit zero is preserved      |
-| `declaredLimits`                   | array of object                                                           | no       | `[]`    |                                                      |
-| `declaredLimits[].name`            | string                                                                    | yes      |         | Provider-declared limit name                         |
-| `declaredLimits[].value`           | number                                                                    | yes      |         | Declared numeric limit; explicit zero is preserved   |
-| `declaredLimits[].unit`            | string                                                                    | yes      |         | Provider-declared unit                               |
-| `declaredLimits[].period`          | string                                                                    | no       |         | Optional reset or measurement period                 |
-| `declaredLimits[].sourceReference` | string                                                                    | no       |         | Optional authorized stable API or operator reference |
-| `sourceReference`                  | string                                                                    | no       |         | Optional authorized stable API or operator reference |
+| argument                           | type                                                                      | required | default | description                                                                                             |
+| ---------------------------------- | ------------------------------------------------------------------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------- |
+| `provider`                         | string                                                                    | yes      |         | Subscription provider or product family                                                                 |
+| `planName`                         | string                                                                    | no       |         |                                                                                                         |
+| `billingCadence`                   | `monthly` \| `annual` \| `quarterly` \| `weekly` \| `one-time` \| `other` | no       |         |                                                                                                         |
+| `priceMinor`                       | string                                                                    | no       |         | Declared recurring price in currency minor units                                                        |
+| `currency`                         | string                                                                    | no       |         |                                                                                                         |
+| `renewalStart`                     | string                                                                    | no       |         |                                                                                                         |
+| `renewalEnd`                       | string                                                                    | no       |         |                                                                                                         |
+| `seats`                            | integer                                                                   | no       |         | Declared seat count; explicit zero is preserved                                                         |
+| `declaredLimits`                   | array of object                                                           | no       | `[]`    |                                                                                                         |
+| `declaredLimits[].name`            | string                                                                    | yes      |         | Supported capacity: Included requests, Context window, Throughput, or Seats included (case-insensitive) |
+| `declaredLimits[].value`           | integer                                                                   | yes      |         | Declared nonnegative safe-integer capacity; explicit zero is preserved                                  |
+| `declaredLimits[].unit`            | string                                                                    | yes      |         | Capacity unit: requests, tokens, tokens-per-second, or count, matching the name                         |
+| `declaredLimits[].period`          | string                                                                    | no       |         | Optional period: minute, hour, day, week, month, year, or billing cycle                                 |
+| `declaredLimits[].sourceReference` | string                                                                    | no       |         | Optional allowed public vendor pricing/plans page; unverified provenance only                           |
+| `sourceReference`                  | string                                                                    | no       |         | Optional allowed public vendor pricing/plans page; unverified provenance only                           |
 
 ### Methods
 
@@ -81,21 +75,42 @@ reports:
 
 ## Caveats
 
-Values are declarations, not live billing facts, unless the operator cites an
-authorized stable API in sourceReference. Missing fields remain absent.
-priceMinor is the recurring plan price in currency minor units and never API
-usage cost. Limits whose name, unit, or period declares remaining quota,
-availability, or per-token price are rejected, and that check folds zero-width
-characters and homoglyphs first. Declared limits must be distinct in name, unit,
-and period: the dashboard metric id is derived from that identity rather than
-from array position, so it stays attached to the same limit when the list is
-reordered, and two limits that share an identity are rejected. Currency uses
-three uppercase letters; price and currency must be supplied together;
-priceMinor carries at most fifteen integer digits and four decimals and is
-rejected unless the exact value survives the report's numeric conversion, so a
-published price is always the declared one; renewal timestamps use ISO datetime
-values; limit units use lowercase letters, digits, dot, underscore, or hyphen.
-This package performs no account-dashboard scraping.
+Every value remains an unverified operator declaration, even with a
+sourceReference. References are public vendor-page provenance only: the
+extension never fetches them or verifies billing facts. Missing optional plan
+facts remain absent; declaredLimits defaults to an empty list. Each capture
+writes the snapshot instance named subscription-metadata. Provider/plan labels
+must include a visible Unicode letter or digit, have at most 120 UTF-16 units,
+and contain no control/format characters, line/paragraph separators, unpaired
+surrogates, private-use/unassigned code points or default-ignorable characters.
+Other visible punctuation/symbols are allowed. Report freshness is always
+`unknown`: capturedAt records when a declaration was stored, not when billing
+facts were verified. No maximum-age policy is asserted. A valid informational
+section means the declaration passed validation, not that the subscription is
+currently healthy; overall state remains unknown. priceMinor is the recurring
+plan price in currency minor units and never API usage cost. Declared limits
+support a closed capacity vocabulary, not arbitrary provider wording:
+`Included requests` with `requests`, `Context window` with `tokens`,
+`Throughput` with `tokens-per-second`, and `Seats included` with `count`.
+Capacity values and seats must be nonnegative safe integers; fractional
+throughput is not supported. At most 50 limits are accepted. Names and their
+metric identities are case-insensitive but otherwise exact. Optional periods are
+exactly `minute`, `hour`, `day`, `week`, `month`, `year`, or `billing cycle`.
+Other names, mismatched units, extra wording, invisible characters and
+homoglyphs are rejected, so balance/quota-price synonyms cannot bypass a word
+blacklist. This validates the declared category, not the truth of the number;
+operators must supply truthful capacities rather than relabel balances or
+prices. Earlier source-only versions accepted arbitrary limit labels;
+unsupported legacy snapshots now render as unknown rather than healthy metrics.
+Declared limits must be distinct in name, unit, and period: the dashboard metric
+id is derived from that identity rather than from array position, so it stays
+attached to the same limit when the list is reordered, and two limits that share
+an identity are rejected. Currency uses three uppercase letters; price and
+currency must be supplied together; priceMinor carries at most fifteen integer
+digits and four decimals and is rejected unless the exact value survives the
+report's numeric conversion, so a published price is always the declared one;
+renewal timestamps use ISO datetime values. This package performs no
+account-dashboard scraping.
 
 ## Security
 
@@ -105,20 +120,26 @@ source reference are commercially sensitive, so the dashboard bundle, its
 section, and every fact, metric, and reference carrying one of them are
 classified `sensitive` rather than `operational`, and the bundle enumerates each
 of those fields; a publication-aware renderer should treat the whole section as
-unpublishable. The Swamp model id is withheld from the bundle, and the model
-name it does carry is operator-chosen private identity. The bundle id is a hash
-of the Swamp model id, so it is distinct per model instance without carrying
-that id. Protect stored Swamp data and rendered dashboards accordingly. A source
-reference cannot carry a credential in any part of the URL: besides requiring
-HTTPS and rejecting credentials, query parameters, and fragments, it must be one
-of the public vendor origins listed in the source (`https://www.anthropic.com`,
+unpublishable. The raw Swamp model id and name are withheld; the required
+producer modelName is a constant display label. The stable bundle id is a hash
+of the Swamp model id: it permits correlation across captures and is not an
+anonymity guarantee. Limit metric ids encode the supported capacity
+category/unit/period, never commercial values or free-form labels. Protect
+stored Swamp data and rendered dashboards accordingly. A source reference cannot
+carry a credential in any part of the URL: besides requiring HTTPS and rejecting
+credentials, query parameters, and fragments, it must be one of the public
+vendor origins listed in the source (`https://www.anthropic.com`,
 `https://openai.com`, `https://proton.me`, `https://github.com`) with one of the
-paths `/`, `/pricing`, or `/plans`, and both source-reference arguments are
-marked sensitive. Resource tags carry only the constant `provenance` marker; no
+paths `/`, `/pricing`, or `/plans`, and the exact literal spelling must match;
+whitespace, controls and normalized aliases are rejected rather than stored.
+These finite public URLs are not credentials: supply them literally, not via a
+vault expression. They are stored in configuration and snapshots without Swamp's
+secret-field vaulting, which would otherwise replace URLs with expressions
+unreadable by the report. Protect the containing commercial metadata even though
+the URL is public. Resource tags carry only the constant `provenance` marker; no
 subscription value is tagged. The rendered Markdown carries no subscription
 value at all, because it cannot carry the sensitivity classification the JSON
 bundle does.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the repository's security review requirements. This version is shared as
-GitHub source and is not published to the Swamp registry.
+for the release gates every version passes before it reaches the registry.
