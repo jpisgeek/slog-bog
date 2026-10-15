@@ -1,25 +1,137 @@
 package: "@jpisgeek/caddy"
-purpose: Manage a single route in an existing systemd Caddy wildcard site through your configured Swamp SSH model.
+purpose: >-
+  Manage and retire one explicitly owned route in an existing Linux systemd
+  Caddy wildcard site through an existing Swamp SSH model. Validate candidates,
+  refuse drift, verify backend TLS, privately back up changes and roll back
+  failed reloads without replacing unrelated routes or restarting the service.
 example: |
+  # Stored model globals; YOUR_* are placeholders, not deployment names.
   globalArguments:
-    sshModel: proxy-access
-    host: proxy
-    configPath: /etc/caddy/Caddyfile
-    caddyBinary: /usr/bin/caddy
-    systemctlBinary: /usr/bin/systemctl
-caveats: >-
-  Requires Swamp and an installed @swamp/ssh model on the runner, Python 3 and
-  noninteractive sudo on the proxy. Supports exactly one plain wildcard site
-  header; imported configurations are refused. Environment-dependent validation
-  needs inspection before use. Run inspect, plan, apply in a serial Swamp workflow. Supply the
-  inspected digest to plan and apply. An interrupted reload requires a fresh
-  inspection; the verified original remains in a private backup directory.
-  DNS and backend networking are separate infrastructure operations.
-security: >-
-  Reuses the SSH model's existing authentication. No new SSH keys or TLS
-  credentials. Full Caddyfiles and command diagnostics stay on the proxy.
-  Refuses existing unmanaged host entries, stale digests, universal client
-  CIDRs, symlinked Caddyfiles and malformed route markers. Output contains only
-  route configuration, digests, status and a private backup path.
-  The community @evrardjp/caddy 2026.08.12.1 was reviewed as a design reference;
-  no source was copied. This implementation targets the existing systemd service.
+    sshModel: YOUR_SSH_MODEL
+    host: YOUR_HOST
+    helperPath: /usr/local/sbin/swamp-caddy
+
+  ---
+  # plan/apply method arguments: use inspect's current beforeSha256.
+  # The trusted operator supplies a public CA PEM on the proxy first.
+  name: notes
+  hostname: notes.example.com
+  wildcardDomain: example.com
+  upstream: backend.example.com:8443
+  upstreamScheme: https
+  upstreamCaFile: /etc/caddy/trust/example-root-ca.pem
+  allowedCidrs: ["192.0.2.0/24"]
+  expectedSha256: REPLACE_WITH_INSPECTED_SHA256
+caveats: |
+  **Compatibility:** tested with Swamp `20261014.121640.0-sha.c5d1db96`
+  (native `ctx.runModel` resource handles and definition UUID lookup),
+  `@swamp/ssh@2026.10.13.1`, Python 3.9+ and Caddy 2.11.7. The declared
+  platforms describe the Swamp controller, not a macOS systemd target.
+  The target is Linux with an already active `caddy` service. This extension
+  does not bootstrap the service, DNS or backend. Validation provisions real
+  Caddy modules and can create module state, including local PKI keys and CAs;
+  only use configuration and modules reviewed by the privileged operator.
+
+  **Install deliberately:** call `helper` to emit the pinned helper and
+  its digest (this does not inspect the target). An authorized operator must
+  install those exact bytes at `helperPath`, root-owned mode 0755, under
+  root-owned non-group/world-writable parents. The narrowly scoped sudoers
+  command is `/usr/local/sbin/swamp-caddy`, never a shell or Python interpreter.
+  Protect model configuration and any allowed custom helperPath as privileged
+  operator input. Upgrades fail closed until the new helper is installed.
+
+  The helper fixes `/etc/caddy/Caddyfile`, `/usr/bin/caddy`, and
+  `/usr/bin/systemctl`; these paths cannot be overridden. Protected paths
+  must not contain symlinks or writable/untrusted ancestors. Optional
+  `/etc/caddy/caddy.env` supplies simple KEY=VALUE defaults; this is not a
+  general systemd EnvironmentFile parser. Ensure its effective validation
+  environment matches the running service before use.
+
+  Run `inspect`, `plan`, then `apply` serially in a Swamp workflow, binding
+  each method to the successful inspection's digest. A plan provisions real
+  Caddy modules in a private staged directory. All methods, including inspect,
+  create/use the persistent empty root-owned `/etc/caddy/.swamp-caddy.lock`.
+  It does not replace or reload the live configuration, but is not literally
+  filesystem-read-only. A stale digest refuses the operation. An unchanged
+  apply still reloads to reconcile an interrupted previous operation.
+  Validation does not probe backend reachability; backend certificate and
+  hostname verification happen when Caddy forwards a request.
+
+  **Concurrency precondition:** every writer of the Caddyfile, including
+  administrators and other automation, must hold an exclusive flock on that
+  same lock file across its edit and reload. Do not use this helper alongside
+  writers that ignore the lock. The helper serializes its own invocations and
+  checks bytes, inode, ownership, permissions and timestamps for observed drift;
+  these checks are not filesystem compare-and-swap against an uncooperative
+  root writer. Atomic replacement alone cannot provide that guarantee.
+
+  Exactly one plain `*.example.com {` header is supported for a selected
+  wildcard domain. Imports, CRLF, ambiguous/noncanonical owned blocks and
+  unmanaged occurrences of the desired hostname are refused. Matching
+  existing hostnames is case-insensitive and ignores a terminal dot.
+  Removal requires only name, hostname, wildcardDomain and expectedSha256;
+  it removes a complete canonical block with that exact identity, validates
+  and reloads. Absent removal is idempotent. Always inspect after errors.
+
+  **Migration:** old configurable binary/config globals were removed.
+  HTTPS now defaults on: supply a public CA PEM under `/etc/caddy/trust/`
+  (root-owned, protected parents, at most 64 KiB, no private key).
+  Explicit `upstreamScheme: http` opts into cleartext and forbids a CA field.
+  HTTP exposes forwarded headers, cookies, authorization and request/response
+  bodies to the backend network; use it only on a separately protected hop.
+  Normal certificate/hostname verification stays on; there is no insecure
+  TLS switch. Canonical non-universal client CIDRs are mandatory, and their
+  union must not cover all IPv4 or all IPv6 clients.
+
+  Tests include disposable transaction success/failure/rollback/retirement
+  fixtures and native child-evidence admission tests. The separate Linux CI
+  integration exercises real Caddy and systemd with disposable localhost TLS
+  resources; it requires an empty hosted runner and refuses preexisting Caddy
+  resources. It is never a production proxy check or a grant to deploy there.
+security: |
+  Root helper privilege is a real operator capability. Native child calls
+  use the existing `@swamp/ssh` definition, not a new credential or nested CLI.
+  They are delegated model capability, **not** a per-target grant check for
+  the triggering principal. Allow only fixed reviewed workflows/configuration;
+  do not expose arbitrary method inputs as an unrestricted public run surface.
+  The SSH model remains responsible for connection/host-key policy.
+
+  Success requires one current-invocation resource with matching definition,
+  host, method, name and request/action identifiers; latest-result fallback is
+  forbidden. Unknown execution inputs and contradictory helper answers fail
+  without writing an operation observation. Schema validation is not a general
+  secret detector and cannot make an untrusted SSH server honest.
+
+  Full Caddyfiles remain on the proxy. Subprocess stderr is discarded, not
+  preserved for later diagnosis, because it can expose credentials. The helper
+  bounds stdout and deadlines, uses the cooperative exclusive lock, validates
+  before replacing, and restores/reloads the original on reload failure unless
+  observed content or metadata drift makes rollback unsafe. Cancellation does not guarantee an elevated operation
+  stopped or undo an already committed change. Failed/ambiguous runs require a
+  fresh inspection; they are never recorded as successful observations.
+
+  Remote full-configuration backups are private (directory 0700/files 0600),
+  capped at five recognized owned regular files even after failed reloads.
+  They can include unrelated inline secrets from the original configuration;
+  prefer protected external secret references. There is no backup age limit:
+  operators must delete unwanted backups deliberately. Normal exits remove
+  private staging directories; crashes/power loss can leave private staged
+  copies requiring inspected operator cleanup. Neither is public output.
+  Foreign files and symlinks are never pruned. Operation observations contain
+  selected route host/upstream/CIDRs/CA path, digests, status, backup path and
+  an exact child-evidence pointer; these can still be operationally sensitive.
+  `inspect`, `plan`, `apply` and `remove` are per-model versioned result streams,
+  not per-route inventory. Bind the current run's exact resource version and
+  requestId, not a later latest-result lookup. Keeping these names stable also
+  bounds version-stream cardinality instead of creating a stream per request.
+  They declare a 7-day/20-version policy; helper files/digests declare
+  7-day/5-version policies. Actual deletion requires Swamp GC configuration
+  and execution; expiry is not guaranteed immediate physical deletion.
+
+  The dependency `@swamp/ssh` is separately licensed (AGPL); this extension's MIT
+  license does not relicense it. Its script runner records connection metadata,
+  interpreter/sudo/script byte count and potentially sensitive stdout/stderr,
+  not the full supplied script. Its runResult has infinite lifetime and its
+  model runHistory/GC settings govern version retention (default 50), not this
+  extension's policies. Protect those records and review that configuration.
+  The community `@evrardjp/caddy` was a design reference; no source was copied.

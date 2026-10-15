@@ -48,6 +48,19 @@ jobs:
           deno test --allow-read --allow-write --allow-env --allow-net --allow-run \
             $(ls -d */*_test.ts | xargs -n1 dirname | sort -u)
 
+      - name: real disposable Caddy and systemd integration
+        run: |
+          # An empty GitHub-hosted VM only; the script refuses preexisting
+          # Caddy resources. It never targets the publisher's live proxy.
+          mkdir "$RUNNER_TEMP/caddy-binary"
+          curl --fail --location --silent --show-error \
+            https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz \
+            -o "$RUNNER_TEMP/caddy-binary/caddy.tar.gz"
+          echo "727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b  $RUNNER_TEMP/caddy-binary/caddy.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/caddy-binary/caddy.tar.gz" -C "$RUNNER_TEMP/caddy-binary" caddy
+          sudo env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            python3 scripts/test-caddy-systemd.py --disposable-hosted-runner "$RUNNER_TEMP/caddy-binary/caddy"
+
       - name: fixed evidence schema compatibility
         run: |
           # Swamp externalizes Zod; a fresh scorer and an installed consumer
@@ -82,9 +95,8 @@ jobs:
       - name: review verdicts match content hashes
         run: |
           if [ "$GITHUB_REF_NAME" = extension-publication-20261014 ]; then
-            # This isolated branch releases only the explicitly reviewed set. The
-            # legacy Caddy helper has an unresolved review and is NOT admitted.
-            scripts/check-review-verdicts.sh mise/manifest.yaml video-pipeline/manifest.yaml subscription-metadata/manifest.yaml documentation-evidence/manifest.yaml inventory-coverage/manifest.yaml
+            # This isolated branch releases only the explicitly reviewed set.
+            scripts/check-review-verdicts.sh mise/manifest.yaml video-pipeline/manifest.yaml subscription-metadata/manifest.yaml documentation-evidence/manifest.yaml inventory-coverage/manifest.yaml caddy/manifest.yaml
           else
             scripts/check-review-verdicts.sh
           fi
