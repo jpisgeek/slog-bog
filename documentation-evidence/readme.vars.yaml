@@ -1,0 +1,91 @@
+package: "@jpisgeek/documentation-evidence"
+purpose: >-
+  Captures fixed operational metadata v1 from versioned stored Swamp resources.
+  Includes the infrastructure-guide model-scope report. There is no arbitrary
+  field selection, generic scalar projection, label, description or free-text
+  payload. Counts, nullable boolean flags, an enumerated collector outcome and
+  an original observation timestamp are the entire producer contract. This is
+  a deliberate replacement for the unpublished projection draft, not a drop-in
+  adapter for raw collector resources.
+  Its sibling @jpisgeek/inventory-coverage is also an intentionally public MIT
+  extension in this repository; this is a public package identity, not a private
+  deployment or workflow name.
+example: |
+  globalArguments:
+    sources:
+      - category: storage
+        modelType: '@example/operational-metadata'
+        modelId: 00000000-0000-4000-8000-000000000001
+        dataName: summary
+  reports:
+    require:
+      - '@jpisgeek/infrastructure-guide'
+caveats: |
+  A trusted producer must write exactly this JSON contract (all keys required):
+
+  ```json
+  {
+    "schemaVersion": 1,
+    "observedAt": "2026-10-14T12:00:00.123Z",
+    "collectorStatus": "succeeded",
+    "counts": { "expected": 9, "observed": 7, "unhealthy": 2, "unknown": 1 },
+    "flags": { "reachable": false, "configured": null }
+  }
+  ```
+
+  `collectorStatus` is `succeeded`, `failed` or `unknown`. It describes the
+  producer's declared outcome, not a verified latest run. Counts are integers
+  from 0 through 1,000,000. Observed cannot exceed expected; unhealthy plus
+  unknown cannot exceed observed (these are disjoint observed subsets).
+  Unobserved expected items are expected minus observed. Flags are booleans or
+  null (unknown). `observedAt` is null or a valid UTC ISO timestamp with exactly
+  three fractional-second digits. No fallback to resource creation/capture time.
+  Future times are retained, never treated as fresh by @jpisgeek/inventory-coverage.
+  Extra or missing keys at every object level, unsupported values, coercion,
+  arbitrary selectors and free-text labels are rejected, not silently stripped.
+
+  Run `capture` against an existing producer; it writes one `snapshot` with
+  `collectedAt` and observations. The latest exact named version is pinned;
+  unrelated resources are not enumerated. A missing/deleted/empty resource is unavailable
+  with null metadata, never a healthy zero. Malformed evidence, repository
+  failures, missing/invalid size metadata or invalid versions fail the whole capture before writing
+  any partial snapshot. The report reads only this successful execution's exact
+  snapshot version and renders from validated fields; no older/latest fallback.
+
+  Categories are compute, storage, network, applications, automation and
+  documentation, one source per category (1-6 total). Source model IDs are UUIDs;
+  types use slash-separated ASCII identifier segments. Resource names are
+  1-200 ASCII letters/digits/dot/colon/underscore/hyphen, starting alphanumeric.
+  These are storage routes, not shell paths. Routing identifiers stay in the
+  configuration and are not copied to snapshots/reports. Exact-name metadata
+  lookup rejects rename redirects; the configured UUID must match its model type.
+  Recorded size must be an integer from 0 to 64,000 before streaming begins.
+  Source/report streams accumulate at most 64,000 bytes in this extension;
+  overflow or a byte count differing from recorded size fails without truncation.
+  This is NOT a whole-platform allocation bound: Swamp may buffer metadata,
+  scan definitions to resolve a UUID, enumerate versions when a latest marker is absent, hydrate content or buffer
+  remote-worker artifacts before yielding. The Swamp repository/backend and its
+  metadata writers are trusted; do not run against attacker-controlled storage.
+  Backend resource quotas/isolation are the operator's responsibility, not provided
+  by this schema. Locally tested with the filesystem backend; remote-worker and
+  hydration allocation are not tested or claimed bounded. Malformed UTF-8/JSON fails.
+  Requires context definitionRepository.findByIdGlobal plus dataRepository.findByName
+  and stream; unsupported contexts fail rather than falling back to unbounded reads.
+  Numeric JSON must survive decimal round-trip; rounded,
+  underflowed, non-finite and negative-zero values fail closed. Numeric parsing
+  requires JSON reviver source-context support. Snapshots retain 30 days and
+  at most 30 versions. This pure data pipeline is tested on macOS ARM64 and
+  Linux x86_64; it does not assert any backend's platform compatibility.
+security: >-
+  No network, subprocess, environment or vault access. Only configured stored
+  resources are read through Swamp's repository. No private data is automatically
+  published. Strict schema validation reduces the accepted data surface; it is
+  NOT a universal secret detector or proof of truthful producer data. An
+  authorized writer could encode information in valid numbers/timestamps/flags.
+  Review and trust producers and protect configuration, observations, snapshots
+  and both report formats as operational data. Do not use configuration routing
+  fields as secret storage. No arbitrary source text is rendered; error details
+  are sanitized and cancellation remains cancellation. Adding an adapter for a
+  raw collector requires its own explicit reviewed mapping, never a generic
+  field-selecting escape hatch. MIT shared contract code is bundled into the
+  @jpisgeek/inventory-coverage package, requiring no live grant or separate runtime install.

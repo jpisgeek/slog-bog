@@ -1,0 +1,25 @@
+manifestVersion: 1
+name: "@jpisgeek/inventory-coverage"
+version: 2026.10.14.1
+description: >
+  Assess fixed-schema operational metadata with bounded counts, typed status
+  flags and explicit fresh, stale, unknown, unavailable and error states,
+  without probing backends or projecting arbitrary fields.
+repository: https://github.com/jpisgeek/slog-bog/tree/inventory-coverage-2026.10.14.1/inventory-coverage
+license: MIT
+paths:
+  base: manifest
+models:
+  - inventory_coverage.ts
+reports:
+  - coverage_report.ts
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+  - linux-x86_64
+labels:
+  - inventory
+  - evidence
+dependencies: []

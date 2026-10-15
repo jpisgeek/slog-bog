@@ -76,7 +76,7 @@ jobs:
           if [ "$GITHUB_REF_NAME" = extension-publication-20261014 ]; then
             # This isolated branch releases only the explicitly reviewed set. The
             # legacy Caddy helper has an unresolved review and is NOT admitted.
-            scripts/check-review-verdicts.sh mise/manifest.yaml video-pipeline/manifest.yaml subscription-metadata/manifest.yaml
+            scripts/check-review-verdicts.sh mise/manifest.yaml video-pipeline/manifest.yaml subscription-metadata/manifest.yaml documentation-evidence/manifest.yaml inventory-coverage/manifest.yaml
           else
             scripts/check-review-verdicts.sh
           fi
