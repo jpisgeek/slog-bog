@@ -12,8 +12,8 @@ adapter for raw collector resources. Its sibling @jpisgeek/inventory-coverage is
 also an intentionally public MIT extension in this repository; this is a public
 package identity, not a private deployment or workflow name.
 
-**Version** `2026.10.14.2` · **License** MIT · **Source**
-https://github.com/jpisgeek/slog-bog/tree/documentation-evidence-2026.10.14.2/documentation-evidence
+**Version** `2026.10.15.1` · **License** MIT · **Source**
+https://github.com/jpisgeek/slog-bog/tree/documentation-evidence-2026.10.15.1/documentation-evidence
 
 ## Install
 
@@ -88,10 +88,19 @@ Extra or missing keys at every object level, unsupported values, coercion,
 arbitrary selectors and free-text labels are rejected, not silently stripped.
 Duplicate decoded JSON member names (including escape-equivalent keys) are
 rejected at every object depth before schema validation; nesting is limited
-to 16. The reserved `__proto__` member is explicitly rejected, not silently
-discarded by Zod. Capture accepts no method inputs: its empty finite-key record
-schema keeps Swamp's global-argument merging separate from method-input
-validation.
+to 16. Raw evidence rejects the reserved `__proto__` member (including escaped
+names) before Zod parsing. Source items are checked before their object parser;
+capture also checks the own keys of the globals it receives. On Swamp c5d1db96,
+definition ingestion can discard a root `__proto__` configuration key before
+this extension sees it; this extension cannot attest rejection of that original
+definition text. It still rejects such a key if present at its execution
+boundary. Declare source routes as complete items, not CEL paths descending
+through the source-item schema: its preprocessing wrapper is not traversed by
+this Swamp version's schema-path introspection. Root sources routing/coercion
+and output attribute schemas remain native. Standalone exported object schemas
+describe the contract; they are not substitutes for the raw-byte capture/report
+boundary. Capture accepts no method inputs: its empty finite-key record schema
+keeps Swamp's global-argument merging separate from method-input validation.
 
 Run `capture` against an existing producer; it writes one `snapshot` with
 `collectedAt` and observations. The latest exact named version is pinned;

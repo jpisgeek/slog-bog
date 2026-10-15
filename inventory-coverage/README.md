@@ -9,8 +9,8 @@ probes backends or assumes retained evidence proves current health. Shared code
 comes from @jpisgeek/documentation-evidence, an intentionally public MIT sibling
 package in this repository, not a private deployment name.
 
-**Version** `2026.10.14.2` · **License** MIT · **Source**
-https://github.com/jpisgeek/slog-bog/tree/inventory-coverage-2026.10.14.2/inventory-coverage
+**Version** `2026.10.15.1` · **License** MIT · **Source**
+https://github.com/jpisgeek/slog-bog/tree/inventory-coverage-2026.10.15.1/inventory-coverage
 
 ## Install
 
@@ -82,11 +82,21 @@ extra/missing keys, free text, unsupported enums, coerced values, arbitrary
 field selection and legacy zeroFields/trueFields/falseFields are rejected.
 Duplicate decoded JSON keys, including escape-equivalent names, are rejected at
 every object depth; nesting is limited to 16. UUIDs must be canonical lowercase.
-The reserved `__proto__` member is explicitly rejected, not silently discarded
-by Zod. Capture accepts no method inputs: its empty finite-key record schema
-keeps Swamp's global-argument merging separate from method-input validation. Raw
-collector resources need a separately reviewed fixed mapping, not an arbitrary
-projection. The unpublished projection draft is not supported.
+Raw evidence rejects the reserved `__proto__` member (including escaped names)
+before Zod parsing. Source items are checked before their object parser; capture
+also checks the own keys of the globals it receives. On Swamp c5d1db96,
+definition ingestion can discard a root `__proto__` configuration key before
+this extension sees it; it cannot attest rejection of that original text. Such a
+key still rejects if present at the execution boundary. Declare source routes as
+complete items, not CEL paths descending through the source-item schema: its
+preprocessing wrapper is not traversed by this Swamp version's schema-path
+introspection. Root argument routing/coercion and output attribute schemas
+remain native. Exported object schemas describe the contract, not a substitute
+for the raw-byte capture/report boundary. Capture accepts no method inputs: its
+empty finite-key record schema keeps Swamp's global-argument merging separate
+from method-input validation. Raw collector resources need a separately reviewed
+fixed mapping, not an arbitrary projection. The unpublished projection draft is
+not supported.
 
 Run capture to write the summary named summary. Each source pins its latest
 exact named version without model-wide enumeration. Missing/deleted/empty data

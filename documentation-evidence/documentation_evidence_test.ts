@@ -105,6 +105,8 @@ Deno.test("reject arbitrary projections, labels, unknown arguments, duplicate ca
     const globalArgs of [
       { sources: [{ ...source, ["__proto__"]: "PRIVATE_VALUE" }] },
       { sources: [source], ["__proto__"]: "PRIVATE_VALUE" },
+      { sources: [{ ...source, ["__proto__"]: undefined }] },
+      { sources: [source], ["__proto__"]: undefined },
       { sources: [{ ...source, fields: ["password"] }] },
       { sources: [{ ...source, label: "PRIVATE_LABEL" }] },
       { sources: [{ ...source, category: "PRIVATE_CATEGORY" }] },
@@ -265,6 +267,29 @@ Deno.test("duplicate decoded JSON members at every object depth are rejected bef
     // Every fixture would otherwise parse to the valid payload; malformed JSON
     // must not accidentally make a duplicate-key regression test pass.
     assertEquals(JSON.parse(raw), metadata);
+    let writes = 0;
+    await assertRejects(() =>
+      model.methods.capture.execute({}, {
+        globalArgs: { sources: [source] },
+        definitionRepository: modelRepository,
+        dataRepository: repo(new TextEncoder().encode(raw)),
+        writeResource: async () => {
+          writes++;
+          return { name: "snapshot" };
+        },
+      })
+    );
+    assertEquals(writes, 0);
+  }
+});
+
+Deno.test("escaped reserved evidence members reject at every object depth before any write", async () => {
+  for (const member of ["schemaVersion", "expected", "reachable"]) {
+    const raw = JSON.stringify(metadata).replace(
+      `"${member}":`,
+      `"__pr\\u006fto__":"PRIVATE_VALUE","${member}":`,
+    );
+    assertEquals(JSON.stringify(JSON.parse(raw)).includes("__proto__"), true);
     let writes = 0;
     await assertRejects(() =>
       model.methods.capture.execute({}, {

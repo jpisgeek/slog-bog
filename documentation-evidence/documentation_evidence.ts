@@ -12,13 +12,23 @@ export const Category = z.enum([
   "automation",
   "documentation",
 ]);
-/** Reject unknown members, including __proto__ which Zod otherwise skips. */
+/** Object declarations retain Swamp's shape introspection; raw inputs are checked separately. */
 export function strictObject<T extends z.ZodRawShape>(shape: T) {
-  return z.object({ ...shape, ["__proto__"]: z.never().optional() }).strict()
-    .overwrite((value) => {
-      Reflect.deleteProperty(value, "__proto__");
-      return value;
-    });
+  return z.object(shape).strict();
+}
+function unexpectedMember(value: unknown, shape: object): boolean {
+  return value !== null && typeof value === "object" &&
+    Reflect.ownKeys(value).some((key) => !Object.hasOwn(shape, key));
+}
+/** Check untouched global arguments before an object parser can discard reserved keys. */
+export function parseArguments<T extends z.ZodRawShape>(
+  schema: z.ZodObject<T>,
+  value: unknown,
+) {
+  if (unexpectedMember(value, schema.shape)) {
+    throw Error("Unexpected configuration member");
+  }
+  return schema.parse(value);
 }
 /** An empty finite-key record rejects every method input without merging globals. */
 export const CaptureArgs = z.record(z.enum([]), z.never());
@@ -42,8 +52,7 @@ export const OperationalMetadata = strictObject({
     configured: z.boolean().nullable(),
   }),
 });
-/** Routing stays in private configuration, not copied into evidence outputs. */
-export const Source = strictObject({
+const SourceObject = strictObject({
   category: Category,
   modelType: z.string().regex(
     /^@?[A-Za-z][A-Za-z0-9_-]*(\/[A-Za-z][A-Za-z0-9_-]*)+$/,
@@ -51,6 +60,14 @@ export const Source = strictObject({
   modelId: z.string().uuid().regex(/^[0-9a-f-]+$/),
   dataName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/),
 });
+/** Reject raw routing members before Zod's version-dependent reserved-key handling. */
+export const Source = z.preprocess((value, ctx) => {
+  if (unexpectedMember(value, SourceObject.shape)) {
+    ctx.addIssue({ code: "custom", message: "Unexpected source member" });
+    return z.NEVER;
+  }
+  return value;
+}, SourceObject);
 /** At most one source per fixed category; arbitrary labels/selectors are rejected. */
 export const Sources = z.array(Source).min(1).max(6).refine(
   (sources) => new Set(sources.map((s) => s.category)).size === sources.length,
@@ -254,6 +271,7 @@ export function parseEvidence(bytes: Uint8Array): unknown {
       frame.key = true;
     } else if (token.startsWith('"') && frame?.keys && frame.key) {
       const key = JSON.parse(token) as string;
+      if (key === "__proto__") throw Error("Unsupported evidence member");
       if (frame.keys.has(key)) throw Error("Duplicate evidence member");
       frame.keys.add(key);
       frame.key = false;
@@ -362,7 +380,7 @@ export function render(observations: z.infer<typeof Observation>[]): string {
 /** Capture validated stored metadata with bounded retention and no backend authority. */
 export const model = {
   type: "@jpisgeek/documentation-evidence",
-  version: "2026.10.14.2",
+  version: "2026.10.15.1",
   globalArguments: GlobalArgs,
   resources: {
     snapshot: {
@@ -393,7 +411,7 @@ export const model = {
         try {
           CaptureArgs.parse(args);
           context.signal?.throwIfAborted();
-          const { sources } = GlobalArgs.parse(context.globalArgs);
+          const { sources } = parseArguments(GlobalArgs, context.globalArgs);
           context.logger?.info("Capturing fixed operational metadata");
           const observations = await collect(
             sources,

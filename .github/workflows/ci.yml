@@ -48,6 +48,14 @@ jobs:
           deno test --allow-read --allow-write --allow-env --allow-net --allow-run \
             $(ls -d */*_test.ts | xargs -n1 dirname | sort -u)
 
+      - name: fixed evidence schema compatibility
+        run: |
+          # Swamp externalizes Zod; a fresh scorer and an installed consumer
+          # need not use the same minor. Neither may silently discard raw keys.
+          printf '{"imports":{"npm:zod@4":"npm:zod@4.4.3"}}\n' > "$RUNNER_TEMP/zod-installed.json"
+          deno test --import-map "$RUNNER_TEMP/zod-installed.json" documentation-evidence/ inventory-coverage/
+          deno test --unsafe-proto documentation-evidence/ inventory-coverage/
+
       - name: release evidence boundary regressions
         run: |
           # The synthetic repos intentionally execute the helper cached-only.

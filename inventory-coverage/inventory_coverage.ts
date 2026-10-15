@@ -6,6 +6,7 @@ import {
   type EvidenceModels,
   type EvidenceRepository,
   Observation,
+  parseArguments,
   render as renderEvidence,
   Sources,
   strictObject,
@@ -98,7 +99,7 @@ export async function capture(
   signal?: AbortSignal,
 ): Promise<z.infer<typeof Summary>> {
   signal?.throwIfAborted();
-  const parsed = Args.parse(args);
+  const parsed = parseArguments(Args, args);
   const assessedAt = new Date(now).toISOString();
   const rows: Row[] = [];
   for (const source of parsed.sources) {
@@ -152,7 +153,7 @@ export function render(input: z.infer<typeof Summary>): string {
 /** Fixed-contract stored-evidence model with no live-backend authority. */
 export const model = {
   type: "@jpisgeek/inventory-coverage",
-  version: "2026.10.14.2",
+  version: "2026.10.15.1",
   globalArguments: Args,
   resources: {
     summary: {
@@ -184,7 +185,7 @@ export const model = {
           CaptureArgs.parse(args);
           ctx.logger?.info("Assessing fixed operational metadata coverage");
           const summary = await capture(
-            Args.parse(ctx.globalArgs),
+            parseArguments(Args, ctx.globalArgs),
             ctx.dataRepository,
             ctx.definitionRepository,
             Date.now(),
