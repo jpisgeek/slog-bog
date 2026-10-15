@@ -42,10 +42,18 @@ def main():
     for path in (root, config, installed, installed_helper, unit):
         if path.exists() or path.is_symlink():
             raise RuntimeError("Refusing preexisting Caddy test resource")
-    known = subprocess.run(["systemctl", "list-unit-files", "caddy.service", "--no-legend"],
-                           check=True, capture_output=True, timeout=20)
-    if known.stdout.strip():
+    # A filtered zero-row list exits 1, indistinguishable from operational
+    # errors. Require successful unfiltered enumeration instead; never waive 1.
+    known = subprocess.run(["systemctl", "list-unit-files", "--no-legend", "--no-pager", "--full"],
+                           check=True, stdout=subprocess.PIPE, timeout=20)
+    if any(row.split()[0] == b"caddy.service" for row in known.stdout.splitlines() if row.split()):
         raise RuntimeError("Refusing preexisting Caddy unit")
+    # Also reject loaded/transient units that have no installed unit file.
+    state = subprocess.run(["systemctl", "show", "caddy.service", "--no-pager",
+                            "--property=LoadState", "--property=ActiveState"],
+                           check=True, stdout=subprocess.PIPE, timeout=20)
+    if set(state.stdout.splitlines()) != {b"LoadState=not-found", b"ActiveState=inactive"}:
+        raise RuntimeError("Refusing preexisting or indeterminate Caddy unit state")
     for port in (12019, 18443, 18444):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
