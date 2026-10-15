@@ -49,7 +49,11 @@ jobs:
             $(ls -d */*_test.ts | xargs -n1 dirname | sort -u)
 
       - name: release evidence boundary regressions
-        run: python3 -m unittest discover -s tests -p committed_reviews_test.py
+        run: |
+          # The synthetic repos intentionally execute the helper cached-only.
+          # A fresh runner needs its pinned tooling dependencies prepared first.
+          deno cache scripts/content-hash.ts
+          python3 -m unittest discover -s tests -p committed_reviews_test.py
 
       - name: every extension has tests
         run: |
