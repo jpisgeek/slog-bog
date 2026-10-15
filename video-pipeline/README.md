@@ -7,19 +7,14 @@ prepare, narrate, render, inspect, package, verify, and deliver receipts and
 validates dependency and output artifact bytes before storing success. This
 package is not a standalone renderer or speech engine.
 
-**Version** `2026.09.04.1` · **License** MIT · **Source**
-https://github.com/jpisgeek/slog-bog/tree/main/video-pipeline
+**Version** `2026.10.14.1` · **License** MIT · **Source**
+https://github.com/jpisgeek/slog-bog/tree/extensions-2026.10.14.1/video-pipeline
 
 ## Install
 
-Clone this GitHub repository and register its model source in your Swamp repo.
-Replace the example path with the canonical location of your clone:
-
-```sh
-swamp extension source add /example/slog-bog/video-pipeline --only models
 ```
-
-This package is distributed as source; no public registry upload is required.
+swamp extension pull @jpisgeek/video-pipeline
+```
 
 ## `@jpisgeek/video-pipeline`
 
@@ -129,9 +124,12 @@ build/swamp-step.py deliver --release v1 --input-hash SHA256 --video-sha256 SHA2
 ```
 
 Arguments are passed as an argv array, without a shell. The bridge must emit one
-JSON receipt on stdout; progress belongs on stderr. Its receipt must contain
-`stage`, `release`, `inputHash`, an ISO `completedAt`, a nonempty `artifacts`
-array of `{path, bytes, sha256}`, nullable `videoSha256`, and
+JSON receipt on stdout; progress belongs on stderr and is discarded by the
+adapter. Receipt stdout is capped at four MiB while reading; exceeding the limit
+stops the bridge and fails the stage without writing a receipt. Keep durable
+bridge diagnostics in your private project, not in receipts. Its receipt must
+contain `stage`, `release`, `inputHash`, an ISO `completedAt`, a nonempty
+`artifacts` array of `{path, bytes, sha256}`, nullable `videoSha256`, and
 `metrics: {durationSeconds, clippedSamples, fileCount, verified}`. All artifacts
 must be real nonempty regular files with unique absolute paths, matching sizes
 and hashes, and no symlinks in their ancestry. `verified` must be true and
@@ -141,18 +139,36 @@ verifies receipt integrity, not whether pixels or speech are good.
 
 Non-delivery artifacts must stay inside the canonical project directory.
 Delivery receipts must list only copied files under the configured canonical
-delivery folders. The bridge must independently enforce delivery destinations,
-serialize mutations, use safe temporary files, and clean up descendant processes
-on cancellation. Each invocation has a configurable time limit.
+delivery folders. Root aliases, repeated/trailing separators, Unicode controls,
+and noncanonical symlink aliases are rejected before the bridge runs. Create
+delivery directories before running any stage and use their real paths. Missing
+directories are rejected; filesystem identities and ancestry must be distinct
+and non-overlapping, including case/Unicode aliases. Delivery must contain a
+verified video copy under every destination, and every delivered artifact must
+match the size and hash of an artifact in the stored verify receipt. Missing
+copies, incorrect copies, and unverified extras fail without a receipt. The
+bridge must independently enforce delivery destinations, serialize mutations,
+and use safe temporary files. Each invocation has a configurable time limit.
+Cancellation, timeout, or oversized stdout sends SIGTERM to the bridge's
+dedicated process group, permits 500 ms for cleanup, then sends SIGKILL to stop
+resistant descendants. Bridges and renderers must not detach their descendants
+into other process groups or sessions: this is bounded process-group cleanup,
+not a sandbox or arbitrary process-tree kill.
 
 Required receipt dependencies are: narrate → prepare; render → prepare and
-narrate; inspect → prepare, narrate, and render; package → prepare and inspect;
-verify → prepare, inspect, and package; deliver → prepare, inspect, and verify.
-Every dependency must match the release/input hash and still match its files.
-Keep these artifacts stable for the release. The bridge must hash all source
-inputs and reject changes, and include every file consumed by a later stage in
-an appropriate earlier receipt. Delivery also binds its requested video hash to
-the verify receipt.
+narrate; inspect → prepare, narrate, and render; package → prepare, narrate, and
+inspect; verify → prepare, narrate, inspect, and package; deliver → prepare,
+inspect, and verify. Every dependency must match the release/input hash and
+still match its files. A model instance is bound to its first prepared input
+hash and release. Repeating preparation with the same binding is allowed;
+changed inputs or a different release require a new model instance. Stable stage
+names keep existing CEL consumers compatible without mixing evidence for
+different inputs. A bridge may have produced files before its returned hash is
+refused; such a failure never replaces the stored prepared receipt. Keep these
+artifacts stable for the release. The bridge must hash all source inputs and
+reject changes, and include every file consumed by a later stage in an
+appropriate earlier receipt. Delivery also binds its requested video hash to the
+verify receipt.
 
 The included synthetic example demonstrates the adapter protocol; it creates
 text fixtures, not a playable video. See `examples/USAGE.md` for the example.
@@ -161,8 +177,9 @@ text fixtures, not a playable video. See `examples/USAGE.md` for the example.
 
 The configured executable and project bridge are trusted code running with the
 operator's inherited environment and process permissions. This adapter is not a
-sandbox and cannot constrain a bridge's filesystem or network actions. Review
-that code before use and keep credentials out of scripts, receipts, and stdout.
+sandbox and cannot constrain a bridge's filesystem or network actions. Run it
+under a dedicated least-privilege account/environment, review that code before
+use, and keep credentials out of scripts, path components, receipts, and stdout.
 Raw bridge stderr and malformed JSON payloads are not echoed in adapter
 failures. Artifact paths and other receipts are private runtime data stored by
 Swamp; do not commit them, model instances, generated media, private project
@@ -171,5 +188,4 @@ model, production asset, or deployment configuration is included in this
 package.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the repository's security review requirements. This package is shared as
-GitHub source and is not published to the Swamp registry.
+for the release gates every version passes before it reaches the registry.

@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, extension-publication-20261014]
   pull_request:
 
 permissions:
@@ -48,6 +48,9 @@ jobs:
           deno test --allow-read --allow-write --allow-env --allow-net --allow-run \
             $(ls -d */*_test.ts | xargs -n1 dirname | sort -u)
 
+      - name: release evidence boundary regressions
+        run: python3 -m unittest discover -s tests -p committed_reviews_test.py
+
       - name: every extension has tests
         run: |
           missing=""
@@ -65,7 +68,14 @@ jobs:
         run: deno run --allow-read --allow-write --allow-run --allow-env scripts/gen-readme.ts --check
 
       - name: review verdicts match content hashes
-        run: scripts/check-review-verdicts.sh
+        run: |
+          if [ "$GITHUB_REF_NAME" = extension-publication-20261014 ]; then
+            # This isolated branch releases only these two candidates. The
+            # legacy Caddy helper has an unresolved review and is NOT admitted.
+            scripts/check-review-verdicts.sh mise/manifest.yaml video-pipeline/manifest.yaml
+          else
+            scripts/check-review-verdicts.sh
+          fi
 
       # swamp itself is not installed in CI: the registry-side gates
       # (extension fmt / quality / push --dry-run) run locally via

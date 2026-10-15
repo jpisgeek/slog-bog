@@ -68,10 +68,11 @@ def main():
     source = json.loads(scenes.read_text(encoding="utf-8"))
     if not isinstance(source, list) or not source:
         raise ValueError("The synthetic scene list must be nonempty")
-    input_hash = hashlib.sha256(
-        b"scenes.json\0" + scenes.read_bytes()
-        + b"\0build/swamp-step.py\0" + bridge.read_bytes()
-    ).hexdigest()
+    inputs = hashlib.sha256()
+    for value in (b"scenes.json", scenes.read_bytes(), b"build/swamp-step.py", bridge.read_bytes()):
+        inputs.update(len(value).to_bytes(8, byteorder="big"))
+        inputs.update(value)
+    input_hash = inputs.hexdigest()
     if args.stage != "prepare" and args.input_hash != input_hash:
         raise ValueError("Prepared inputs changed; prepare the fixture again")
 

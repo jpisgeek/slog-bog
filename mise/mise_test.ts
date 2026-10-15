@@ -635,6 +635,7 @@ function mockCtx(
   globalArgs: Json,
   opts: {
     existing?: string[];
+    stored?: Record<string, Json>;
     throwOnFirstWarning?: boolean | string;
     signal?: AbortSignal;
   } = {},
@@ -679,9 +680,18 @@ function mockCtx(
         deleted.push(name);
         return Promise.resolve();
       },
+      readResource: (name: string) =>
+        Promise.resolve(opts.stored?.[name] ?? null),
       dataRepository: {
         findAllForModel: () =>
-          Promise.resolve((opts.existing ?? []).map((name) => ({ name }))),
+          Promise.resolve(
+            [
+              ...new Set([
+                ...(opts.existing ?? []),
+                ...Object.keys(opts.stored ?? {}),
+              ]),
+            ].map((name) => ({ name })),
+          ),
         getContent: () => Promise.resolve(null),
         delete: () => Promise.resolve(),
       },
@@ -700,6 +710,7 @@ type FailedSub = "config" | "outdated" | "trust" | "version";
 async function fakeMiseSuite(
   answers: {
     ls?: string;
+    version?: string;
     config?: string;
     outdated?: string;
     trust?: string;
@@ -739,11 +750,7 @@ async function fakeMiseSuite(
         ? refuse("version")
         : '  echo "2026.8.12 test"\n  exit 0'
     }\nfi`,
-    `if [ "$1" = "version" ]; then\n${
-      failing.has("version")
-        ? refuse("version")
-        : 'echo "2026.8.12 test"\nexit 0'
-    }\nfi`,
+    branch("version", "version", answers.version ?? "2026.8.12 test"),
     `if [ "$1" = "ls" ]; then cat <<'EOF'\n${
       answers.ls ?? "{}"
     }\nEOF\nexit 0; fi`,
@@ -763,12 +770,17 @@ async function fakeMiseSuite(
  * and remoteCommand are pure and pass their unit tests whichever way the
  * transport ternary points.
  */
-async function fakeSshOnPath(): Promise<
+async function fakeSshOnPath(stderr?: string): Promise<
   { restore: () => Promise<void> }
 > {
   const dir = await Deno.makeTempDir();
   const originalPath = Deno.env.get("PATH") ?? "";
-  await Deno.writeTextFile(`${dir}/ssh`, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+  await Deno.writeTextFile(
+    `${dir}/ssh`,
+    stderr === undefined
+      ? "#!/bin/sh\nprintf '%s\\n' \"$@\"\n"
+      : `#!/bin/sh\ncat >&2 <<'SSH_FIXTURE_EOF'\n${stderr}\nSSH_FIXTURE_EOF\nexit 255\n`,
+  );
   await Deno.chmod(`${dir}/ssh`, 0o755);
   Deno.env.set("PATH", `${dir}:${originalPath}`);
   return {
@@ -1221,8 +1233,8 @@ Deno.test("a tool row carries its host's degraded flag", async () => {
       )!;
       return (w.opts as { tags?: Record<string, string> }).tags ?? {};
     };
-    // The row itself writes outdated: false because the probe never ran, so
-    // without the tag a query over rows alone reads this host as clean.
+    // Nullable outdated alone cannot distinguish other degraded probes;
+    // carry the host's partial-measurement state on the row as well.
     assertEquals(tagsFor("workstation").degraded, "true");
     assertEquals(tagsFor("builder").degraded, "false");
   } finally {
@@ -1413,6 +1425,7 @@ Deno.test("one node's exception never discards the fleet", async () => {
   const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN });
   try {
     const c = mockCtx({
+      errorDetail: true,
       nodes: [
         { name: "gone", misePath: "/nonexistent/mise" },
         { name: "workstation", misePath: m.path },
@@ -1442,6 +1455,11 @@ Deno.test("one node's exception never discards the fleet", async () => {
     // failure was a thrown logger, not a remote condition, so the classifier
     // declines to name it rather than guessing at the nearest code.
     assertEquals(String(gone.error), "unclassified");
+    assertEquals(
+      gone.errorDetail,
+      null,
+      "internal exceptions are not host output",
+    );
     for (const log of c.logs) {
       assertNoControlCharacters(log.values);
     }
@@ -1775,6 +1793,45 @@ Deno.test("errorDetail on preserves the diagnosis the code alone loses", async (
   }
 });
 
+Deno.test("SSH diagnostics cannot persist the sensitive identity-file locator", async () => {
+  for (const identityFile of ["/example/ssh/fixture-reader", "/"]) {
+    const ssh = await fakeSshOnPath(
+      `Warning: Identity file ${identityFile} not accessible: No such file or directory.\nPermission denied (publickey). https://reader:fixture-password@host.example.com/path`,
+    );
+    try {
+      for (const errorDetail of [true, false]) {
+        const c = mockCtx({
+          nodes: [{
+            name: "builder",
+            ssh: { host: "host.example.com", user: "reader", identityFile },
+          }],
+          errorDetail,
+        });
+        await model.methods.discover.execute({}, c.ctx);
+        const node = c.written.find((w) => w.spec === "node")!.data;
+        assertEquals(node.measured, false);
+        assertEquals(JSON.stringify(c.written).includes(identityFile), false);
+        assertEquals(JSON.stringify(c.logs).includes(identityFile), false);
+        assertEquals(
+          JSON.stringify(c.written).includes("fixture-password"),
+          false,
+        );
+        assertEquals(
+          JSON.stringify(c.logs).includes("fixture-password"),
+          false,
+        );
+        assertEquals(node.error, "permission-denied");
+        assertEquals(node.failureKind, "failed");
+        if (errorDetail) {
+          assertStringIncludes(String(node.errorDetail), "Permission denied");
+        } else assertEquals(node.errorDetail, null);
+      }
+    } finally {
+      await ssh.restore();
+    }
+  }
+});
+
 Deno.test("errorDetail never widens the error field itself", async () => {
   // Whatever errorDetail is set to, `error` remains a code. The two fields
   // exist separately so the always-safe one cannot become the unsafe one.
@@ -1903,6 +1960,92 @@ Deno.test("a host that could not be measured keeps its history", async () => {
     assertEquals(c.deleted, ["tool-retired--go-9999abcd"]);
   } finally {
     await m.cleanup();
+  }
+});
+
+Deno.test("retained rows are stale after failed sweeps and fresh on recovery", async () => {
+  const healthy = await fakeMiseSuite({
+    ls: LS_CURRENT_CLEAN,
+    config: '[{"path":"/srv/project/mise.toml","tools":["node"]}]',
+  });
+  const partial = await fakeMiseSuite({ ls: "{}", fail: ["config"] });
+  try {
+    const before = mockCtx({
+      nodes: [
+        { name: "workstation", misePath: healthy.path },
+        { name: "builder", misePath: healthy.path },
+      ],
+    });
+    await model.methods.discover.execute({}, before.ctx);
+    const stored = Object.fromEntries(
+      before.written.filter((w) => w.spec === "tool" || w.spec === "config")
+        .map((w) => {
+          // Model the old published schema, which has no freshness fields.
+          const data = { ...w.data };
+          delete data.stale;
+          return [w.name, data];
+        }),
+    );
+    for (const targeted of [false, true]) {
+      for (const misePath of ["/nonexistent/mise", partial.path]) {
+        const args = targeted ? { node: "workstation" } : {};
+        const failed = mockCtx({
+          nodes: [
+            { name: "workstation", misePath },
+            { name: "builder", misePath: healthy.path },
+          ],
+        }, { stored });
+        await model.methods.discover.execute(args, failed.ctx);
+        for (const spec of ["tool", "config"]) {
+          const row = failed.written.find((w) =>
+            w.spec === spec && w.data.node === "workstation"
+          );
+          assertEquals(row !== undefined, true, "history must be refreshed");
+          assertEquals(row!.data.stale, true, "history is not a measurement");
+          assertEquals(row!.data.node, "workstation");
+          const tags = row!.opts.tags as Json;
+          assertEquals(tags.stale, "true");
+          assertEquals(tags.degraded, "true");
+          assertMatch(String(tags.sweptAt), /^\d{4}-\d{2}-\d{2}T/);
+          if (spec === "tool") {
+            assertEquals(row!.data.resolvedVersion, "22.23.2");
+            assertEquals(row!.data.installed, true);
+          } else {
+            assertEquals(row!.data.path, "/srv/project/mise.toml");
+            assertEquals(row!.data.degraded, true);
+          }
+        }
+        const builder = failed.written.filter((w) =>
+          (w.spec === "tool" || w.spec === "config") &&
+          w.data.node === "builder"
+        );
+        assertEquals(builder.length, targeted ? 0 : 2);
+        for (const row of builder) assertEquals(row.data.stale, false);
+        assertEquals(failed.deleted, []);
+
+        const recovered = mockCtx(before.ctx.globalArgs, {
+          stored: Object.fromEntries(
+            failed.written.filter((w) =>
+              w.spec === "tool" || w.spec === "config"
+            ).map((w) => [w.name, w.data]),
+          ),
+        });
+        await model.methods.discover.execute(args, recovered.ctx);
+        const rows = recovered.written.filter((w) =>
+          (w.spec === "tool" || w.spec === "config") &&
+          w.data.node === "workstation"
+        );
+        assertEquals(rows.length, 2);
+        for (const row of rows) {
+          assertEquals(row.data.stale, false);
+          assertEquals((row.opts.tags as Json).stale, "false");
+          assertEquals((row.opts.tags as Json).degraded, "false");
+        }
+      }
+    }
+  } finally {
+    await healthy.cleanup();
+    await partial.cleanup();
   }
 });
 
@@ -2098,6 +2241,15 @@ Deno.test("any query or fragment on a source URL is withheld", () => {
   );
   assertEquals(safeRemoteString("https://reg.internal/n.tgz#tok"), null);
   assertEquals(
+    safeRemoteString("//registry.example.com/n.tgz?code=secret"),
+    null,
+  );
+  assertEquals(safeRemoteString("//registry.example.com/n.tgz#private"), null);
+  assertEquals(
+    safeRemoteString("//registry.example.com/n.tgz"),
+    "//registry.example.com/n.tgz",
+  );
+  assertEquals(
     safeRemoteString("https://reg.internal/n.tgz"),
     "https://reg.internal/n.tgz",
     "an ordinary source URL is not collateral damage",
@@ -2228,6 +2380,34 @@ Deno.test("a version must be a version all the way through", () => {
   assertEquals(parseVersion("2025.1.0-rc1 macos"), "2025.1.0-rc1");
   assertEquals(parseVersion("2025.1.0"), "2025.1.0");
   assertEquals(parseVersion("mise 2025.1.0"), null);
+});
+
+Deno.test("mise version output cannot bypass inventory credential and size limits", async () => {
+  for (
+    const version of [
+      `2026.10.10-${"aB3c".repeat(20)}`,
+      "1".repeat(5000),
+      "2026.10.10-rc1",
+    ]
+  ) {
+    const accepted = version === "2026.10.10-rc1";
+    const m = await fakeMiseSuite({ ls: LS_CURRENT_CLEAN, version });
+    try {
+      const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+      await model.methods.discover.execute({}, c.ctx);
+      const node = c.written.find((w) => w.spec === "node")!.data;
+      assertEquals(node.measured, true);
+      assertEquals(node.degraded, !accepted);
+      assertEquals(node.miseVersion, accepted ? version : null);
+      assertEquals(node.failedSubcommands, accepted ? [] : ["version"]);
+      if (!accepted) {
+        assertEquals(JSON.stringify(c.written).includes(version), false);
+        assertEquals(JSON.stringify(c.logs).includes(version), false);
+      }
+    } finally {
+      await m.cleanup();
+    }
+  }
 });
 
 Deno.test("an ls entry missing the measurement is not a measured tool", () => {
@@ -2721,6 +2901,259 @@ Deno.test("an environment-variable-shaped secret name is caught", () => {
   }
 });
 
+Deno.test("prefix-form credentials cannot become inventory or error detail", async () => {
+  for (
+    const prefix of [
+      "ghp_",
+      "github_pat_",
+      "xoxb-",
+      "sk-proj-",
+      "sk-ant-",
+      "glpat-",
+      "AKIA",
+      "ASIA",
+      "AIza",
+      "AGE-SECRET-KEY-1",
+      "prefix_ghp_",
+    ]
+  ) {
+    const token = prefix +
+      (prefix === "AKIA" || prefix === "ASIA"
+        ? "A".repeat(16)
+        : prefix === "AIza"
+        ? "a".repeat(35)
+        : "A".repeat(48));
+    assertEquals(safeRemoteString(token), null);
+    assertEquals(
+      GlobalArgsSchema.safeParse({ nodes: [{ name: token }] }).success,
+      false,
+    );
+    const tool = {
+      version: token,
+      requested_version: token,
+      install_path: `/opt/${token}`,
+      source: { type: token, path: `/srv/${token}` },
+      installed: true,
+      active: true,
+    };
+    const m = await fakeMiseSuite({
+      ls: JSON.stringify({ node: [tool], [token]: [tool] }),
+      config: JSON.stringify([{ path: `/srv/${token}`, tools: [token] }]),
+    });
+    const failed = await fakeMise({
+      stderr: `could not fetch ${token}`,
+      exit: 1,
+    });
+    try {
+      for (const binary of [m.path, failed.path]) {
+        const c = mockCtx({
+          errorDetail: true,
+          nodes: [{ name: "workstation", misePath: binary }],
+        });
+        await model.methods.discover.execute({}, c.ctx);
+        assertEquals(JSON.stringify(c.written).includes(token), false);
+        assertEquals(JSON.stringify(c.logs).includes(token), false);
+        const node = c.written.find((w) => w.spec === "node")!.data;
+        if (binary === m.path) {
+          assertEquals(node.measured, true);
+          assertEquals(
+            node.degraded,
+            true,
+            "refused rows are missing measurements",
+          );
+          assertEquals(c.written.filter((w) => w.spec === "tool").length, 1);
+        } else {
+          assertEquals(node.measured, false);
+          assertEquals(node.errorDetail, "[withheld: unscreenable error text]");
+        }
+      }
+    } finally {
+      await m.cleanup();
+      await failed.cleanup();
+    }
+  }
+});
+
+Deno.test("unpaired surrogates preserve distinct tool and config identities", async () => {
+  const keys = ["thing\ud800", "thing\ud801"];
+  const m = await fakeMiseSuite({
+    ls: JSON.stringify(Object.fromEntries(keys.map((key) => [key, [{
+      version: "1.2.3",
+      installed: true,
+      active: true,
+    }]]))),
+    config: JSON.stringify(
+      keys.map((key) => ({ path: `/srv/${key}`, tools: [key] })),
+    ),
+  });
+  try {
+    const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+    await model.methods.discover.execute({}, c.ctx);
+    for (const spec of ["tool", "config"]) {
+      const rows = c.written.filter((w) => w.spec === spec);
+      assertEquals(rows.length, 2);
+      assertEquals(new Set(rows.map((w) => w.name)).size, 2);
+      assertEquals(/[\p{Cs}]/u.test(JSON.stringify(rows)), false);
+    }
+    assertEquals(
+      c.written.filter((w) => w.spec === "tool").map((w) => w.data.tool),
+      ["thing\\ud800", "thing\\ud801"],
+    );
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("unsafe or malformed history fails before publishing a partial sweep", async () => {
+  const m = await fakeMiseSuite({
+    ls: LS_CURRENT_CLEAN,
+    config: '[{"path":"/srv/project/mise.toml","tools":["node"]}]',
+  });
+  try {
+    const seed = mockCtx({
+      nodes: [{ name: "workstation", misePath: m.path }],
+    });
+    await model.methods.discover.execute({}, seed.ctx);
+    const token = "ghp_" + "a".repeat(48);
+    const rows = seed.written.filter((w) =>
+      w.spec === "tool" || w.spec === "config"
+    );
+    for (const row of rows) {
+      for (const [key, value] of Object.entries(row.data)) {
+        if (typeof value !== "string" && !Array.isArray(value)) continue;
+        for (const unsafe of [token, "bad\u001bvalue"]) {
+          const c = mockCtx({
+            nodes: [{ name: "workstation", misePath: "/nonexistent/mise" }],
+          }, {
+            stored: {
+              [row.name]: {
+                ...row.data,
+                [key]: Array.isArray(value) ? [unsafe] : unsafe,
+              },
+            },
+          });
+          const error = await assertRejects(
+            () => model.methods.discover.execute({}, c.ctx),
+            Error,
+          );
+          assertStringIncludes(
+            error.message,
+            "stored inventory; no sweep data was written.",
+          );
+          assertEquals(error.message.includes(unsafe), false);
+          assertEquals(c.written, []);
+          assertEquals(c.deleted, []);
+        }
+      }
+    }
+    for (const existing of [[{ name: `tool-workstation--${token}` }], [{}]]) {
+      const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+      c.ctx.dataRepository.findAllForModel = () => Promise.resolve(existing);
+      await assertRejects(
+        () => model.methods.discover.execute({}, c.ctx),
+        Error,
+        "Invalid stored inventory; no sweep data was written.",
+      );
+      assertEquals(c.written, []);
+      assertEquals(c.deleted, []);
+    }
+    const malformed = mockCtx({
+      nodes: [{ name: "workstation", misePath: "/nonexistent/mise" }],
+    }, {
+      stored: {
+        [rows[0].name]: { node: "workstation", installed: "not a boolean" },
+      },
+    });
+    await assertRejects(
+      () => model.methods.discover.execute({}, malformed.ctx),
+      Error,
+      "Invalid stored inventory; no sweep data was written.",
+    );
+    assertEquals(malformed.written, []);
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("large hostile stderr remains bounded with errorDetail both off and on", async () => {
+  const m = await fakeMise({ stderr: "a".repeat(1024 * 1024), exit: 1 });
+  try {
+    for (const errorDetail of [false, true]) {
+      const c = mockCtx({
+        errorDetail,
+        nodes: [{ name: "workstation", misePath: m.path }],
+      });
+      const started = Date.now();
+      await model.methods.discover.execute({}, c.ctx);
+      assertEquals(
+        Date.now() - started < 5000,
+        true,
+        "screening must not stall after process exit",
+      );
+      const node = c.written.find((w) => w.spec === "node")!.data;
+      assertEquals(node.measured, false);
+      assertEquals(
+        node.errorDetail,
+        errorDetail ? "[withheld: oversized error text]" : null,
+      );
+    }
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("SSH configuration is isolated with an explicit optional identity", async () => {
+  const dir = await Deno.makeTempDir();
+  const identityFile = `${dir}/reader`;
+  await Deno.writeTextFile(identityFile, "test configuration only, not a key");
+  const node = GlobalArgsSchema.parse({
+    nodes: [{
+      name: "builder",
+      ssh: {
+        host: "builder.example.com",
+        user: "reader",
+        identityFile,
+      },
+    }],
+  }).nodes[0];
+  const args = sshArgs(node.ssh!, 15, "mise version");
+  const out = await new Deno.Command("ssh", {
+    args: ["-G", ...args],
+    stdin: "null",
+  }).output().finally(() => Deno.remove(dir, { recursive: true }));
+  assertEquals(out.success, true);
+  const config = new TextDecoder().decode(out.stdout);
+  for (
+    const expected of [
+      "stricthostkeychecking true",
+      "updatehostkeys false",
+      `identityfile ${identityFile}`,
+      "forwardagent no",
+    ]
+  ) {
+    assertStringIncludes(config, expected);
+  }
+  // OpenSSH omits disabled command directives from its effective config.
+  assertEquals(
+    /^sendenv |^setenv |^knownhostscommand |^proxycommand /m.test(config),
+    false,
+  );
+  assertEquals(args.slice(0, 2), ["-F", "/dev/null"]);
+  assertEquals(
+    GlobalArgsSchema.safeParse({
+      nodes: [{
+        name: "builder",
+        ssh: {
+          host: "builder.example.com",
+          user: "reader",
+          identityFile: "~/key;exec",
+        },
+      }],
+    }).success,
+    false,
+  );
+});
+
 Deno.test("a host that will not stop talking is cut off, not buffered", async () => {
   // The first version of this bound decoded whatever Deno.Command.output()
   // had already buffered, which is not a bound at all: output() reads the
@@ -2887,4 +3320,354 @@ Deno.test("an instance stored before errorDetail existed parses safely off", () 
   // direction for the one argument that persists host text.
   const g = GlobalArgsSchema.parse({ nodes: [{ name: "a" }] });
   assertEquals(g.errorDetail, false);
+});
+
+Deno.test("an empty targeted node cannot turn into a fleet sweep", async () => {
+  const c = mockCtx({ nodes: [{ name: "workstation" }] }, {
+    existing: ["summary", "tool-removed-old"],
+  });
+  assertEquals(
+    model.methods.discover.arguments.safeParse({ node: "" }).success,
+    false,
+  );
+  await assertRejects(() =>
+    model.methods.discover.execute({ node: "" }, c.ctx)
+  );
+  assertEquals(c.written, []);
+  assertEquals(c.deleted, []);
+});
+
+Deno.test("misspelled operator settings cannot silently change the probe", () => {
+  for (
+    const value of [
+      { nodes: [{ name: "workstation", dirr: "/srv/project" }] },
+      {
+        nodes: [{
+          name: "workstation",
+          ssh: { host: "host.example.com", user: "reader", portt: 2222 },
+        }],
+      },
+      { nodes: [{ name: "workstation" }], expectt: { node: "22" } },
+    ]
+  ) assertEquals(GlobalArgsSchema.safeParse(value).success, false);
+});
+
+Deno.test("wrapped schemeless credentials cannot reach inventory or error prose", async () => {
+  for (
+    const value of [
+      "[reader@host.example.com:path]",
+      "{reader@host.example.com:path}",
+      "source=reader:pw@host.example.com:path",
+      "source=//reader:pw@host.example.com/path",
+      "/reader:pw@host.example.com:path",
+      "source=//registry.example.com/path?code=private",
+      "source=//registry.example.com/path#private",
+      String.raw`https:\reader:fixture-password@host.example.com/path`,
+      String.raw`https:\\reader:fixture-password@host.example.com/path`,
+      String.raw`source=\\reader:fixture-password@host.example.com/path`,
+      "https:reader:fixture-password@host.example.com/path",
+      String.raw`https:\host.example.com/path?code=private`,
+      String.raw`https:\host.example.com/path#private`,
+    ]
+  ) {
+    assertEquals(safeRemoteString(value), null);
+    const rows = parseLsCurrent(
+      JSON.stringify({
+        node: [{
+          version: "22",
+          installed: true,
+          active: true,
+          source: { path: value },
+        }],
+      }),
+    );
+    assertEquals(rows[0].sourcePath, null);
+    const m = await fakeMise({ stderr: `could not fetch ${value}`, exit: 1 });
+    try {
+      const c = mockCtx({
+        nodes: [{ name: "workstation", misePath: m.path }],
+        errorDetail: true,
+      });
+      await model.methods.discover.execute({}, c.ctx);
+      assertEquals(JSON.stringify(c.written).includes(value), false);
+      assertEquals(JSON.stringify(c.logs).includes(value), false);
+      assertEquals(
+        JSON.stringify(c.written).includes("fixture-password"),
+        false,
+      );
+      assertEquals(JSON.stringify(c.logs).includes("fixture-password"), false);
+    } finally {
+      await m.cleanup();
+    }
+  }
+  for (
+    const value of [
+      "reader@example.com",
+      "rust@1.2.3",
+      "task-unusually-long-tool-name",
+    ]
+  ) {
+    assertEquals(safeRemoteString(value), value);
+  }
+});
+
+Deno.test("invalid UTF-8 cannot collapse distinct tool identities into healthy data", async () => {
+  const dir = await Deno.makeTempDir();
+  const path = `${dir}/mise`;
+  try {
+    for (const byte of ["377", "376"]) {
+      await Deno.writeTextFile(
+        path,
+        `#!/bin/sh\nprintf '{"node\\${byte}":[{"version":"22","installed":true,"active":true}]}'\n`,
+      );
+      await Deno.chmod(path, 0o755);
+      const c = mockCtx({ nodes: [{ name: "workstation", misePath: path }] });
+      await model.methods.discover.execute({}, c.ctx);
+      const node = c.written.find((w) => w.spec === "node")!.data;
+      assertEquals(node.measured, false);
+      assertEquals(node.drift, ["unmeasured"]);
+      assertEquals(node.toolCount, null);
+      assertEquals(c.written.filter((w) => w.spec === "tool"), []);
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("a silent child ignoring SIGTERM cannot defeat caller cancellation", async () => {
+  const dir = await Deno.makeTempDir();
+  const path = `${dir}/mise`;
+  const ready = `${dir}/ready`;
+  await Deno.writeTextFile(
+    path,
+    `#!/bin/sh\ntrap '' TERM\nprintf '%s' "$$" > '${ready}'\nwhile :; do :; done\n`,
+  );
+  await Deno.chmod(path, 0o755);
+  const caller = new AbortController();
+  const run = runMise(
+    { name: "workstation", misePath: path },
+    SUB_LS,
+    15,
+    caller.signal,
+  );
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const started = Date.now();
+    let pid = 0;
+    while (Date.now() - started < 2000) {
+      try {
+        pid = Number(await Deno.readTextFile(ready));
+      } catch { /* waiting for our fixture */ }
+      if (pid > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assertEquals(pid > 0, true, "fixture must have installed its signal trap");
+    watchdog = setTimeout(() => {
+      try {
+        Deno.kill(pid, "SIGKILL");
+      } catch { /* exited */ }
+    }, 2000);
+    const abortedAt = Date.now();
+    caller.abort(new Error("test cancellation"));
+    await assertRejects(() => run, Error, "test cancellation");
+    assertEquals(
+      Date.now() - abortedAt < 1000,
+      true,
+      "must return before the cleanup watchdog",
+    );
+  } finally {
+    caller.abort();
+    if (watchdog !== undefined) clearTimeout(watchdog);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test("structured credential errors are withheld rather than copied into resources", async () => {
+  for (
+    const key of [
+      "password",
+      "token",
+      "cookie",
+      "authorization",
+      "api_key",
+      "pass\\u0077ord",
+    ]
+  ) {
+    const stderr = `request failed: {"${key}":"EXAMPLE_SECRET"}`;
+    const m = await fakeMise({ stderr, exit: 1 });
+    try {
+      const c = mockCtx({
+        nodes: [{ name: "workstation", misePath: m.path }],
+        errorDetail: true,
+      });
+      await model.methods.discover.execute({}, c.ctx);
+      const node = c.written.find((w) => w.spec === "node")!.data;
+      assertEquals(node.errorDetail, "[withheld: structured error text]");
+      assertEquals(JSON.stringify(c.written).includes("EXAMPLE_SECRET"), false);
+      assertEquals(JSON.stringify(c.logs).includes("EXAMPLE_SECRET"), false);
+    } finally {
+      await m.cleanup();
+    }
+  }
+  assertEquals(safeRemoteString('{"password":"EXAMPLE_SECRET"}'), null);
+});
+
+Deno.test("schemeless userinfo is withheld for aliases and international hostnames", () => {
+  for (const host of ["build_host", "例え.example", "[scoped-address%zone]"]) {
+    for (const value of [`reader@${host}:repo`, `//reader@${host}/repo`]) {
+      assertEquals(safeRemoteString(value), null);
+    }
+  }
+  assertEquals(safeRemoteString("reader@example.com"), "reader@example.com");
+});
+
+Deno.test("duplicate JSON members make probes unparseable instead of silently dropping facts", async () => {
+  for (const field of ["ls", "outdated"] as const) {
+    for (const key of ["node", "no\\u0064e"]) {
+      const value = field === "ls"
+        ? '[{"version":"22","installed":true,"active":true}]'
+        : '{"latest":"24"}';
+      const m = await fakeMiseSuite({
+        ls: LS_CURRENT_CLEAN,
+        [field]: `{"node":${value},"${key}":${value}}`,
+      });
+      try {
+        const c = mockCtx({
+          nodes: [{ name: "workstation", misePath: m.path }],
+        });
+        await model.methods.discover.execute({}, c.ctx);
+        const node = c.written.find((w) => w.spec === "node")!.data;
+        if (field === "ls") {
+          assertEquals(node.measured, false);
+          assertEquals(node.failureKind, "unparseable");
+          assertEquals(c.written.filter((w) => w.spec === "tool"), []);
+        } else {
+          assertEquals(node.measured, true);
+          assertEquals(node.degraded, true);
+          assertEquals(node.failedSubcommands, ["outdated"]);
+          assertEquals(
+            c.written.find((w) => w.spec === "tool")!.data.outdated,
+            null,
+          );
+        }
+      } finally {
+        await m.cleanup();
+      }
+    }
+  }
+  assertEquals(
+    parseLsCurrent('{"node":[{"version":"22","version":"24"}]}'),
+    [],
+  );
+  assertEquals(parseLsCurrent(LS_CURRENT_CLEAN).length, 1);
+  // Repeated names in distinct objects, and punctuation within string values,
+  // are not duplicates in the same object.
+  assertEquals(
+    parseLsCurrent(
+      JSON.stringify({
+        node: [{
+          version: "22",
+          installed: true,
+          active: true,
+          source: { type: 'a,}:"b' },
+        }],
+        go: [{ version: "1.2", installed: true, active: true }],
+      }),
+    ).length,
+    2,
+  );
+});
+
+Deno.test("missing local SSH transport does not claim remote mise is absent", async () => {
+  const path = Deno.env.get("PATH");
+  const empty = await Deno.makeTempDir();
+  try {
+    Deno.env.set("PATH", empty);
+    const c = mockCtx({
+      nodes: [{
+        name: "workstation",
+        ssh: { host: "host.example.com", user: "reader" },
+      }],
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const node = c.written.find((w) => w.spec === "node")!.data;
+    assertEquals(node.measured, false);
+    assertEquals(node.failureKind, "failed");
+    assertEquals(node.error, "transport-missing");
+  } finally {
+    if (path === undefined) Deno.env.delete("PATH");
+    else Deno.env.set("PATH", path);
+    await Deno.remove(empty);
+  }
+});
+
+Deno.test("error detail truncation never introduces an unpaired surrogate", async () => {
+  const m = await fakeMise({ stderr: "x".repeat(159) + "😀", exit: 1 });
+  try {
+    const c = mockCtx({
+      nodes: [{ name: "workstation", misePath: m.path }],
+      errorDetail: true,
+    });
+    await model.methods.discover.execute({}, c.ctx);
+    const detail = c.written.find((w) => w.spec === "node")!.data.errorDetail;
+    assertEquals(detail, "x".repeat(159));
+  } finally {
+    await m.cleanup();
+  }
+});
+
+Deno.test("unknown targeting arguments cannot start a sweep or prune stored records", async () => {
+  for (
+    const args of [
+      { node: undefined, nnode: "workstation" },
+      { errorDetail: false },
+      { nodes: [{ name: "other-host" }] },
+      { timeoutSec: 1 },
+      { maxConcurrency: 1 },
+      { expect: { node: "22" } },
+    ]
+  ) {
+    const c = mockCtx({ nodes: [{ name: "workstation" }], errorDetail: true }, {
+      existing: ["summary", "tool-removed-old"],
+    });
+    await assertRejects(() => model.methods.discover.execute(args, c.ctx));
+    assertEquals(c.written, []);
+    assertEquals(c.deleted, []);
+    assertEquals(c.logs, []);
+  }
+  // The platform first validates merged globals, stripping them from the
+  // node-only method schema; direct execute calls above remain fail-closed.
+  assertEquals(
+    model.methods.discover.arguments.parse({
+      nodes: [{ name: "workstation" }],
+      node: "workstation",
+    }),
+    { node: "workstation" },
+  );
+});
+
+Deno.test("duplicate trust paths never publish a last-wins trusted state", async () => {
+  for (
+    const trust of [
+      "/srv/project/mise.toml: trusted\n/srv/project/mise.toml: untrusted\n",
+      "/srv/project/mise.toml: untrusted\n/srv/project/mise.toml: trusted\n/srv/project/mise.toml: trusted\n",
+    ]
+  ) {
+    const m = await fakeMiseSuite({
+      ls: LS_CURRENT_CLEAN,
+      config: '[{"path":"/srv/project/mise.toml","tools":["node"]}]',
+      trust,
+    });
+    try {
+      const c = mockCtx({ nodes: [{ name: "workstation", misePath: m.path }] });
+      await model.methods.discover.execute({}, c.ctx);
+      const node = c.written.find((w) => w.spec === "node")!.data;
+      const config = c.written.find((w) => w.spec === "config")!.data;
+      assertEquals(node.degraded, true);
+      assertEquals(config.trusted, null);
+      assertEquals(config.degraded, true);
+    } finally {
+      await m.cleanup();
+    }
+  }
 });

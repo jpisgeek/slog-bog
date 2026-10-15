@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/mise"
-version: 2026.08.28.3
+version: 2026.10.14.1
 description: >
   Read-only sweep of mise toolchain state across a fleet. Records which tool
   versions each host is actually running and where that disagrees with the
@@ -10,7 +10,8 @@ description: >
   wades through the fleet and writes down what it finds, including which hosts
   refused to answer, because a host that could not be measured is not a host
   that is clean.
-repository: https://github.com/jpisgeek/slog-bog/tree/main/mise
+repository: https://github.com/jpisgeek/slog-bog/tree/extensions-2026.10.14.1/mise
+license: MIT
 paths:
   base: manifest
 models:

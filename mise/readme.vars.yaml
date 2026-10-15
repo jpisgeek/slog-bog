@@ -34,7 +34,9 @@ caveats: >-
   routinely missing from a non-login shell's PATH, and a zero tool count from a
   host that never ran mise is indistinguishable from a host that is genuinely
   clean. Set `misePath` when a host records `failureKind: notfound`, which is
-  mise missing from the PATH rather than a host missing from the network. A
+  mise missing from the PATH rather than a host missing from the network.
+  A missing local SSH executable instead records `failureKind: failed` with
+  `error: transport-missing`; repair the local transport, not remote mise. A
   host that exits zero and hands back something other than the JSON that
   `ls --current` promises records `failureKind: unparseable` and stays
   unmeasured, because that is the probe the whole reading rests on. The
@@ -63,7 +65,19 @@ caveats: >-
   host's contributing probe went unanswered. Zero is a fleet with no drift of
   that kind; null is a fleet where some of it was never measured.
   Tool rows carry the same flag as a `degraded` tag, so a query over
-  rows alone cannot mistake a partial sweep for a clean one.
+  rows alone can identify a partial sweep. Stored tool and config rows that
+  a failed sweep could not refresh are retained with `stale: true` in the
+  data and `stale: "true"`, `degraded: "true"` tags, including in a targeted
+  diagnostic. Their values are historical, not current measurements. Fresh
+  rows explicitly set `stale: false`. The `sweptAt` tag identifies the sweep
+  that assessed freshness; on a stale row it is not an observation timestamp.
+  Older stored rows missing the marker default to stale when parsed. Filter
+  for non-stale, non-degraded rows before interpreting health or drift.
+  Stored inventory is validated before any sweep data is written. An unsafe
+  name or malformed/unsafe retained row fails the run with a fixed error,
+  leaves the previous sweep unchanged, and is never quoted. Repair such legacy
+  content through the datastore's authorized interface before retrying; a
+  failed run is not evidence that its previous rows are current.
   mise config is directory-scoped, so `dir` decides which config is being
   judged. Leave it off and you measure the swamp working directory locally and
   the login directory over SSH, which is rarely the question you meant to ask.
@@ -88,13 +102,16 @@ caveats: >-
   disagree, because keeping a stale row is recoverable by the next sweep that
   can attribute it and deleting a live one is not. Dropping a host from `nodes`
   removes its node record along with its tool and config rows. A run limited
-  to one node with `--node` is a diagnostic and touches only that host. It
+  to one node with `--input node=workstation` is a diagnostic and touches only that host. It
   deletes nothing, and it does not write the `summary` either, because one
   host's totals under a fleet-wide name would read as the fleet. The standing
   summary keeps its own `sweptAt`, which is the honest way to see how old it
   is. Node, tool, and config resource names
   all carry a hash suffix, so find them with `swamp data list <model>` rather
-  than building the name by hand.
+  than building the name by hand. `node` is the only per-run method argument.
+  Set `nodes`, `timeoutSec`, `maxConcurrency`, `expect`, and `errorDetail` in
+  the model's global configuration; passing them as method overrides is rejected,
+  not silently ignored.
 security: >-
   Read-only throughout. The model runs `ls --current`, `config ls`, `outdated`,
   `trust --show`, and `version`, and nothing else. It never calls
@@ -136,33 +153,41 @@ security: >-
   closed. BatchMode alone would not do that: it removes the prompt but leaves
   the decision to ambient ssh_config, which can be set to accept a key it has
   never seen, and passing the policy as an argument beats any config file.
-  `ProxyCommand` and `PermitLocalCommand` are set on the command line for the
-  same reason and are the sharper case: both run a shell command, and ssh
-  expands `%h` and `%u` into them, so an operator config written for
-  interactive use would turn every value in the node list into local shell
-  input. `ControlMaster` and `ControlPath` go the same way and are the
-  sharpest of the group: with a multiplexing socket already open ssh hands
-  the session to the existing connection and consults none of these options,
-  so a connection opened earlier under a weaker host-key policy would carry
-  this one. One gap is left open and is worth naming rather than papering
-  over: `SendEnv` and `SetEnv` in the operator's own config can ship local
-  environment to a target, and the command line cannot clear them --
-  `-o SendEnv=-*` looks like it does and does not, because options are read
-  before config files and SendEnv accumulates. It takes a matching
-  `AcceptEnv` on the target to have any effect, and closing it locally would
-  mean `-F /dev/null` and the loss of the per-host `IdentityFile` and
-  `ProxyJump` settings a real fleet depends on. Keep secrets out of the
-  environment this runs in, which is where they should not be anyway.
-  input. The
+  SSH uses `-F /dev/null`, ignoring both user and system SSH configuration.
+  This prevents ambient `Match exec`, `KnownHostsCommand`, `SendEnv`, and
+  `SetEnv` from executing commands or sending environment values.
+  `KnownHostsCommand=none`, `ProxyCommand=none`, and
+  `PermitLocalCommand=no` are explicit as well. Host aliases and `ProxyJump`
+  are not supported: supply the real hostname, username, and port in `ssh`.
+  To select a non-default local key, set `ssh.identityFile` to an absolute
+  path containing only letters, digits, dot, dash, underscore, or slash.
+  The locator is sensitive: a stored Swamp definition must use a vault
+  expression for this field, not a literal path. Store the locator (not the
+  private key bytes) in your vault and use, for example,
+  `${{ vault.get('example-vault', 'YOUR_IDENTITY_FILE_ITEM') }}`. Swamp rejects literal
+  sensitive inputs and masks this field in model inspection.
+  Default key files and the local authentication agent may authenticate the
+  connection; the agent is never forwarded. Strict host-key checking still
+  uses the standard known-hosts files, so enroll the target key through your
+  approved procedure before collecting it. `UpdateHostKeys=no` prevents the
+  sweep from updating that trust store after authentication.
+  `ControlMaster=no` and `ControlPath=none` prevent reuse of an existing
+  connection that could have been opened under a weaker policy. The
   same reasoning applies to what the connection hands the host rather than what
   it trusts about it: `ForwardAgent`, `ForwardX11`, `ForwardX11Trusted` and
-  `ClearAllForwardings` are all set on the command line too. ssh inherits
-  ambient config, and a `ForwardAgent` in the operator's `~/.ssh/config` --
+  `ClearAllForwardings` are all set on the command line too. Without isolation,
+  a `ForwardAgent` in the operator's `~/.ssh/config` --
   perfectly ordinary to have there for hosts you use interactively -- would
   otherwise expose the authentication agent to every host this model sweeps.
   An agent socket on a remote box signs for the key it holds, which for a fleet
   key is every host that trusts it. A read-only inventory probe has no business
   offering that.
+  Unknown operator configuration keys and an empty targeted-node argument are
+  rejected, not replaced with defaults or a full-fleet sweep. Process output
+  must be valid UTF-8; invalid bytes fail the probe rather than collapsing
+  distinct inventory identities. Cancellation and deadlines force-kill the
+  local child and close its readers even when it ignores SIGTERM. This does
+  not promise termination of a command already running on a remote host.
   Errors never quote host output by default. stderr is read to classify a
   failure and then discarded; what is stored in `error` is one of a closed set
   of codes, `unparseable-output` among them for a host that exits zero without
@@ -173,7 +198,12 @@ security: >-
   whether a host answered at all. A host that answered and then lost a
   follow-up probe is degraded rather than unmeasured, and names that probe in
   `failedSubcommands` instead of storing its text, so `errorDetail` on such a
-  node is null even with the option on. It is off by default and should stay
+  node is null even with the option on. Unexpected internal exceptions and
+  local spawn errors never supply detail. Exact occurrences of the sensitive
+  SSH identity-file locator are removed from screened diagnostics before truncation.
+  Structured error fragments are
+  withheld rather than partially redacted, and oversized host errors are
+  withheld before screening. It is off by default and should stay
   off wherever the
   datastore is shared, because host error text routinely carries
   credential-bearing URLs, tokens, private hostnames and home paths. The trade

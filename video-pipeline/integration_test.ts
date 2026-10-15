@@ -1,5 +1,9 @@
 /** Execute the real adapter against a real, stdlib-only synthetic bridge. */
-import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import {
+  deepStrictEqual as assertEquals,
+  ok as assert,
+  rejects as assertRejects,
+} from "node:assert/strict";
 import { model } from "./video_pipeline.ts";
 
 type Context = Parameters<typeof model.methods.prepare.execute>[1];
@@ -45,6 +49,7 @@ async function fixture() {
       `${root}/${relative}`,
     );
   }
+  await Deno.mkdir(`${root}/deliveries/example`, { recursive: true });
   const receipts = new Map<string, Record<string, unknown>>();
   const context: Context = {
     globalArgs: {
@@ -131,7 +136,7 @@ Deno.test("synthetic bridge: an outside delivery destination creates no files", 
   );
   try {
     for (const stage of stages.slice(0, -1)) await example.run(stage);
-    example.context.globalArgs.deliveryFolders = [`${outside}/must-not-exist`];
+    example.context.globalArgs.deliveryFolders = [outside];
     await assertRejects(() => example.run("deliver"));
     assertEquals(await collect(outside), []);
     assertEquals(example.receipts.has("deliver"), false);
@@ -156,6 +161,55 @@ Deno.test("synthetic bridge: modified scene input invalidates the prepared hash"
     });
     await assertRejects(() => example.run("narrate"));
     assertEquals(example.receipts.has("narrate"), false);
+  } finally {
+    await example.close();
+  }
+});
+
+for (const stage of ["package", "verify"] as const) {
+  Deno.test(`synthetic bridge: ${stage} refuses narration changed after inspection`, async () => {
+    const example = await fixture();
+    try {
+      for (const prior of stages.slice(0, stages.indexOf(stage))) {
+        await example.run(prior);
+      }
+      const path = `${example.root}/example-output/v1/synthetic-narration.txt`;
+      const changed = await Deno.readFile(path);
+      changed[0] ^= 1;
+      await Deno.writeFile(path, changed);
+      await assertRejects(() => example.run(stage), /content changed/);
+      assertEquals(example.receipts.has(stage), false);
+    } finally {
+      await example.close();
+    }
+  });
+}
+
+Deno.test("delivery root aliases and noncanonical paths are rejected before bridge execution", async () => {
+  const example = await fixture();
+  try {
+    for (
+      const folder of [
+        "/",
+        "//",
+        "///",
+        `${example.root}//copies`,
+        `${example.root}/copies/`,
+        `${example.root}/hidden\u0085`,
+        `${example.root}/bidi\u202e`,
+      ]
+    ) {
+      example.context.globalArgs.deliveryFolders = [folder];
+      await assertRejects(() => example.run("prepare"));
+      assertEquals(example.receipts.size, 0);
+    }
+    await Deno.symlink("/", `${example.root}/root-alias`);
+    example.context.globalArgs.deliveryFolders = [`${example.root}/root-alias`];
+    await assertRejects(
+      () => example.run("prepare"),
+      /boundary validation failed/,
+    );
+    assertEquals(example.receipts.size, 0);
   } finally {
     await example.close();
   }

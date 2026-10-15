@@ -11,6 +11,9 @@
  */
 import { z } from "npm:zod@4";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { kill } from "node:process";
+import { Readable } from "node:stream";
 
 const stages = [
   "prepare",
@@ -29,8 +32,8 @@ const dependencies: Record<DependentStage, readonly Stage[]> = {
   narrate: ["prepare"],
   render: ["prepare", "narrate"],
   inspect: ["prepare", "narrate", "render"],
-  package: ["prepare", "inspect"],
-  verify: ["prepare", "inspect", "package"],
+  package: ["prepare", "narrate", "inspect"],
+  verify: ["prepare", "narrate", "inspect", "package"],
   deliver: ["prepare", "inspect", "verify"],
 };
 
@@ -39,17 +42,15 @@ const ReleaseSchema = z.string().regex(/^v[0-9]+$/);
 
 /** Accept explicit POSIX paths without traversal, control characters, or root. */
 function isAbsolutePath(value: string): boolean {
-  return value.startsWith("/") && value !== "/" &&
-    !Array.from(value).some((character) => {
-      const code = character.charCodeAt(0);
-      return code < 32 || code === 127;
-    }) &&
-    !value.split("/").some((part) => part === "." || part === "..");
+  return value.startsWith("/") && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value) &&
+    value.slice(1).split("/").every((part) =>
+      part !== "" && part !== "." && part !== ".."
+    );
 }
 
 const AbsolutePathSchema = z.string().refine(isAbsolutePath, {
   message:
-    "Use a non-root absolute POSIX path without traversal or control characters",
+    "Use a canonical non-root absolute POSIX path without traversal or control characters",
 });
 
 const GlobalArgsSchema = z.object({
@@ -60,9 +61,16 @@ const GlobalArgsSchema = z.object({
     "Trusted Python executable; inherits the operator environment",
   ),
   release: ReleaseSchema.describe("Numbered project release, such as v1"),
-  deliveryFolders: z.array(AbsolutePathSchema).describe(
-    "Explicit canonical folders permitted for delivery receipts",
-  ),
+  deliveryFolders: z.array(AbsolutePathSchema).refine(
+    (folders) =>
+      folders.every((folder, index) =>
+        !folders.some((other, otherIndex) =>
+          index !== otherIndex &&
+          (folder === other || folder.startsWith(`${other}/`))
+        )
+      ),
+    { message: "Delivery folders must be distinct and non-overlapping" },
+  ).describe("Explicit canonical folders permitted for delivery receipts"),
   timeoutSeconds: z.number().int().positive().max(2147483).default(600)
     .describe("Time limit for each bridge invocation"),
 }).strict();
@@ -142,6 +150,7 @@ async function checkBoundary(args: GlobalArgs): Promise<{
   root: string;
   bridge: string;
   python: string;
+  destinations: string[];
 }> {
   const root = await Deno.realPath(args.workspaceRoot);
   if (root === "/" || !(await Deno.stat(root)).isDirectory) {
@@ -157,7 +166,39 @@ async function checkBoundary(args: GlobalArgs): Promise<{
   ) {
     throw new Error("pythonBin must resolve to a regular executable file");
   }
-  return { root, bridge, python };
+  const destinations: string[] = [];
+  const ancestry: string[][] = [];
+  for (const folder of args.deliveryFolders) {
+    // Missing names cannot be distinguished from case/Unicode aliases until
+    // the filesystem creates them. Require pre-existing canonical directories.
+    const real = await Deno.realPath(folder);
+    if (real === "/" || real !== folder) {
+      throw new Error("Delivery folder must be canonical and non-root");
+    }
+    const identities: string[] = [];
+    let ancestor = folder;
+    while (true) {
+      const info = await Deno.stat(ancestor);
+      if (!info.isDirectory || info.dev === null || info.ino === null) {
+        throw new Error("Delivery directory identity is unavailable");
+      }
+      identities.push(`${info.dev}:${info.ino}`);
+      if (ancestor === "/") break;
+      ancestor = ancestor.slice(0, ancestor.lastIndexOf("/")) || "/";
+    }
+    destinations.push(real);
+    ancestry.push(identities);
+  }
+  if (
+    ancestry.some((parents, index) =>
+      ancestry.some((other, otherIndex) =>
+        index !== otherIndex && parents.includes(other[0])
+      )
+    )
+  ) {
+    throw new Error("Delivery directories must not alias or overlap");
+  }
+  return { root, bridge, python, destinations };
 }
 
 /** Reject traversal and symbolic links in an artifact or any of its ancestors. */
@@ -209,43 +250,53 @@ async function checkArtifacts(
     throw new Error("Receipt has unverified or inconsistent artifacts");
   }
   const seen = new Set<string>();
-  for (const artifact of receipt.artifacts) {
+  try {
+    for (const artifact of receipt.artifacts) {
+      signal.throwIfAborted();
+      if (seen.has(artifact.path)) {
+        throw new Error("Receipt repeats an artifact path");
+      }
+      seen.add(artifact.path);
+      const root = roots.find((candidate) =>
+        artifact.path.startsWith(`${candidate}/`)
+      );
+      if (!root) {
+        throw new Error("Artifact is outside its authorized directory");
+      }
+      const real = await checkedArtifactPath(root, artifact.path);
+      const file = await Deno.open(real, { read: true });
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile || stat.size !== artifact.bytes) {
+          throw new Error("Artifact size changed");
+        }
+        const hash = createHash("sha256");
+        const buffer = new Uint8Array(64 * 1024);
+        let total = 0;
+        while (true) {
+          signal.throwIfAborted();
+          const count = await file.read(buffer);
+          signal.throwIfAborted();
+          if (count === null) break;
+          total += count;
+          if (total > artifact.bytes) throw new Error("Artifact size changed");
+          hash.update(buffer.subarray(0, count));
+        }
+        if (total !== artifact.bytes) throw new Error("Artifact size changed");
+        if (hash.digest("hex") !== artifact.sha256) {
+          throw new Error("Artifact content changed");
+        }
+      } finally {
+        file.close();
+      }
+      await checkedArtifactPath(root, artifact.path);
+    }
+  } catch (error) {
     signal.throwIfAborted();
-    if (seen.has(artifact.path)) {
-      throw new Error("Receipt repeats an artifact path");
+    if (error instanceof Error && Object.hasOwn(Deno.errors, error.name)) {
+      throw new Error("Receipt artifact cannot be read or verified");
     }
-    seen.add(artifact.path);
-    const root = roots.find((candidate) =>
-      artifact.path.startsWith(`${candidate}/`)
-    );
-    if (!root) throw new Error("Artifact is outside its authorized directory");
-    const real = await checkedArtifactPath(root, artifact.path);
-    const file = await Deno.open(real, { read: true });
-    try {
-      const stat = await file.stat();
-      if (!stat.isFile || stat.size !== artifact.bytes) {
-        throw new Error("Artifact size changed");
-      }
-      const hash = createHash("sha256");
-      const buffer = new Uint8Array(64 * 1024);
-      let total = 0;
-      while (true) {
-        signal.throwIfAborted();
-        const count = await file.read(buffer);
-        signal.throwIfAborted();
-        if (count === null) break;
-        total += count;
-        if (total > artifact.bytes) throw new Error("Artifact size changed");
-        hash.update(buffer.subarray(0, count));
-      }
-      if (total !== artifact.bytes) throw new Error("Artifact size changed");
-      if (hash.digest("hex") !== artifact.sha256) {
-        throw new Error("Artifact content changed");
-      }
-    } finally {
-      file.close();
-    }
-    await checkedArtifactPath(root, artifact.path);
+    throw error;
   }
   signal.throwIfAborted();
 }
@@ -299,8 +350,31 @@ async function runStage(
       : stage === "deliver"
       ? DeliverArgsSchema.parse(args)
       : StepArgsSchema.parse(args);
-  const { root, bridge, python } = await checkBoundary(globals);
+  // Stage names remain stable for CEL consumers. Bind the instance to one
+  // immutable release/input pair instead of letting a new preparation replace
+  // the identity underneath its later receipts. Swamp serializes model runs.
+  const prepared = stage === "prepare"
+    ? await context.readResource("prepare")
+    : null;
+  const binding = prepared === null ? null : parseReceipt(prepared);
+  if (
+    binding &&
+    (binding.stage !== "prepare" || binding.release !== globals.release)
+  ) {
+    throw new Error(
+      "Prepared release is immutable; create a new model instance",
+    );
+  }
+  let boundary: Awaited<ReturnType<typeof checkBoundary>>;
+  try {
+    boundary = await checkBoundary(globals);
+  } catch {
+    context.signal.throwIfAborted();
+    throw new Error("Project bridge or executable boundary validation failed");
+  }
+  const { root, bridge, python, destinations } = boundary;
   const commandArgs = [bridge, stage, "--release", globals.release];
+  let verified: StageReceipt | undefined;
   if (stage !== "prepare") {
     for (const dependency of dependencies[stage]) {
       const receipt = await checkDependency(
@@ -318,6 +392,7 @@ async function runStage(
           "Requested delivery video hash differs from Swamp verification",
         );
       }
+      if (stage === "deliver" && dependency === "verify") verified = receipt;
     }
     commandArgs.push("--input-hash", methodArgs.inputHash!);
   }
@@ -328,7 +403,7 @@ async function runStage(
       );
     }
     commandArgs.push("--video-sha256", methodArgs.videoSha256!);
-    for (const destination of globals.deliveryFolders) {
+    for (const destination of destinations) {
       commandArgs.push("--destination", destination);
     }
   }
@@ -344,16 +419,93 @@ async function runStage(
     () => timeout.abort(),
     globals.timeoutSeconds * 1000,
   );
-  let result: Deno.CommandOutput;
+  const signal = AbortSignal.any([context.signal, timeout.signal]);
+  let result: Pick<Deno.CommandOutput, "success" | "code" | "stdout">;
+  let receiptTooLarge = false;
   try {
-    result = await new Deno.Command(python, {
-      args: commandArgs,
+    // Node's POSIX detached mode creates a process group atomically at spawn.
+    // Deno.Command has no equivalent: killing only Python can orphan renderers.
+    const child = spawn(python, commandArgs, {
       cwd: root,
-      stdin: "null",
-      stdout: "piped",
-      stderr: "piped",
-      signal: AbortSignal.any([context.signal, timeout.signal]),
-    }).output();
+      detached: true,
+      // Diagnostics are not receipt data and must not be buffered or exposed.
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const status = new Promise<{ success: boolean; code: number }>(
+      (resolve) => {
+        child.once("error", () => resolve({ success: false, code: -1 }));
+        child.once(
+          "exit",
+          (code) => resolve({ success: code === 0, code: code ?? -1 }),
+        );
+      },
+    );
+    if (child.pid === undefined || child.stdout === null) {
+      await status;
+      throw new Error("Bridge did not start");
+    }
+    const pid = child.pid;
+    const reader = Readable.toWeb(child.stdout).getReader();
+    let stopping: Promise<void> | undefined;
+    const stop = () => {
+      if (stopping) return;
+      const terminate = (signal: "SIGTERM" | "SIGKILL") => {
+        try {
+          kill(-pid, signal);
+        } catch {
+          // Also handles a child that failed before establishing its group.
+          try {
+            child.kill(signal);
+          } catch { /* Already exited. */ }
+        }
+      };
+      terminate("SIGTERM");
+      void reader.cancel().catch(() => {});
+      // Give bridge cleanup handlers a bounded chance, then stop resistant
+      // descendants even when their parent exited immediately on SIGTERM.
+      stopping = new Promise((resolve) => {
+        setTimeout(() => {
+          terminate("SIGKILL");
+          resolve();
+        }, 500);
+      });
+    };
+    signal.addEventListener("abort", stop, { once: true });
+    if (signal.aborted) stop();
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    let exit: Awaited<typeof status>;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > 4 * 1024 * 1024) {
+          receiptTooLarge = true;
+          stop();
+          break;
+        }
+        chunks.push(value);
+      }
+      exit = await status;
+    } catch (error) {
+      stop();
+      await status;
+      throw error;
+    } finally {
+      signal.removeEventListener("abort", stop);
+      await stopping;
+      await reader.cancel().catch(() => {});
+    }
+    const stdout = new Uint8Array(receiptTooLarge ? 0 : bytes);
+    let offset = 0;
+    if (!receiptTooLarge) {
+      for (const chunk of chunks) {
+        stdout.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+    }
+    result = { success: exit.success, code: exit.code, stdout };
   } catch {
     context.signal.throwIfAborted();
     if (timeout.signal.aborted) {
@@ -368,6 +520,9 @@ async function runStage(
   context.signal.throwIfAborted();
   if (timeout.signal.aborted) {
     throw new Error(`Video pipeline stage ${stage} timed out`);
+  }
+  if (receiptTooLarge) {
+    throw new Error("Bridge receipt exceeded the four-MiB output limit");
   }
   const decoder = new TextDecoder("utf-8", { fatal: true });
   if (!result.success) {
@@ -394,6 +549,11 @@ async function runStage(
   if (stage !== "prepare" && payload.inputHash !== methodArgs.inputHash) {
     throw new Error("Bridge receipt input hash does not match this invocation");
   }
+  if (binding && payload.inputHash !== binding.inputHash) {
+    throw new Error(
+      "Prepared inputs are immutable; create a new model instance",
+    );
+  }
   if (stage === "deliver" && payload.videoSha256 !== methodArgs.videoSha256) {
     throw new Error(
       "Delivery receipt video hash does not match the verified video",
@@ -413,10 +573,33 @@ async function runStage(
   ) {
     throw new Error("Recorded video hash must identify a receipt artifact");
   }
-  const outputRoots = stage === "deliver"
-    ? globals.deliveryFolders.map((folder) => folder.replace(/\/+$/, ""))
-    : [root];
+  const outputRoots = stage === "deliver" ? destinations : [root];
   await checkArtifacts(payload, outputRoots, context.signal);
+  if (stage === "deliver") {
+    for (const artifact of payload.artifacts) {
+      if (
+        !verified!.artifacts.some((prior) =>
+          prior.sha256 === artifact.sha256 && prior.bytes === artifact.bytes
+        )
+      ) {
+        throw new Error(
+          "Delivery contains an artifact absent from verification",
+        );
+      }
+    }
+    for (const destination of destinations) {
+      if (
+        !payload.artifacts.some((artifact) =>
+          artifact.path.startsWith(`${destination}/`) &&
+          artifact.sha256 === verified!.videoSha256
+        )
+      ) {
+        throw new Error(
+          "Delivery is missing a verified video copy at a destination",
+        );
+      }
+    }
+  }
 
   context.signal.throwIfAborted();
   const handle = await context.writeResource(stage, stage, payload);
@@ -457,7 +640,12 @@ function method(
 /** One operator-owned video project, with an auditable resource for every production stage. */
 export const model = {
   type: "@jpisgeek/video-pipeline",
-  version: "2026.09.04.1",
+  version: "2026.10.14.1",
+  upgrades: [{
+    toVersion: "2026.10.14.1",
+    description: "Registry release; existing project arguments are unchanged",
+    upgradeAttributes: (attributes: Record<string, unknown>) => attributes,
+  }],
   globalArguments: GlobalArgsSchema,
   checks: {
     "project-boundary": {

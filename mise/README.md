@@ -9,8 +9,8 @@ declared in a config that never took, or simply behind. Installs nothing and
 upgrades nothing. mise already does that job. This one wades through the fleet,
 writes down what it finds, and leaves the acting to whatever workflow wants it.
 
-**Version** `2026.08.28.3` · **License** MIT · **Source**
-https://github.com/jpisgeek/slog-bog/tree/main/mise
+**Version** `2026.10.14.1` · **License** MIT · **Source**
+https://github.com/jpisgeek/slog-bog/tree/extensions-2026.10.14.1/mise
 
 ## Install
 
@@ -22,20 +22,21 @@ swamp extension pull @jpisgeek/mise
 
 ### Arguments
 
-| argument           | type            | required | default  | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ------------------ | --------------- | -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `nodes`            | array of object | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `nodes[].name`     | string          | yes      |          | Label for this host in the written data                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `nodes[].ssh`      | object          | no       |          | Reach this host over SSH. Omit for the machine swamp is running on.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `nodes[].ssh.host` | string          | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `nodes[].ssh.user` | string          | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `nodes[].ssh.port` | integer         | no       | `22`     |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `nodes[].dir`      | string          | no       |          | Which directory's config to evaluate. mise config is directory-scoped, so without this the question has no fixed answer. Defaults to the swamp working directory locally and the login directory over SSH.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `nodes[].misePath` | string          | no       | `"mise"` | Path to the mise binary. Worth setting for SSH hosts: a non-login shell often has no ~/.local/bin on PATH, and mise lives there.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `timeoutSec`       | integer         | no       | `15`     |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `maxConcurrency`   | integer         | no       | `8`      | How many hosts to poll at once. A long nodes list otherwise spawns an unbounded pile of ssh processes at the same time.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `expect`           | object          | no       | `{}`     | Optional fleet-wide expectation, e.g. {node: '22'}. A version matches when its dot-separated segments start with these, so '22' accepts 22.23.2 but '22.2' does not. It can only police tools a host's own config declares. A tool no config on that host mentions produces no record for that host at all, so expect never flags it and its absence is not visible in the drift counts. Omit it and each host is judged only against its own config.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `errorDetail`      | boolean         | no       | `false`  | Store a bounded excerpt of an UNMEASURED host's own error text alongside the classification code, for diagnosis. Only the probe that decides whether a host was measured at all carries text here: a host that answered and then had a follow-up probe fail is degraded, and names the probe in failedSubcommands rather than storing its text. OFF by default, and it should stay off wherever the datastore is not fully trusted: host error text routinely carries credential-bearing URLs, tokens, private hostnames and home paths, and resource data is durable and readable. The trade is real -- with this off a novel failure classifies as 'unclassified' and you lose the detail that would explain it. Turn it on for a private fleet whose datastore you own and need to debug; leave it off for anything shared. The classification code is written either way; this only adds a second field beside it. |
+| argument                   | type            | required | default  | description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------------- | --------------- | -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `nodes`                    | array of object | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `nodes[].name`             | string          | yes      |          | Label for this host in the written data                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `nodes[].ssh`              | object          | no       |          | Reach this host over SSH. Omit for the machine swamp is running on.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `nodes[].ssh.host`         | string          | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `nodes[].ssh.user`         | string          | yes      |          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `nodes[].ssh.port`         | integer         | no       | `22`     |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `nodes[].ssh.identityFile` | string          | no       |          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `nodes[].dir`              | string          | no       |          | Which directory's config to evaluate. mise config is directory-scoped, so without this the question has no fixed answer. Defaults to the swamp working directory locally and the login directory over SSH.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `nodes[].misePath`         | string          | no       | `"mise"` | Path to the mise binary. Worth setting for SSH hosts: a non-login shell often has no ~/.local/bin on PATH, and mise lives there.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `timeoutSec`               | integer         | no       | `15`     |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `maxConcurrency`           | integer         | no       | `8`      | How many hosts to poll at once. A long nodes list otherwise spawns an unbounded pile of ssh processes at the same time.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `expect`                   | object          | no       | `{}`     | Optional fleet-wide expectation, e.g. {node: '22'}. A version matches when its dot-separated segments start with these, so '22' accepts 22.23.2 but '22.2' does not. It can only police tools a host's own config declares. A tool no config on that host mentions produces no record for that host at all, so expect never flags it and its absence is not visible in the drift counts. Omit it and each host is judged only against its own config.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `errorDetail`              | boolean         | no       | `false`  | Store a bounded excerpt of an UNMEASURED host's own error text alongside the classification code, for diagnosis. Only the probe that decides whether a host was measured at all carries text here: a host that answered and then had a follow-up probe fail is degraded, and names the probe in failedSubcommands rather than storing its text. OFF by default, and it should stay off wherever the datastore is not fully trusted: host error text routinely carries credential-bearing URLs, tokens, private hostnames and home paths, and resource data is durable and readable. The trade is real -- with this off a novel failure classifies as 'unclassified' and you lose the detail that would explain it. Turn it on for a private fleet whose datastore you own and need to debug; leave it off for anything shared. The classification code is written either way; this only adds a second field beside it. |
 
 ### Methods
 
@@ -59,8 +60,8 @@ the fleet summary from one host's worth of data.
 | resource  | lifetime | fields                                                                                                                                                                               | description                                                                                                                                                                                                                                                                                                                    |
 | --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `node`    | infinite | `name`, `measured`, `degraded`, `failedSubcommands`, `droppedEntries`, `failureKind`, `transport`, `error`, `errorDetail`, `miseVersion`, `dir`, `configCount`, `toolCount`, `drift` | One record per host: whether mise answered at all, whether it answered in full, which directory the reading came from, and how much drift was found there. A null dir is either an ssh node with no dir set, where the reading comes from wherever the login lands, or a local node whose working directory could not be read. |
-| `tool`    | infinite | `node`, `tool`, `requestedVersion`, `resolvedVersion`, `installPath`, `sourceType`, `sourcePath`, `installed`, `active`, `outdated`, `latestVersion`, `drift`                        | One record per tool per host: what the config asked for, what the host resolved it to, and whether it is installed, active, or behind.                                                                                                                                                                                         |
-| `config`  | infinite | `node`, `degraded`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                                          | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                                                                                                                                                                                                                     |
+| `tool`    | infinite | `node`, `stale`, `tool`, `requestedVersion`, `resolvedVersion`, `installPath`, `sourceType`, `sourcePath`, `installed`, `active`, `outdated`, `latestVersion`, `drift`               | One record per tool per host: what the config asked for, what the host resolved it to, and whether it is installed, active, or behind.                                                                                                                                                                                         |
+| `config`  | infinite | `node`, `stale`, `degraded`, `path`, `trusted`, `toolsDeclared`, `toolsInEffect`, `toolsNotInEffect`                                                                                 | One record per mise config file in scope, with the tools it declares and the tools that never took effect.                                                                                                                                                                                                                     |
 | `summary` | infinite | `nodes`, `nodesMeasured`, `nodesUnmeasured`, `nodesDegraded`, `tools`, `notinstalled`, `notactive`, `configsNotInEffect`, `outdated`, `expected`, `sweptAt`                          | Fleet totals for the most recent sweep.                                                                                                                                                                                                                                                                                        |
 
 ## Example
@@ -93,8 +94,10 @@ rather than dropping to zero. This matters more than it sounds: mise is
 routinely missing from a non-login shell's PATH, and a zero tool count from a
 host that never ran mise is indistinguishable from a host that is genuinely
 clean. Set `misePath` when a host records `failureKind: notfound`, which is mise
-missing from the PATH rather than a host missing from the network. A host that
-exits zero and hands back something other than the JSON that `ls --current`
+missing from the PATH rather than a host missing from the network. A missing
+local SSH executable instead records `failureKind: failed` with
+`error: transport-missing`; repair the local transport, not remote mise. A host
+that exits zero and hands back something other than the JSON that `ls --current`
 promises records `failureKind: unparseable` and stays unmeasured, because that
 is the probe the whole reading rests on. The follow-up subcommands are judged
 the same way but cost less: a wrong shape from `config ls` or `outdated`, a
@@ -119,36 +122,50 @@ add up totals it cannot stand behind: `outdated` and `configsNotInEffect` are
 null, not zero, whenever any host's contributing probe went unanswered. Zero is
 a fleet with no drift of that kind; null is a fleet where some of it was never
 measured. Tool rows carry the same flag as a `degraded` tag, so a query over
-rows alone cannot mistake a partial sweep for a clean one. mise config is
-directory-scoped, so `dir` decides which config is being judged. Leave it off
-and you measure the swamp working directory locally and the login directory over
-SSH, which is rarely the question you meant to ask. The node record's `dir`
-field names the directory the reading actually came from, so what a sweep judged
-is never left to guesswork. It is null in two cases: an ssh node with no `dir`
-set, where the reading comes from wherever the login lands, and a local node
-whose working directory could not be read, which is what a deleted working
-directory looks like. Trust is recorded but never treated as drift. A plain
-`[tools]` file reports as untrusted while applying perfectly, because mise only
-demands trust for configs that can execute something. `expect` can only police
-tools a host's own config declares. Hold the fleet to `{node: "22"}` and a host
-whose config never mentions node records no `expected` drift at all, which is
-not the same as passing. A tool no config on that host declares produces no
-record for that host at all, so its absence is invisible in the drift counts
-rather than surfacing under some other class. To hold a host to a tool, the tool
-has to be in that host's config. A full sweep deletes every stored record it did
-not write that time, with one exception worth knowing: a record is attributed to
-a host by the readable half of its name, and two host labels that normalize
-alike leave that attribution ambiguous. Such a record is deleted when every
-candidate host answered and held when they disagree, because keeping a stale row
-is recoverable by the next sweep that can attribute it and deleting a live one
-is not. Dropping a host from `nodes` removes its node record along with its tool
-and config rows. A run limited to one node with `--node` is a diagnostic and
-touches only that host. It deletes nothing, and it does not write the `summary`
-either, because one host's totals under a fleet-wide name would read as the
-fleet. The standing summary keeps its own `sweptAt`, which is the honest way to
-see how old it is. Node, tool, and config resource names all carry a hash
-suffix, so find them with `swamp data list <model>` rather than building the
-name by hand.
+rows alone can identify a partial sweep. Stored tool and config rows that a
+failed sweep could not refresh are retained with `stale: true` in the data and
+`stale: "true"`, `degraded: "true"` tags, including in a targeted diagnostic.
+Their values are historical, not current measurements. Fresh rows explicitly set
+`stale: false`. The `sweptAt` tag identifies the sweep that assessed freshness;
+on a stale row it is not an observation timestamp. Older stored rows missing the
+marker default to stale when parsed. Filter for non-stale, non-degraded rows
+before interpreting health or drift. Stored inventory is validated before any
+sweep data is written. An unsafe name or malformed/unsafe retained row fails the
+run with a fixed error, leaves the previous sweep unchanged, and is never
+quoted. Repair such legacy content through the datastore's authorized interface
+before retrying; a failed run is not evidence that its previous rows are
+current. mise config is directory-scoped, so `dir` decides which config is being
+judged. Leave it off and you measure the swamp working directory locally and the
+login directory over SSH, which is rarely the question you meant to ask. The
+node record's `dir` field names the directory the reading actually came from, so
+what a sweep judged is never left to guesswork. It is null in two cases: an ssh
+node with no `dir` set, where the reading comes from wherever the login lands,
+and a local node whose working directory could not be read, which is what a
+deleted working directory looks like. Trust is recorded but never treated as
+drift. A plain `[tools]` file reports as untrusted while applying perfectly,
+because mise only demands trust for configs that can execute something. `expect`
+can only police tools a host's own config declares. Hold the fleet to
+`{node: "22"}` and a host whose config never mentions node records no `expected`
+drift at all, which is not the same as passing. A tool no config on that host
+declares produces no record for that host at all, so its absence is invisible in
+the drift counts rather than surfacing under some other class. To hold a host to
+a tool, the tool has to be in that host's config. A full sweep deletes every
+stored record it did not write that time, with one exception worth knowing: a
+record is attributed to a host by the readable half of its name, and two host
+labels that normalize alike leave that attribution ambiguous. Such a record is
+deleted when every candidate host answered and held when they disagree, because
+keeping a stale row is recoverable by the next sweep that can attribute it and
+deleting a live one is not. Dropping a host from `nodes` removes its node record
+along with its tool and config rows. A run limited to one node with
+`--input node=workstation` is a diagnostic and touches only that host. It
+deletes nothing, and it does not write the `summary` either, because one host's
+totals under a fleet-wide name would read as the fleet. The standing summary
+keeps its own `sweptAt`, which is the honest way to see how old it is. Node,
+tool, and config resource names all carry a hash suffix, so find them with
+`swamp data list <model>` rather than building the name by hand. `node` is the
+only per-run method argument. Set `nodes`, `timeoutSec`, `maxConcurrency`,
+`expect`, and `errorDetail` in the model's global configuration; passing them as
+method overrides is rejected, not silently ignored.
 
 ## Security
 
@@ -185,63 +202,75 @@ being handed to a terminal. SSH passes both `BatchMode=yes` and
 `StrictHostKeyChecking=yes` on the command line, so an unknown host key fails
 closed. BatchMode alone would not do that: it removes the prompt but leaves the
 decision to ambient ssh_config, which can be set to accept a key it has never
-seen, and passing the policy as an argument beats any config file.
-`ProxyCommand` and `PermitLocalCommand` are set on the command line for the same
-reason and are the sharper case: both run a shell command, and ssh expands `%h`
-and `%u` into them, so an operator config written for interactive use would turn
-every value in the node list into local shell input. `ControlMaster` and
-`ControlPath` go the same way and are the sharpest of the group: with a
-multiplexing socket already open ssh hands the session to the existing
-connection and consults none of these options, so a connection opened earlier
-under a weaker host-key policy would carry this one. One gap is left open and is
-worth naming rather than papering over: `SendEnv` and `SetEnv` in the operator's
-own config can ship local environment to a target, and the command line cannot
-clear them -- `-o SendEnv=-*` looks like it does and does not, because options
-are read before config files and SendEnv accumulates. It takes a matching
-`AcceptEnv` on the target to have any effect, and closing it locally would mean
-`-F /dev/null` and the loss of the per-host `IdentityFile` and `ProxyJump`
-settings a real fleet depends on. Keep secrets out of the environment this runs
-in, which is where they should not be anyway. input. The same reasoning applies
-to what the connection hands the host rather than what it trusts about it:
-`ForwardAgent`, `ForwardX11`, `ForwardX11Trusted` and `ClearAllForwardings` are
-all set on the command line too. ssh inherits ambient config, and a
-`ForwardAgent` in the operator's `~/.ssh/config` -- perfectly ordinary to have
-there for hosts you use interactively -- would otherwise expose the
-authentication agent to every host this model sweeps. An agent socket on a
-remote box signs for the key it holds, which for a fleet key is every host that
-trusts it. A read-only inventory probe has no business offering that. Errors
-never quote host output by default. stderr is read to classify a failure and
-then discarded; what is stored in `error` is one of a closed set of codes,
-`unparseable-output` among them for a host that exits zero without the JSON its
-subcommand promises. The `errorDetail` option turns that off and stores a
-bounded excerpt of the host's own text beside the code, for a private fleet
-whose datastore you own and need to debug. It covers unmeasured hosts only --
-the probe that decides whether a host answered at all. A host that answered and
-then lost a follow-up probe is degraded rather than unmeasured, and names that
-probe in `failedSubcommands` instead of storing its text, so `errorDetail` on
-such a node is null even with the option on. It is off by default and should
-stay off wherever the datastore is shared, because host error text routinely
-carries credential-bearing URLs, tokens, private hostnames and home paths. The
-trade is real either way: with it off, a failure nobody wrote a pattern for
-reads as `unclassified` and the detail that would explain it is gone. Quoting
-even a truncated excerpt would publish whatever the host happened to print,
-which routinely includes URLs carrying credentials. Written data: host labels,
-the measured directory, mise version, tool names and versions, install paths,
-tool source types and source paths, and config file paths. Install and config
-paths embed the remote account's home directory and real project directory
-names. A source path is whatever registry or repository a tool came from, so it
-can name a private repository URL, an internal domain, Some of it also appears
-in readable form outside the resource data itself, and it is worth knowing
-exactly which: resource NAMES carry the host label, the tool name, and the
-config path; TAGS carry the host label, the tool name, the transport, and the
-measured, degraded and drift states. Install paths, source paths and versions
-appear in the data only. Credential-bearing values are withheld before any of
-that: a source or install URL carrying a username, a password, a query or a
-fragment is dropped rather than redacted, and a tool name or config path that
-screens the same way takes its whole entry with it. Screening is a set of shape
-rules, not a proof -- it catches the forms a credential usually takes, and a
-secret shaped like an ordinary path will pass. What remains is infrastructure
-detail regardless. Treat the datastore, and the sweep logs alongside it, as
+seen, and passing the policy as an argument beats any config file. SSH uses
+`-F /dev/null`, ignoring both user and system SSH configuration. This prevents
+ambient `Match exec`, `KnownHostsCommand`, `SendEnv`, and `SetEnv` from
+executing commands or sending environment values. `KnownHostsCommand=none`,
+`ProxyCommand=none`, and `PermitLocalCommand=no` are explicit as well. Host
+aliases and `ProxyJump` are not supported: supply the real hostname, username,
+and port in `ssh`. To select a non-default local key, set `ssh.identityFile` to
+an absolute path containing only letters, digits, dot, dash, underscore, or
+slash. The locator is sensitive: a stored Swamp definition must use a vault
+expression for this field, not a literal path. Store the locator (not the
+private key bytes) in your vault and use, for example,
+`${{ vault.get('example-vault', 'YOUR_IDENTITY_FILE_ITEM') }}`. Swamp rejects
+literal sensitive inputs and masks this field in model inspection. Default key
+files and the local authentication agent may authenticate the connection; the
+agent is never forwarded. Strict host-key checking still uses the standard
+known-hosts files, so enroll the target key through your approved procedure
+before collecting it. `UpdateHostKeys=no` prevents the sweep from updating that
+trust store after authentication. `ControlMaster=no` and `ControlPath=none`
+prevent reuse of an existing connection that could have been opened under a
+weaker policy. The same reasoning applies to what the connection hands the host
+rather than what it trusts about it: `ForwardAgent`, `ForwardX11`,
+`ForwardX11Trusted` and `ClearAllForwardings` are all set on the command line
+too. Without isolation, a `ForwardAgent` in the operator's `~/.ssh/config` --
+perfectly ordinary to have there for hosts you use interactively -- would
+otherwise expose the authentication agent to every host this model sweeps. An
+agent socket on a remote box signs for the key it holds, which for a fleet key
+is every host that trusts it. A read-only inventory probe has no business
+offering that. Unknown operator configuration keys and an empty targeted-node
+argument are rejected, not replaced with defaults or a full-fleet sweep. Process
+output must be valid UTF-8; invalid bytes fail the probe rather than collapsing
+distinct inventory identities. Cancellation and deadlines force-kill the local
+child and close its readers even when it ignores SIGTERM. This does not promise
+termination of a command already running on a remote host. Errors never quote
+host output by default. stderr is read to classify a failure and then discarded;
+what is stored in `error` is one of a closed set of codes, `unparseable-output`
+among them for a host that exits zero without the JSON its subcommand promises.
+The `errorDetail` option turns that off and stores a bounded excerpt of the
+host's own text beside the code, for a private fleet whose datastore you own and
+need to debug. It covers unmeasured hosts only -- the probe that decides whether
+a host answered at all. A host that answered and then lost a follow-up probe is
+degraded rather than unmeasured, and names that probe in `failedSubcommands`
+instead of storing its text, so `errorDetail` on such a node is null even with
+the option on. Unexpected internal exceptions and local spawn errors never
+supply detail. Exact occurrences of the sensitive SSH identity-file locator are
+removed from screened diagnostics before truncation. Structured error fragments
+are withheld rather than partially redacted, and oversized host errors are
+withheld before screening. It is off by default and should stay off wherever the
+datastore is shared, because host error text routinely carries
+credential-bearing URLs, tokens, private hostnames and home paths. The trade is
+real either way: with it off, a failure nobody wrote a pattern for reads as
+`unclassified` and the detail that would explain it is gone. Quoting even a
+truncated excerpt would publish whatever the host happened to print, which
+routinely includes URLs carrying credentials. Written data: host labels, the
+measured directory, mise version, tool names and versions, install paths, tool
+source types and source paths, and config file paths. Install and config paths
+embed the remote account's home directory and real project directory names. A
+source path is whatever registry or repository a tool came from, so it can name
+a private repository URL, an internal domain, Some of it also appears in
+readable form outside the resource data itself, and it is worth knowing exactly
+which: resource NAMES carry the host label, the tool name, and the config path;
+TAGS carry the host label, the tool name, the transport, and the measured,
+degraded and drift states. Install paths, source paths and versions appear in
+the data only. Credential-bearing values are withheld before any of that: a
+source or install URL carrying a username, a password, a query or a fragment is
+dropped rather than redacted, and a tool name or config path that screens the
+same way takes its whole entry with it. Screening is a set of shape rules, not a
+proof -- it catches the forms a credential usually takes, and a secret shaped
+like an ordinary path will pass. What remains is infrastructure detail
+regardless. Treat the datastore, and the sweep logs alongside it, as
 infrastructure-sensitive.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)

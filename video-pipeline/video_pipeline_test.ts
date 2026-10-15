@@ -3,6 +3,7 @@ import { model } from "./video_pipeline.ts";
 const inputHash = "a".repeat(64);
 const otherHash = "b".repeat(64);
 const decoder = new TextDecoder();
+// swamp-quality-ignore deno-command: Locate installed Python for disposable fixture tests with a fixed, non-mutating interpreter query.
 const pythonLookup = await new Deno.Command("python3", {
   args: ["-c", "import sys; print(sys.executable)"],
   stdout: "piped",
@@ -300,15 +301,19 @@ Deno.test("cancelling an active bridge prevents a receipt", async () => {
   const f = await fixture();
   try {
     await f.writeBridge(
-      `from pathlib import Path\nimport time\nPath(${
+      `from pathlib import Path\nimport time, signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nPath(${
         JSON.stringify(f.marker)
-      }).write_text("started")\ntime.sleep(30)\n`,
+      }).write_text("started")\ntime.sleep(3)\n`,
     );
     const running = model.methods.narrate.execute({ inputHash }, f.context);
     const rejectedRun = rejected(() => running, "Abort");
     await waitForFile(f.marker);
+    const abortedAt = Date.now();
     f.controller.abort();
     await rejectedRun;
+    if (Date.now() - abortedAt >= 2000) {
+      throw new Error("Cancellation did not stop a SIGTERM-resistant bridge");
+    }
     if (f.writes.length) throw new Error("Persisted cancelled stage");
   } finally {
     f.controller.abort();
@@ -320,16 +325,79 @@ Deno.test("bridge timeout prevents a receipt", async () => {
   const f = await fixture();
   try {
     f.context.globalArgs.timeoutSeconds = 1;
-    await f.writeBridge("import time\ntime.sleep(30)\n");
+    await f.writeBridge(
+      "import time, signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(3)\n",
+    );
+    const started = Date.now();
     await rejected(
       () => model.methods.narrate.execute({ inputHash }, f.context),
       "timed out",
     );
+    if (Date.now() - started >= 2500) {
+      throw new Error("Deadline did not stop a SIGTERM-resistant bridge");
+    }
     if (f.writes.length) throw new Error("Persisted timed out stage");
   } finally {
     await f.close();
   }
 });
+
+for (const mode of ["cancellation", "timeout", "overflow"] as const) {
+  Deno.test(`${mode} stops a resistant renderer descendant`, async () => {
+    const f = await fixture();
+    const escaped = `${f.root}/escaped`;
+    try {
+      // The descendant deliberately ignores TERM and closes inherited pipes.
+      // Killing only its Python parent therefore cannot stop this write.
+      const renderer = `from pathlib import Path
+import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(${JSON.stringify(f.marker)}).write_text("ready")
+time.sleep(2)
+Path(${JSON.stringify(escaped)}).write_text("orphan survived")
+`;
+      await f.writeBridge(`import subprocess, sys, time
+from pathlib import Path
+subprocess.Popen([sys.executable, "-c", ${
+        JSON.stringify(renderer)
+      }], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+while not Path(${JSON.stringify(f.marker)}).exists():
+    time.sleep(0.01)
+${
+        mode === "overflow"
+          ? 'sys.stdout.write("x" * (4 * 1024 * 1024 + 1)); sys.stdout.flush()'
+          : ""
+      }
+time.sleep(60)
+`);
+      if (mode === "timeout") f.context.globalArgs.timeoutSeconds = 1;
+      const running = model.methods.narrate.execute({ inputHash }, f.context);
+      const failure = rejected(
+        () => running,
+        mode === "cancellation"
+          ? "Abort"
+          : mode === "timeout"
+          ? "timed out"
+          : "four-MiB output limit",
+      );
+      await waitForFile(f.marker);
+      if (mode === "cancellation") f.controller.abort();
+      await failure;
+      await new Promise((resolve) => setTimeout(resolve, 2200));
+      try {
+        await Deno.stat(escaped);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+        if (f.writes.length) throw new Error("Persisted failed stage");
+        return;
+      }
+      throw new Error("Renderer descendant survived termination");
+    } finally {
+      f.controller.abort();
+      await f.close();
+    }
+  });
+}
 
 Deno.test("render receipt must identify an actual artifact as its video", async () => {
   const f = await fixture();
@@ -419,3 +487,229 @@ for (const tamper of [false, true]) {
     },
   );
 }
+
+Deno.test("missing artifact errors do not reveal project paths or write receipts", async () => {
+  const f = await fixture();
+  try {
+    await Deno.remove(f.artifact);
+    const error = await rejected(
+      () => model.methods.narrate.execute({ inputHash }, f.context),
+      "Receipt artifact cannot be read or verified",
+    );
+    if (error.includes(f.root)) {
+      throw new Error("Project path escaped into an error");
+    }
+    if (f.writes.length) {
+      throw new Error("Persisted a missing artifact receipt");
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("missing bridge errors do not reveal project paths or write receipts", async () => {
+  const f = await fixture();
+  try {
+    await Deno.remove(`${f.root}/build/swamp-step.py`);
+    const error = await rejected(
+      () => model.methods.prepare.execute({}, f.context),
+      "Project bridge or executable boundary validation failed",
+    );
+    if (error.includes(f.root)) {
+      throw new Error("Project path escaped into an error");
+    }
+    if (f.writes.length) throw new Error("Persisted a missing bridge receipt");
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("oversized receipt output is refused without publishing or waiting for timeout", async () => {
+  const f = await fixture();
+  try {
+    await f.writeBridge(
+      "import sys\nsys.stdout.write('x' * (4 * 1024 * 1024 + 1))\n",
+    );
+    const started = Date.now();
+    await rejected(
+      () => model.methods.narrate.execute({ inputHash }, f.context),
+      "Bridge receipt exceeded the four-MiB output limit",
+    );
+    if (Date.now() - started >= 5000) {
+      throw new Error("Receipt cap did not stop collection promptly");
+    }
+    if (f.writes.length) throw new Error("Persisted an oversized receipt");
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test("preparation keeps one immutable release/input binding per instance", async () => {
+  const f = await fixture();
+  try {
+    f.output.stage = "prepare";
+    await f.writeBridge();
+    await model.methods.prepare.execute({}, f.context);
+    if (f.writes.length !== 1) {
+      throw new Error("Same-input preparation must be repeatable");
+    }
+    f.output.inputHash = otherHash;
+    await f.writeBridge();
+    await rejected(
+      () => model.methods.prepare.execute({}, f.context),
+      "Prepared inputs are immutable",
+    );
+    if (f.writes.length !== 1) {
+      throw new Error("Changed inputs replaced a prepared receipt");
+    }
+    f.context.globalArgs.release = "v2";
+    await rejected(
+      () => model.methods.prepare.execute({}, f.context),
+      "Prepared release is immutable",
+    );
+    if (f.writes.length !== 1) {
+      throw new Error("Changed release replaced a prepared receipt");
+    }
+  } finally {
+    await f.close();
+  }
+
+  const fresh = await fixture();
+  try {
+    fresh.context.readResource = () => Promise.resolve(null);
+    fresh.output.stage = "prepare";
+    fresh.output.inputHash = otherHash;
+    await fresh.writeBridge();
+    await model.methods.prepare.execute({}, fresh.context);
+    if (fresh.writes.length !== 1) {
+      throw new Error("A new instance must accept its own input binding");
+    }
+  } finally {
+    await fresh.close();
+  }
+});
+
+for (
+  const mode of [
+    "missing-first",
+    "missing-second",
+    "wrong",
+    "extra",
+    "complete",
+  ]
+) {
+  Deno.test(`delivery requires verified video bytes in every destination: ${mode}`, async () => {
+    const f = await fixture();
+    try {
+      const roots = [`${f.root}/copies-a`, `${f.root}/copies-b`];
+      for (const root of roots) await Deno.mkdir(root);
+      f.context.globalArgs.deliveryFolders = roots;
+      const videoSha256 = f.receipt.artifacts[0].sha256;
+      f.context.readResource = (name) =>
+        Promise.resolve({ ...f.receipt, stage: name, videoSha256 });
+      f.output.stage = "deliver";
+      f.output.videoSha256 = videoSha256;
+      f.output.artifacts = [];
+      for (const [index, root] of roots.entries()) {
+        if (
+          (mode === "missing-first" && index === 0) ||
+          (mode === "missing-second" && index === 1)
+        ) continue;
+        const text = mode === "wrong" && index === 1 ? "omega" : "alpha";
+        const bytes = new TextEncoder().encode(text);
+        const digest = new Uint8Array(
+          await crypto.subtle.digest("SHA-256", bytes),
+        );
+        const path = `${root}/video.txt`;
+        await Deno.writeFile(path, bytes);
+        f.output.artifacts.push({
+          path,
+          bytes: bytes.length,
+          sha256: Array.from(digest, (b) => b.toString(16).padStart(2, "0"))
+            .join(""),
+        });
+      }
+      if (mode === "extra") {
+        const bytes = new TextEncoder().encode("extra");
+        const digest = new Uint8Array(
+          await crypto.subtle.digest("SHA-256", bytes),
+        );
+        const path = `${roots[1]}/extra.txt`;
+        await Deno.writeFile(path, bytes);
+        f.output.artifacts.push({
+          path,
+          bytes: bytes.length,
+          sha256: Array.from(digest, (b) => b.toString(16).padStart(2, "0"))
+            .join(""),
+        });
+      }
+      f.output.metrics.fileCount = f.output.artifacts.length;
+      await f.writeBridge();
+      const run = () =>
+        model.methods.deliver.execute({ inputHash, videoSha256 }, f.context);
+      if (mode === "complete") {
+        await run();
+        if (f.writes.length !== 1) {
+          throw new Error("Complete verified delivery must persist");
+        }
+      } else {
+        await rejected(
+          run,
+          mode.startsWith("missing")
+            ? "missing a verified video copy"
+            : "absent from verification",
+        );
+        if (f.writes.length) {
+          throw new Error("Persisted incomplete or unverified delivery");
+        }
+      }
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test("duplicate and nested delivery destinations are rejected", () => {
+  for (
+    const deliveryFolders of [["/example/output", "/example/output"], [
+      "/example/output",
+      "/example/output/nested",
+    ]]
+  ) {
+    const parsed = model.globalArguments.safeParse({
+      workspaceRoot: "/example/project",
+      pythonBin: "/example/bin/python3",
+      release: "v1",
+      deliveryFolders,
+    });
+    if (parsed.success) throw new Error("Ambiguous destinations were accepted");
+  }
+});
+
+Deno.test("missing potentially aliased destinations fail before the bridge can write", async () => {
+  const f = await fixture();
+  try {
+    f.context.globalArgs.deliveryFolders = [
+      `${f.root}/Output`,
+      `${f.root}/output/nested`,
+    ];
+    f.output.stage = "prepare";
+    await f.writeBridge(
+      `from pathlib import Path\nPath(${JSON.stringify(f.marker)}).touch()\n` +
+        `print(${JSON.stringify(JSON.stringify(f.output))})\n`,
+    );
+    await rejected(
+      () => model.methods.prepare.execute({}, f.context),
+      "boundary validation failed",
+    );
+    if (f.writes.length) throw new Error("Persisted ambiguous destinations");
+    try {
+      await Deno.stat(f.marker);
+      throw new Error("Bridge ran before destinations were validated");
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    }
+  } finally {
+    await f.close();
+  }
+});

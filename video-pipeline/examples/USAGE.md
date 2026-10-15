@@ -28,12 +28,20 @@ Start at the repository root. These commands create an isolated temporary Swamp
 repo; the model ID and all machine-specific paths are assigned at runtime.
 
 ```sh
+(
+set -eu
+command -v swamp >/dev/null
+command -v python3 >/dev/null
 example_source="$(pwd -P)/video-pipeline"
+[ -f "$example_source/manifest.yaml" ]
 example_python="$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')"
 example_repo="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.mkdtemp(prefix="video-pipeline-example-")))')"
+case "$example_repo" in /*) ;; *) echo "Invalid temporary repo path" >&2; exit 1 ;; esac
+[ -d "$example_repo" ]
 swamp repo init "$example_repo"
 cp -R "$example_source/examples/synthetic" "$example_repo/project"
 mv "$example_repo/project/build/swamp-step.py.txt" "$example_repo/project/build/swamp-step.py"
+mkdir -p "$example_repo/project/deliveries/example"
 cp "$example_source/examples/workflow-example-video.yaml" "$example_repo/workflows/"
 cd "$example_repo"
 swamp extension source add "$example_source" --only models
@@ -47,13 +55,17 @@ swamp model create @jpisgeek/video-pipeline example-video \
 swamp workflow validate @jpisgeek/example-video-pipeline
 swamp workflow run @jpisgeek/example-video-pipeline
 swamp data get example-video deliver --json
+)
 ```
 
 The expected result is seven stored stage receipts, one passing assertion, and
 `project/deliveries/example/synthetic-video.txt`. Runtime models, Swamp state,
 receipts, and produced artifacts stay in the temporary repo; none belong in the
-published example. The workflow's ID was originally assigned by
-`swamp workflow create` and is preserved in the distributed YAML.
+published example. The distributed workflow's ID was assigned by
+`swamp workflow create` in a fresh disposable authoring repository solely for
+this public fixture, not copied from a deployed workflow. Use a new model
+instance for changed scene inputs or a different release; stage receipts are
+bound to the instance's first prepared input hash and release.
 
 ## Integration checks
 

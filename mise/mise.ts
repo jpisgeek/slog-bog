@@ -25,7 +25,11 @@ import { z } from "npm:zod@4";
  * semicolon, no dollar, no backtick, no whitespace.
  */
 const SAFE_ABS_PATH = /^\/[A-Za-z0-9._/-]*$/;
-/** Same character class, but a bare command name like `mise` is also fine. */
+/**
+ * Same character class, but a bare command name like `mise` is also fine.
+ * Without the multiline flag, ECMAScript anchors require the entire input;
+ * unlike Python's $, this rejects a trailing line terminator too.
+ */
 const SAFE_BIN_PATH = /^[A-Za-z0-9._/-]+$/;
 
 /**
@@ -113,9 +117,15 @@ async function readCapped(
   stream: ReadableStream<Uint8Array>,
   cap: number,
   onOverflow?: () => void,
+  signal?: AbortSignal,
 ): Promise<{ text: string; truncated: boolean }> {
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   const reader = stream.getReader();
+  const cancel = () => {
+    void reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel();
   const chunks: Uint8Array[] = [];
   let total = 0;
   let truncated = false;
@@ -141,6 +151,7 @@ async function readCapped(
   } finally {
     // Cancel rather than drain. Draining a hostile stream to be polite is
     // the same unbounded read this exists to prevent.
+    signal?.removeEventListener("abort", cancel);
     await reader.cancel().catch(() => {});
   }
   const buf = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0));
@@ -165,8 +176,11 @@ async function readCapped(
  */
 async function cappedOutput(
   cmd: Deno.Command,
+  signal: AbortSignal,
 ): Promise<{ success: boolean; code: number; stdout: string; stderr: string }> {
   const child = cmd.spawn();
+  const stopReads = new AbortController();
+  const readSignal = AbortSignal.any([signal, stopReads.signal]);
   let killed = false;
   const kill = () => {
     if (killed) return;
@@ -178,21 +192,37 @@ async function cappedOutput(
     try {
       child.kill("SIGKILL");
     } catch { /* already gone */ }
+    stopReads.abort();
   };
-  const [o, e] = await Promise.all([
-    readCapped(child.stdout, MAX_OUTPUT_BYTES, kill),
-    readCapped(child.stderr, MAX_OUTPUT_BYTES, kill),
-  ]);
-  const status = await child.status;
-  return {
-    success: status.success && !o.truncated && !e.truncated,
-    code: status.code,
-    stdout: o.text,
-    stderr: e.text,
-  };
+  // Deno's signal sends only SIGTERM. A child can ignore it, and descendants
+  // can hold its pipes open. Kill our child and cancel our readers on abort
+  // rather than waiting indefinitely for EOF. No remote-process claim is made.
+  signal.addEventListener("abort", kill, { once: true });
+  if (signal.aborted) kill();
+  const reads = [
+    readCapped(child.stdout, MAX_OUTPUT_BYTES, kill, readSignal),
+    readCapped(child.stderr, MAX_OUTPUT_BYTES, kill, readSignal),
+  ];
+  try {
+    const [o, e] = await Promise.all(reads);
+    const status = await child.status;
+    return {
+      success: status.success && !o.truncated && !e.truncated,
+      code: status.code,
+      stdout: o.text,
+      stderr: e.text,
+    };
+  } catch (error) {
+    kill();
+    await Promise.allSettled(reads);
+    await child.status;
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", kill);
+  }
 }
 
-const UNSAFE_TEXT_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const UNSAFE_TEXT_RE = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
 
 function printableRemoteText(value: string): string {
   let printable = "";
@@ -233,6 +263,7 @@ function printableRemoteText(value: string): string {
  */
 export type RemoteErrorCode =
   | "binary-missing"
+  | "transport-missing"
   | "permission-denied"
   | "host-key-unknown"
   | "connection-failed"
@@ -246,7 +277,6 @@ const ERROR_PATTERNS: [RegExp, RemoteErrorCode][] = [
     /host key verification failed|remote host identification/i,
     "host-key-unknown",
   ],
-  [/command not found|no such file or directory/i, "binary-missing"],
   [
     /permission denied|access denied|operation not permitted/i,
     "permission-denied",
@@ -266,6 +296,9 @@ const ERROR_PATTERNS: [RegExp, RemoteErrorCode][] = [
  * rather than our deadline expiring.
  */
 export function remoteErrorCode(value: string): RemoteErrorCode {
+  // An absent config or SSH key is not an absent mise executable. Keep the
+  // diagnostic code consistent with the shell-specific failure classifier.
+  if (classifyFailure(-1, value) === "notfound") return "binary-missing";
   for (const [re, code] of ERROR_PATTERNS) if (re.test(value)) return code;
   return "unclassified";
 }
@@ -287,7 +320,9 @@ const SshSchema = z.object({
       "underscore, and must not start with '-'",
   }),
   port: z.number().int().positive().default(22),
-});
+  identityFile: z.string().regex(SAFE_ABS_PATH).meta({ sensitive: true })
+    .optional(),
+}).strict();
 
 /**
  * One host to sweep: how to reach it, which directory's config to evaluate,
@@ -365,7 +400,7 @@ export const NodeSchema = z.object({
       "Path to the mise binary. Worth setting for SSH hosts: a non-login " +
         "shell often has no ~/.local/bin on PATH, and mise lives there.",
     ),
-});
+}).strict();
 
 /**
  * Everything an operator sets once for the whole sweep: which hosts to ask,
@@ -424,6 +459,13 @@ export const GlobalArgsSchema = z.object({
         "classification code is written either way; this only adds a second " +
         "field beside it.",
     ),
+}).strict();
+
+// Swamp validates merged global+method arguments, then strips globals from
+// this method's node-only schema. Globals remain configuration, not per-run
+// overrides. Execute also rejects unknown keys when called directly.
+const DiscoverArgsSchema = z.object({
+  node: NodeLabelSchema.optional().describe("Limit the sweep to one node"),
 });
 
 /**
@@ -529,6 +571,9 @@ export const SUB_OUTDATED = ["outdated", "--json"];
  */
 export function parseVersion(stdout: string): string | null {
   const first = printableRemoteText(stdout.trim()).split(/\s+/)[0] ?? "";
+  // A prerelease suffix is still remote inventory text: apply the same size
+  // and credential screening as tool versions instead of trusting its shape.
+  if (safeRemoteString(first) === null) return null;
   // Anchored at both ends. Unanchored, "1evil" matched its leading digit and
   // was accepted as a version, which is exactly the banner case this check
   // exists to catch -- and being accepted, it kept the host off the degraded
@@ -590,11 +635,16 @@ export function remoteCommand(
  * before the command even starts.
  */
 export function sshArgs(
-  ssh: { host: string; user: string; port: number },
+  ssh: { host: string; user: string; port: number; identityFile?: string },
   timeoutSec: number,
   remote: string,
 ): string[] {
   return [
+    // Do not read executable Match/KnownHostsCommand directives or ambient
+    // SendEnv/SetEnv. Connection settings belong to the validated node config.
+    "-F",
+    "/dev/null",
+    ...(ssh.identityFile ? ["-i", ssh.identityFile] : []),
     "-o",
     "BatchMode=yes",
     // BatchMode alone does NOT guarantee an unknown host key fails closed:
@@ -605,8 +655,11 @@ export function sshArgs(
     // than the operator's environment's.
     "-o",
     "StrictHostKeyChecking=yes",
+    "-o",
+    "UpdateHostKeys=no",
     // Same reasoning, applied to what this connection hands the remote host
-    // rather than what it trusts about it. ssh inherits ambient config, so a
+    // rather than what it trusts about it. Without isolation, ssh inherits
+    // ambient config, so a
     // ForwardAgent in the operator's ~/.ssh/config -- a perfectly ordinary
     // thing to have there for hosts you use interactively -- would expose
     // the authentication agent to every host this model sweeps. An agent
@@ -629,17 +682,8 @@ export function sshArgs(
     "ControlMaster=no",
     "-o",
     "ControlPath=none",
-    // SendEnv is deliberately NOT set here. `-o SendEnv=-*` looks like it
-    // clears the list and does not: command-line options are read before
-    // config files, and SendEnv accumulates, so a `SendEnv AWS_*` in the
-    // operator's config is added afterwards and survives. Verified against
-    // ssh -G rather than assumed. Shipping the option anyway would put a
-    // guarantee in the argv that the argv does not keep, which is worse than
-    // the gap. The residual is documented in the README instead: it needs a
-    // SendEnv or SetEnv in the operator's own config AND a matching
-    // AcceptEnv on the target, and `-F /dev/null` would close it only by
-    // discarding the per-host IdentityFile and ProxyJump settings a real
-    // fleet depends on.
+    "-o",
+    "KnownHostsCommand=none",
     "-o",
     "ProxyCommand=none",
     "-o",
@@ -744,6 +788,7 @@ export async function runMise(
   sub: string[],
   timeoutSec: number,
   signal: AbortSignal,
+  includeDetail = false,
 ): Promise<RunResult> {
   const bin = node.misePath ?? "mise";
   // Our own deadline gets its own controller rather than being folded into the
@@ -756,7 +801,9 @@ export async function runMise(
     () => deadline.abort(new Error("deadline")),
     (timeoutSec + 10) * 1000,
   );
+  const combined = AbortSignal.any([signal, deadline.signal]);
   const cmd = node.ssh
+    // swamp-quality-ignore deno-command: Fixed read-only mise probes over schema-validated, noninteractive SSH; streams and execution time are bounded.
     ? new Deno.Command("ssh", {
       args: sshArgs(
         node.ssh,
@@ -766,18 +813,19 @@ export async function runMise(
       stdin: "null",
       stdout: "piped",
       stderr: "piped",
-      signal: AbortSignal.any([signal, deadline.signal]),
+      signal: combined,
     })
+    // swamp-quality-ignore deno-command: Invoke the operator-selected mise binary directly with fixed read-only argv; streams and execution time are bounded.
     : new Deno.Command(bin, {
       args: localArgs(node.dir, sub),
       stdin: "null",
       stdout: "piped",
       stderr: "piped",
-      signal: AbortSignal.any([signal, deadline.signal]),
+      signal: combined,
     });
 
   try {
-    const out = await cappedOutput(cmd);
+    const out = await cappedOutput(cmd, combined);
     // Deno does not throw when a signal aborts a running command. It kills
     // the child and hands back success: false with SIGTERM, which is the
     // same shape as a host whose mise fell over on its own. So the caller's
@@ -802,7 +850,9 @@ export async function runMise(
         ok: false,
         kind: classifyFailure(out.code, stderr),
         error: stderr ? remoteErrorCode(stderr) : "nonzero-exit",
-        detail: safeDetail(stderr),
+        ...(includeDetail
+          ? { detail: safeDetail(stderr, node.ssh?.identityFile) }
+          : {}),
       };
     }
     return { ok: true, stdout: out.stdout };
@@ -814,8 +864,10 @@ export async function runMise(
     if (deadline.signal.aborted) {
       return { ok: false, kind: "failed", error: "timed-out" };
     }
-    // Deno throws NotFound when the local binary itself is absent, which is
-    // the same fact as a shell's 127 and must classify the same way.
+    // A missing local transport says nothing about remote mise.
+    if (e instanceof Deno.errors.NotFound && node.ssh) {
+      return { ok: false, kind: "failed", error: "transport-missing" };
+    }
     const msg = (e as Error).message;
     return {
       ok: false,
@@ -825,7 +877,6 @@ export async function runMise(
       error: e instanceof Deno.errors.NotFound
         ? "binary-missing"
         : remoteErrorCode(msg),
-      detail: safeDetail(msg),
     };
   } finally {
     // A long-lived process running many probes would otherwise accumulate one
@@ -884,13 +935,9 @@ type JsonShape = "object" | "array";
  * that is a reading rather than the absence of one.
  */
 function isJsonPayload(raw: string, shape: JsonShape): boolean {
-  try {
-    const v = JSON.parse(raw);
-    if (v === null || typeof v !== "object") return false;
-    return shape === "array" ? Array.isArray(v) : !Array.isArray(v);
-  } catch {
-    return false;
-  }
+  return shape === "array"
+    ? parseJsonArray(raw) !== null
+    : parseJsonObject(raw) !== null;
 }
 
 /**
@@ -902,7 +949,30 @@ function jsonStdout(r: RunResult, shape: JsonShape): string | null {
   return r.ok && isJsonPayload(r.stdout, shape) ? r.stdout : null;
 }
 
-/** JSON.parse that yields a fallback instead of throwing mid-sweep. */
+/** Validate syntax natively, then reject duplicate decoded object keys. */
+function parseJson(raw: string): unknown {
+  const value: unknown = JSON.parse(raw);
+  // Strings are single tokens, so their commas/braces cannot alter the stack.
+  // Native parsing has already checked syntax: this scan only checks the
+  // information JSON.parse otherwise loses, including escaped key aliases.
+  const stack: ({ keys: Set<string>; wantKey: boolean } | null)[] = [];
+  for (const token of raw.matchAll(/"(?:[^"\\]|\\.)*"|[{}\[\],:]/g)) {
+    const text = token[0];
+    const current = stack.at(-1);
+    if (text === "{") stack.push({ keys: new Set(), wantKey: true });
+    else if (text === "[") stack.push(null);
+    else if (text === "}" || text === "]") stack.pop();
+    else if (text === "," && current) current.wantKey = true;
+    else if (text.startsWith('"') && current?.wantKey) {
+      const key: string = JSON.parse(text);
+      if (current.keys.has(key)) throw new Error("Duplicate JSON member");
+      current.keys.add(key);
+      current.wantKey = false;
+    }
+  }
+  return value;
+}
+
 /**
  * JSON.parse, narrowed rather than asserted.
  *
@@ -915,7 +985,7 @@ function jsonStdout(r: RunResult, shape: JsonShape): string | null {
  */
 function parseJsonObject(raw: string): Record<string, unknown> | null {
   try {
-    const v: unknown = JSON.parse(raw);
+    const v = parseJson(raw);
     return typeof v === "object" && v !== null && !Array.isArray(v)
       ? v as Record<string, unknown>
       : null;
@@ -926,7 +996,7 @@ function parseJsonObject(raw: string): Record<string, unknown> | null {
 
 function parseJsonArray(raw: string): unknown[] | null {
   try {
-    const v: unknown = JSON.parse(raw);
+    const v = parseJson(raw);
     return Array.isArray(v) ? v : null;
   } catch {
     return null;
@@ -983,16 +1053,25 @@ const CREDENTIAL_SHAPES: RegExp[] = [
   // environment-variable-shaped name -- the commonest way a secret is
   // actually written down -- walked past this rule untouched.
   new RegExp(
-    `\\b${CREDENTIAL_KEYWORDS}\\s*[=:]\\s*(?!\\[withheld\\])\\S`,
+    `\\b${CREDENTIAL_KEYWORDS}["']?\\s*[=:]\\s*(?!\\[withheld\\])\\S`,
     "i",
   ),
-  // A long unbroken high-entropy-looking run: the shape of a bare key sitting
-  // on its own with nothing around it to name it. Deliberately conservative
-  // about length so ordinary hashes in paths -- a nix store path, a git sha
-  // -- are not caught, and deliberately requiring mixed case and digits so
-  // hex digests and lowercase words are not.
-  /(?=[A-Za-z0-9_-]{40,})(?=[A-Za-z0-9_-]*[a-z])(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{40,}/,
+  // Established token prefixes do not require mixed case or digits.
+  /(?:^|[^A-Za-z0-9])(?:gh[pousr]_|github_pat_|xox[baprs]-|sk-(?:proj-|ant-)?|glpat-)[A-Za-z0-9_-]{16,}/,
+  /(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}/,
+  /AIza[A-Za-z0-9_-]{35}/,
+  /AGE-SECRET-KEY-1[0-9A-Z]{16,}/i,
 ];
+
+/** Scan token runs once rather than rescanning every suffix with lookaheads. */
+function hasOpaqueCredential(value: string): boolean {
+  for (const m of value.matchAll(/[A-Za-z0-9_-]{40,}/g)) {
+    if (/[a-z]/.test(m[0]) && /[A-Z]/.test(m[0]) && /[0-9]/.test(m[0])) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Anything that looks like it could be a URL, anywhere in the value.
@@ -1006,7 +1085,8 @@ const CREDENTIAL_SHAPES: RegExp[] = [
  * Deliberately loose: the cost of testing something that is not a URL is one
  * failed parse, and the cost of missing one is publishing a credential.
  */
-const URLISH_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi;
+const URLISH_RE =
+  /(?:[a-z][a-z0-9+.-]*:[/\\]{2}|(?:https?|ftp|file):|[/\\]{2})[^\s]+/gi;
 
 /**
  * Locations that carry userinfo without a scheme in front of them.
@@ -1023,18 +1103,11 @@ const URLISH_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi;
  * `new URL()` will accept.
  */
 const USERINFO_NO_SCHEME: RegExp[] = [
-  // scp-style: user@host:path, with an optional :password. Requires a
-  // colon-path after the host so an ordinary email address in an error
-  // sentence is not mistaken for a location. The host alternative includes
-  // the bracketed IPv6 form, which the first version of this did not. A
-  // literal address in a source location is nearly always an internal one,
-  // and userinfo in front of a bracketed address slipped through with
-  // username, password and address intact. The shape is described rather
-  // than written out: an example address here trips the identifier scanner
-  // that guards this repo, which is the scanner doing its job.
-  /(?:^|[\s(<'"])[A-Za-z0-9._~%-]+(?::[^\s@]*)?@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):[^\s]/,
-  // scheme-relative with userinfo, same two host forms
-  /(?:^|[\s(<'"])\/\/[A-Za-z0-9._~%-]+(?::[^\s@]*)?@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)/,
+  // Do not guess the hostname grammar: SSH aliases, Unicode hostnames and
+  // scoped bracketed addresses all carry userinfo. Require a colon-path so
+  // an ordinary email address is not mistaken for an scp location.
+  /[^\s@]+@[^\s@]+:[^\s]/,
+  /\/\/[^\s@]*@[^\s/]+/,
 ];
 
 /**
@@ -1053,7 +1126,9 @@ const USERINFO_NO_SCHEME: RegExp[] = [
 function urlCarriesMoreThanLocation(value: string): boolean {
   let u: URL;
   try {
-    u = new URL(value);
+    // WHATWG special schemes accept backslashes and even absent slashes;
+    // screen those forms too rather than only conventional scheme:// URLs.
+    u = new URL(/^[\/\\]{2}/.test(value) ? `https:${value}` : value);
   } catch {
     // Fail closed. This returned false -- "carries nothing extra" -- which
     // meant anything URL-shaped that would not parse skipped the check
@@ -1093,6 +1168,7 @@ export function safeRemoteString(v: unknown): string | null {
   // therefore never saw.
   for (const re of USERINFO_NO_SCHEME) if (re.test(s)) return null;
   for (const re of CREDENTIAL_SHAPES) if (re.test(s)) return null;
+  if (hasOpaqueCredential(s)) return null;
   return s;
 }
 
@@ -1110,9 +1186,17 @@ export function safeRemoteString(v: unknown): string | null {
  * keep the sentence and lose the URL. A token that screens out is dropped
  * entirely; the marker says a token was there without saying what it was.
  */
-function safeDetail(text: string): string | undefined {
+function safeDetail(text: string, identityFile?: string): string | undefined {
+  // Bound work BEFORE escaping, regex screening, or tokenization. A failed
+  // process may have returned four MiB; detail is optional, not a second probe.
+  if (text.length > MAX_VALUE_CHARS) return "[withheld: oversized error text]";
   const printable = printableRemoteText(text).trim();
   if (printable === "") return undefined;
+  // Structured error fragments may escape their key names or nest secrets.
+  // Withhold them rather than claiming a prose heuristic parsed their data.
+  if (/["'](?:\\.|[^"'\\])*["']\s*:/.test(printable)) {
+    return "[withheld: structured error text]";
+  }
   // Whole-string pass first, before tokenizing. `password = swordfish` is
   // three whitespace-separated tokens and no single one of them is an
   // assignment, so per-token screening walked straight past it. Here the
@@ -1123,7 +1207,7 @@ function safeDetail(text: string): string | undefined {
       // spaces, and stopping at the first one withheld its opening word and
       // published the rest -- worse than withholding nothing, because it
       // reads as though the screening worked.
-      new RegExp(`\\b(${CREDENTIAL_KEYWORDS})\\s*[=:].*`, "gi"),
+      new RegExp(`\\b(${CREDENTIAL_KEYWORDS})["']?\\s*[=:].*`, "gi"),
       "$1=[withheld]",
     )
     // Same reason, different shape. `Bearer abc123` is two whitespace-
@@ -1143,13 +1227,23 @@ function safeDetail(text: string): string | undefined {
   for (const re of CREDENTIAL_SHAPES) {
     if (re.test(deassigned)) return "[withheld: unscreenable error text]";
   }
-  const kept = deassigned
+  if (hasOpaqueCredential(deassigned)) {
+    return "[withheld: unscreenable error text]";
+  }
+  let kept = deassigned
     .split(/(\s+)/)
     .map((tok) =>
       (/\s/.test(tok) || safeRemoteString(tok) !== null) ? tok : "[withheld]"
     )
     .join("");
-  return kept.slice(0, MAX_DETAIL_CHARS);
+  // Screen credential shapes first: replacing an identity such as "/" must
+  // not obscure URL separators and let embedded credentials evade screening.
+  // Remove the known sensitive locator before truncation can split it.
+  if (identityFile) kept = kept.replaceAll(identityFile, "[withheld]");
+  // Keep the existing code-unit bound without splitting an astral character.
+  let end = Math.min(kept.length, MAX_DETAIL_CHARS);
+  if (end < kept.length && /[\uD800-\uDBFF]/.test(kept[end - 1])) end--;
+  return kept.slice(0, end);
 }
 
 /**
@@ -1270,7 +1364,9 @@ const StoredRecordSchema = z.object({
   // text arriving by a route none of the host-facing filters cover -- a
   // record written by an older version, or by anything else sharing the
   // store, could put control and format characters into log output.
-  name: z.string().min(1).refine((v) => printableRemoteText(v) === v),
+  name: z.string().min(1).refine((v) =>
+    !UNSAFE_TEXT_RE.test(v) && safeRemoteString(v) !== null
+  ),
 });
 
 const OutdatedEntrySchema = z.object({
@@ -1419,6 +1515,7 @@ export function parseTrustShow(
   // remote host, so a lookup that misses must come back empty rather than
   // walking up to Object.prototype and finding a function.
   const out: Record<string, boolean> = Object.create(null);
+  const seen = new Set<string>();
   for (const line of text.split("\n")) {
     if (line.trim() === "") continue;
     const idx = line.lastIndexOf(": ");
@@ -1429,6 +1526,12 @@ export function parseTrustShow(
     const path = safeRemoteKey(line.slice(0, idx).trim(), sink);
     const status = line.slice(idx + 2).trim();
     if (path === null) continue;
+    if (seen.has(path)) {
+      delete out[path];
+      noteDrop(sink);
+      continue;
+    }
+    seen.add(path);
     if (status === "trusted") out[path] = true;
     else if (status === "untrusted") out[path] = false;
     // Any other status is a line this parser does not understand, which is
@@ -1506,6 +1609,8 @@ const NodeStateSchema = z.object({
 
 const ToolStateSchema = z.object({
   node: z.string(),
+  /** Retained history, not a reading from the sweep tagged by sweptAt. */
+  stale: z.boolean().default(true),
   tool: z.string(),
   requestedVersion: z.string().nullable(),
   resolvedVersion: z.string().nullable(),
@@ -1527,6 +1632,8 @@ const ToolStateSchema = z.object({
 
 const ConfigStateSchema = z.object({
   node: z.string(),
+  /** Retained history, not a reading from the sweep tagged by sweptAt. */
+  stale: z.boolean().default(true),
   /**
    * Whether the host this config came from answered in full.
    *
@@ -1576,21 +1683,6 @@ const SummarySchema = z.object({
   sweptAt: z.string(),
 });
 
-/**
- * The leading sixty-four bits of SHA-256, as sixteen lowercase hex
- * characters.
- *
- * Tool names and config paths arrive from remote hosts, and slugPart
- * collapses punctuation runs, so a host can vary punctuation invisibly to the
- * readable half of a name and go hunting for a hash that lands on another
- * host's record. Against a short non-cryptographic hash that hunt is a
- * feasible search. Against a truncated SHA-256 it is not, because there is no
- * shortcut from a target digest back to an input.
- *
- * `crypto.subtle` is a global Web API, so this stays true to a dependency
- * list that is deliberately empty. It is async, which is the only reason
- * resourceName is.
- */
 /**
  * Identity digest for a resource name.
  *
@@ -1762,7 +1854,7 @@ function currentDir(): string | null {
  */
 export const model = {
   type: "@jpisgeek/mise",
-  version: "2026.08.28.3",
+  version: "2026.10.14.1",
   globalArguments: GlobalArgsSchema,
   /**
    * Nothing to transform, and the reasons are worth stating rather than
@@ -1806,6 +1898,14 @@ export const model = {
         "needs no edit. Stored records are not migrated either -- the stale " +
         "`degraded` rows and null miseVersion clear on the next full sweep, " +
         "which rewrites them from a probe that now answers.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.14.1",
+      description:
+        "Declare the existing MIT license in the published manifest. " +
+        "Retained tool and config rows are marked stale on the next sweep; " +
+        "fresh readings clear that marker. No globalArguments migration.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1857,13 +1957,12 @@ export const model = {
         "measured, which keeps its stored rows rather than having them read " +
         "as gone, and which does not rewrite the fleet summary from one " +
         "host's worth of data.",
-      arguments: z.object({
-        node: z.string().optional().describe("Limit the sweep to one node"),
-      }),
+      arguments: DiscoverArgsSchema,
       // deno-lint-ignore no-explicit-any
       execute: async (args: { node?: string }, ctx: any) => {
+        args = DiscoverArgsSchema.strict().parse(args);
         const g = GlobalArgsSchema.parse(ctx.globalArgs);
-        const targets = args.node
+        const targets = args.node !== undefined
           ? g.nodes.filter((n) => n.name === args.node)
           : g.nodes;
         if (targets.length === 0) {
@@ -1903,10 +2002,10 @@ export const model = {
             // would judge different configs and both record dir: null.
             const dir = node.dir ?? (node.ssh ? null : currentDir());
             try {
-              const run = (sub: string[]) =>
-                runMise(node, sub, g.timeoutSec, ctx.signal);
+              const run = (sub: string[], includeDetail = false) =>
+                runMise(node, sub, g.timeoutSec, ctx.signal, includeDetail);
 
-              const ls = await run(SUB_LS);
+              const ls = await run(SUB_LS, g.errorDetail);
               // Two ways to learn nothing, and they take the same exit.
               // mise never ran, or mise exited zero without the tool object
               // it promises, whether a shell printed over the answer or the
@@ -2052,6 +2151,7 @@ export const model = {
                 for (const d of drift) nodeDrift.add(d);
                 toolStates.push({
                   node: node.name,
+                  stale: false,
                   tool: r.tool,
                   requestedVersion: r.requestedVersion,
                   resolvedVersion: r.resolvedVersion,
@@ -2079,6 +2179,7 @@ export const model = {
                 if (missing.length > 0) nodeDrift.add("notineffect");
                 configStates.push({
                   node: node.name,
+                  stale: false,
                   degraded: nodeDegraded,
                   path: c.path,
                   // trust --show reports the directory, config ls the file,
@@ -2146,14 +2247,9 @@ export const model = {
                 failureKind: "failed",
                 transport,
                 error: msg,
-                // Through the same screening as every other stored excerpt.
-                // This path built its own printable-and-truncate inline and
-                // so was the one place a credential-bearing token could be
-                // stored whole, which is the sort of thing an inline
-                // reimplementation is always eventually for.
-                errorDetail: g.errorDetail
-                  ? (safeDetail((e as Error)?.message ?? String(e)) ?? null)
-                  : null,
+                // Internal exceptions are not host stderr. Never persist them,
+                // even when the operator requested host error detail.
+                errorDetail: null,
                 miseVersion: null,
                 dir,
                 configCount: null,
@@ -2189,6 +2285,7 @@ export const model = {
         // only in part, says nothing about which of its tools and configs
         // still exist, so its stored rows are held rather than read as gone.
         const live = new Set<string>();
+        const sweptAt = new Date().toISOString();
         // Prefix -> may this prefix's rows be pruned. Every configured node
         // gets an entry, not only the protected ones, because deciding which
         // node a stored name belongs to needs the whole field to compare
@@ -2232,6 +2329,78 @@ export const model = {
           ) {
             legacyHeld.set(p, (legacyHeld.get(p) ?? false) || held);
           }
+        }
+        for (const t of toolStates) {
+          live.add(await resourceName("tool", t.node, t.tool));
+        }
+        for (const c of configStates) {
+          live.add(await resourceName("config", c.node, c.path));
+        }
+        if (args.node === undefined) live.add("summary");
+
+        // Plan retention and pruning BEFORE publishing any observation. An
+        // invalid legacy row must fail the run, not leave a healthy summary
+        // beside an incomplete prune, and must never be quoted in the error.
+        const existing: z.infer<typeof StoredRecordSchema>[] = [];
+        const retained = new Map<
+          string,
+          z.infer<typeof ToolStateSchema> | z.infer<typeof ConfigStateSchema>
+        >();
+        for (
+          const raw of await ctx.dataRepository.findAllForModel(
+            ctx.modelType,
+            ctx.modelId,
+          )
+        ) {
+          const rec = StoredRecordSchema.safeParse(raw);
+          if (!rec.success) {
+            throw new Error(
+              "Invalid stored inventory; no sweep data was written.",
+            );
+          }
+          existing.push(rec.data);
+          if (live.has(rec.data.name)) continue;
+          const byShape = rec.data.name.includes(PART_SEP)
+            ? prefixHeld
+            : legacyHeld;
+          if (!holdsRecord(byShape, rec.data.name)) continue;
+          const previous = await ctx.readResource(rec.data.name);
+          // A listed version with no content has no values to carry forward.
+          if (previous === null) continue;
+          const parsed = rec.data.name.startsWith("tool-")
+            ? ToolStateSchema.safeParse(previous)
+            : ConfigStateSchema.safeParse(previous);
+          if (!parsed.success) {
+            throw new Error(
+              "Invalid stored inventory; no sweep data was written.",
+            );
+          }
+          const data = parsed.data;
+          // Screen every scalar and every array member, including fields that
+          // become tags. Historical content has not passed today's parsers.
+          for (const field of Object.values(data)) {
+            for (const value of Array.isArray(field) ? field : [field]) {
+              if (
+                typeof value === "string" &&
+                (UNSAFE_TEXT_RE.test(value) || safeRemoteString(value) === null)
+              ) {
+                throw new Error(
+                  "Unsafe stored inventory; no sweep data was written.",
+                );
+              }
+            }
+          }
+          // Slug collisions do not authorize a targeted run on another host.
+          if (!nodeStates.some((n) => n.name === data.node)) continue;
+          retained.set(rec.data.name, data);
+        }
+        if (ctx.signal.aborted) {
+          throw ctx.signal.reason ??
+            new Error("sweep cancelled before anything was written");
+        }
+
+        for (const n of nodeStates) {
+          const name = await resourceName("node", n.name);
           handles.push(
             await ctx.writeResource(
               "node",
@@ -2248,7 +2417,7 @@ export const model = {
           );
         }
         // A tool row cannot say on its own that its host answered in part,
-        // and it writes outdated: false when the outdated probe never ran.
+        // though outdated is null when the outdated probe never ran.
         // The host's degraded flag rides along as a tag so a query over rows
         // alone cannot read a partial sweep as a clean one.
         const degradedNodes = new Set(
@@ -2268,6 +2437,8 @@ export const model = {
                   tool: t.tool,
                   drift: t.drift.join(","),
                   degraded: String(degradedNodes.has(t.node)),
+                  stale: "false",
+                  sweptAt,
                 },
               },
             ),
@@ -2291,6 +2462,8 @@ export const model = {
                 tags: {
                   node: c.node,
                   degraded: String(degradedNodes.has(c.node)),
+                  stale: "false",
+                  sweptAt,
                 },
               },
             ),
@@ -2304,7 +2477,7 @@ export const model = {
         // as the fleet, and only `nodes: 1` would hint otherwise. Leaving the
         // standing record alone keeps its own sweptAt on show, which says how
         // old it is plainly enough.
-        if (!args.node) {
+        if (args.node === undefined) {
           const count = (d: Drift) =>
             toolStates.filter((t) => t.drift.includes(d)).length;
           const degradedCount = nodeStates.filter((n) => n.degraded).length;
@@ -2366,7 +2539,7 @@ export const model = {
                 toolsComplete && count("unmeasured") === 0,
                 count("expected"),
               ),
-              sweptAt: new Date().toISOString(),
+              sweptAt,
             }, {
               tags: {
                 nodes: String(nodeStates.length),
@@ -2377,38 +2550,45 @@ export const model = {
           live.add("summary");
         }
 
-        // Prune only on a full sweep. A single-node run legitimately sees one
-        // host's worth of resources, so it deletes nothing. Without this the
-        // summary and a stale tool row end up as two published views of the
-        // same fact that permanently disagree: remove a tool from a config
-        // and the summary says notinstalled is zero while last sweep's row
-        // still carries the drift.
-        if (!args.node) {
-          const existing = await ctx.dataRepository.findAllForModel(
-            ctx.modelType,
-            ctx.modelId,
-          );
-          // Validated, not cast. This loop deletes, so what it reads has to
-          // be checked: `existing as {name: string}[]` on a repository that
-          // returned anything else produced records whose `name` was
-          // undefined, and `undefined.startsWith` throws mid-prune, after
-          // some deletions and before the rest.
-          for (const raw of existing) {
-            const rec = StoredRecordSchema.safeParse(raw);
-            if (!rec.success) {
-              ctx.logger.warning(
-                "skipped a stored record with no readable name during prune",
+        // Refresh held history even in a targeted diagnostic: a failed probe
+        // must not leave yesterday's row wearing healthy tags. Only a full
+        // sweep can prune; a single-node run deletes nothing outside its view.
+        {
+          for (const rec of existing) {
+            if (live.has(rec.name)) continue;
+            // Matched against one map or the other by the record's own
+            // shape, never both.
+            const byShape = rec.name.includes(PART_SEP)
+              ? prefixHeld
+              : legacyHeld;
+            if (holdsRecord(byShape, rec.name)) {
+              const data = retained.get(rec.name);
+              if (!data) continue;
+              const spec = rec.name.startsWith("tool-") ? "tool" : "config";
+              handles.push(
+                await ctx.writeResource(
+                  spec,
+                  rec.name,
+                  spec === "config"
+                    ? { ...data, stale: true, degraded: true }
+                    : { ...data, stale: true },
+                  {
+                    tags: {
+                      node: data.node,
+                      ...("tool" in data
+                        ? { tool: data.tool, drift: data.drift.join(",") }
+                        : {}),
+                      degraded: "true",
+                      stale: "true",
+                      sweptAt,
+                    },
+                  },
+                ),
               );
               continue;
             }
-            if (live.has(rec.data.name)) continue;
-            // Matched against one map or the other by the record's own
-            // shape, never both.
-            const byShape = rec.data.name.includes(PART_SEP)
-              ? prefixHeld
-              : legacyHeld;
-            if (holdsRecord(byShape, rec.data.name)) continue;
-            await ctx.deleteResource(rec.data.name);
+            if (args.node !== undefined) continue;
+            await ctx.deleteResource(rec.name);
             // Screened before it is logged, not merely checked for
             // printability. This name came out of the datastore rather than
             // off a host, so nothing upstream vouches for it: a record
@@ -2417,11 +2597,16 @@ export const model = {
             // identifier in its name, and the prune would have copied it
             // verbatim into a log line.
             ctx.logger.info("pruned {name}", {
-              name: safeRemoteString(rec.data.name) ?? "<withheld>",
+              name: safeRemoteString(rec.name) ?? "<withheld>",
             });
           }
         }
 
+        ctx.logger.info("completed mise sweep of {nodes} host(s)", {
+          nodes: nodeStates.length,
+          measured: nodeStates.filter((node) => node.measured).length,
+          degraded: nodeStates.filter((node) => node.degraded).length,
+        });
         return { dataHandles: handles };
       },
     },

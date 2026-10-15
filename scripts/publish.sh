@@ -28,6 +28,34 @@
 #   7 swamp extension push --dry-run  (built-in adversarial review forced fresh)
 #   8 STOP for operator approval, then push
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# PUBLISHING: REOPENED 2026-09-10 (supersedes the 2026-09-01 retirement).
+#
+# Why it was retired (2026-09-01): most of what had been published was
+# agent-driven exploration nobody actually ran, wrapped in gates heavier than
+# the work they guarded, so the repo was frozen to reference-only.
+#
+# Why it is open again (2026-09-10, Jason's decision): the repo now grows
+# extensions built against real backends — caddy manages live systemd Caddy
+# routes with drift checks and rollback; others wrap real fleet services.
+# Freezing the whole repo to stop the exploration junk was too blunt. The
+# retirement's real lesson — do not ship things nobody verified — is carried
+# not by a blanket wall but by the per-extension gates below, and by gate 6 in
+# particular: NOTHING publishes without a FRESH security verdict bound to its
+# exact current bytes (reviews/<name>/<contenthash>.md, verdict: PASS). Stale
+# verdicts (the reviewer or the bytes changed) and self-authored verdicts do
+# not admit a push. Validity is enforced per extension, at publish time, on the
+# real bytes — which is stricter than an all-or-nothing freeze ever was.
+#
+# The kill-switch is retained, inverted: publishing is open by default; set
+# SLOG_BOG_PUBLISH_STOPPED=1 to re-close the repo instantly if that is ever
+# the right call again.
+# ---------------------------------------------------------------------------
+if [ "${SLOG_BOG_PUBLISH_STOPPED:-}" = "1" ]; then
+  echo "publish.sh: publishing is manually re-closed (SLOG_BOG_PUBLISH_STOPPED=1). Unset it to reopen." >&2
+  exit 1
+fi
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 cd "$root"
@@ -85,15 +113,16 @@ deno run --allow-read --allow-run --allow-env scripts/gen-readme.ts --check "$na
 
 step "5/8 identifier scan"
 published=()
+published_list="$(deno run --allow-read --allow-run scripts/content-hash.ts "$manifest" --list)"
 while IFS= read -r f; do [ -n "$f" ] && published+=("$f"); done \
-  < <(deno run --allow-read scripts/content-hash.ts "$manifest" --list)
+  <<< "$published_list"
 if [ -z "${SLOG_BOG_DENYLIST:-}" ]; then
   echo "WARNING: SLOG_BOG_DENYLIST is not set — only generic rules will run." >&2
 fi
 scripts/scan-identifiers.sh "${published[@]}"
 
 step "6/8 secrets & security review ($model)"
-hash="$(deno run --allow-read scripts/content-hash.ts "$manifest")"
+hash="$(deno run --allow-read --allow-run scripts/content-hash.ts "$manifest")"
 verdict="reviews/$name/$hash.md"
 mkdir -p "reviews/$name"
 # A verdict is keyed on the content hash, so an unchanged extension keeps the
@@ -143,17 +172,28 @@ fi
 [ "$review_only" -eq 1 ] && { echo "--review-only: stopping after the review."; exit 0; }
 
 step "7/8 swamp extension push --dry-run"
-# Our gate of record is the security verdict in reviews/ (gate 6, PASS above),
-# which is a stricter superset of swamp's built-in adversarial-review
-# dimensions. swamp still emits a "no adversarial-review report recorded"
-# warning of its own; per swamp's docs that is NOT a hard block, it is a
-# confirmable warning, so we let --yes acknowledge it at push time rather
-# than maintaining a second review artifact in swamp's format. (Do not clear
-# swamp's review dir here — that only guarantees the warning and changes
-# nothing that matters.)
-dry=(swamp extension push "$manifest" --dry-run)
+# The independent security verdict and Swamp's dimensional review are
+# separate evidence. Do not use --yes to waive a missing, stale, incomplete,
+# or issue-bearing dimensional report just because the security review passed.
+dry=(swamp extension push "$manifest" --dry-run --json)
 [ -n "$channel" ] && dry+=(--channel "$channel")
-"${dry[@]}" || { echo "dry-run failed — not pushing." >&2; exit 1; }
+dry_result="$("${dry[@]}")" || { echo "dry-run failed — not pushing." >&2; exit 1; }
+printf '%s\n' "$dry_result"
+if ! printf '%s\n' "$dry_result" | python3 -c '
+import json, sys
+result = json.load(sys.stdin)
+warnings = result.get("warnings", {})
+checks = result.get("registryChecks", [])
+if (result.get("status") != "dry_run" or not checks
+    or any(check.get("status") != "passed" for check in checks)
+    or warnings.get("review") or warnings.get("safety")
+    or any(w.get("cause") == "not-audited" for w in warnings.get("dependencyTrust", []))
+    or result.get("unresolvedWarnings") or result.get("acceptedWarnings")):
+    sys.exit(1)
+'; then
+  echo "REFUSING: resolve the review, safety, dependency audit, or registry checks shown above, then rerun." >&2
+  exit 1
+fi
 
 step "8/8 operator approval"
 echo "About to publish:"
@@ -163,24 +203,17 @@ echo "  verdict   : $verdict (PASS)"
 echo "  channel   : ${channel:-stable}"
 echo "  files     :"; printf '    %s\n' "${published[@]}"
 echo
-# Visibility: the registry has no private/public concept that we could find --
-# `swamp extension push` has no visibility flag, `swamp extension` has no
-# visibility subcommand, and registry metadata carries no visibility field
-# (checked against a published extension, 2026-08-23). The Extension Registry
-# Terms describe a single registry users may browse and obtain from. So:
-# PUBLISHING IS PUBLIC AND IMMEDIATE. The recourse afterwards is
-# `swamp extension yank` (reversible with unyank) or `deprecate` -- not
-# deletion, and not before someone could already have pulled it.
-printf '  \033[1mvisibility: PUBLIC and immediate.\033[0m No private-then-promote step exists.\n'
+# New packages inherit collective visibility; existing packages preserve their
+# visibility. A private release is not a staging gate for a public release.
+echo "  visibility: registry default; confirm the applied visibility after push."
 echo "  reversal  : yank/deprecate only (the artifact was still public)."
 [ -n "$channel" ] || echo "  tip       : --channel beta publishes as a prerelease instead of stable."
 echo
 read -r -p "Type JP-GO to push, anything else to abort: " answer
 [ "$answer" = "JP-GO" ] || { echo "aborted."; exit 1; }
-# --yes: non-interactive confirm. swamp's own push prompt AND its
-# not-a-hard-block adversarial-review warning are both acknowledged here; the
-# human gate is the JP-GO line above.
-push=(swamp extension push "$manifest" --yes)
+# --json never prompts and does not waive newly appearing warnings with --yes.
+# The operator gate remains the JP-GO line above.
+push=(swamp extension push "$manifest" --json)
 [ -n "$channel" ] && push+=(--channel "$channel")
 "${push[@]}"
 echo
