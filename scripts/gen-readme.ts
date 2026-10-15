@@ -89,6 +89,7 @@ function schemaRows(schema: Json | undefined, prefix = ""): string[][] {
   const required = new Set((schema.required as string[]) ?? []);
   const rows: string[][] = [];
   for (const [k, p] of Object.entries(props)) {
+    if (p.not && Object.keys(p.not).length === 0) continue;
     const name = prefix + k;
     rows.push([
       `\`${name}\``,
@@ -144,9 +145,10 @@ function renderModel(m: Json): Json {
       Object.entries(resources).map(([name, def]) => [
         `\`${name}\``,
         String(def.lifetime ?? ""),
-        Object.keys(((toJson(def.schema) ?? {}).properties ?? {}) as Json).map((
-          f,
-        ) => `\`${f}\``).join(", "),
+        Object.entries(
+          ((toJson(def.schema) ?? {}).properties ?? {}) as Record<string, Json>,
+        ).filter(([, p]) => !(p.not && Object.keys(p.not).length === 0))
+          .map(([f]) => `\`${f}\``).join(", "),
         md(def.description),
       ]),
     ),

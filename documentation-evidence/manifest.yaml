@@ -1,11 +1,11 @@
 manifestVersion: 1
 name: "@jpisgeek/documentation-evidence"
-version: 2026.10.14.1
+version: 2026.10.14.2
 description: >
   Validate fixed-schema operational metadata from versioned Swamp resources
   and render an infrastructure guide with bounded counts, status flags and
   original observation times, without arbitrary projection or live probes.
-repository: https://github.com/jpisgeek/slog-bog/tree/documentation-evidence-2026.10.14.1/documentation-evidence
+repository: https://github.com/jpisgeek/slog-bog/tree/documentation-evidence-2026.10.14.2/documentation-evidence
 license: MIT
 paths:
   base: manifest

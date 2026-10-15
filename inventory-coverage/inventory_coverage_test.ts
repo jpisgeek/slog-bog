@@ -20,7 +20,7 @@ const type = {
   toString: () => source.modelType,
   toDirectoryPath: () => source.modelType,
 };
-const modelRepository = { findByIdGlobal: async () => ({ type }) };
+const modelRepository = { findAllByIdGlobal: async () => [{ type }] };
 const repo = (value: unknown) => ({
   findByName: async () => ({
     name: "summary",
@@ -177,12 +177,29 @@ Deno.test("errors and missing evidence are distinct and cannot erase the other s
   }
 });
 Deno.test("capture rejects projections, extra arguments, duplicates and invalid freshness budgets", async () => {
+  assertEquals(model.methods.capture.arguments.safeParse({}).success, true);
+  for (const key of ["fields", "__proto__", "constructor", ""]) {
+    assertEquals(
+      model.methods.capture.arguments.safeParse({ [key]: "PRIVATE_VALUE" })
+        .success,
+      false,
+    );
+  }
   for (
     const globalArgs of [
+      { sources: [{ ...source, ["__proto__"]: "PRIVATE_VALUE" }] },
+      { sources: [source], ["__proto__"]: "PRIVATE_VALUE" },
       { sources: [{ ...source, fields: ["password"] }] },
       { sources: [{ ...source, zeroFields: ["unhealthy"] }] },
       { sources: [{ ...source, label: "PRIVATE_LABEL" }] },
       { sources: [source, source] },
+      { sources: [source, { ...source, category: "network" }] },
+      {
+        sources: [{
+          ...source,
+          modelId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        }],
+      },
       ...[0, -1, 31_536_001, 0.5, "3600"].map((maxAgeSeconds) => ({
         sources: [source],
         maxAgeSeconds,
@@ -253,4 +270,16 @@ Deno.test("capture cancellation is not converted to an error row or persisted", 
   );
   assertEquals(error, reason);
   assertEquals(writes, 0);
+});
+
+Deno.test("ambiguous producer UUIDs are error evidence, never complete coverage", async () => {
+  const result = await capture(
+    { sources: [source] },
+    repo(clear),
+    { findAllByIdGlobal: async () => [{ type }, { type }] },
+    now,
+  );
+  assertEquals(result.rows[0].freshness, "error");
+  assertEquals(result.rows[0].observation.available, false);
+  assertEquals(result.coverageComplete, false);
 });

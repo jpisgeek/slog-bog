@@ -12,61 +12,81 @@ export const Category = z.enum([
   "automation",
   "documentation",
 ]);
+/** Reject unknown members, including __proto__ which Zod otherwise skips. */
+export function strictObject<T extends z.ZodRawShape>(shape: T) {
+  return z.object({ ...shape, ["__proto__"]: z.never().optional() }).strict()
+    .overwrite((value) => {
+      Reflect.deleteProperty(value, "__proto__");
+      return value;
+    });
+}
+/** An empty finite-key record rejects every method input without merging globals. */
+export const CaptureArgs = z.record(z.enum([]), z.never());
 const Count = z.number().int().min(0).max(1_000_000);
 /** Version 1 producer contract. Every key is required; null means unknown. */
-export const OperationalMetadata = z.object({
+export const OperationalMetadata = strictObject({
   schemaVersion: z.literal(1),
   observedAt: z.iso.datetime({ precision: 3 }).nullable(),
   collectorStatus: z.enum(["succeeded", "failed", "unknown"]),
-  counts: z.object({
+  counts: strictObject({
     expected: Count,
     observed: Count,
     unhealthy: Count,
     unknown: Count,
-  }).strict().refine(
+  }).refine(
     (c) => c.observed <= c.expected && c.unhealthy + c.unknown <= c.observed,
     "Observed cannot exceed expected; unhealthy plus unknown cannot exceed observed",
   ),
-  flags: z.object({
+  flags: strictObject({
     reachable: z.boolean().nullable(),
     configured: z.boolean().nullable(),
-  }).strict(),
-}).strict();
+  }),
+});
 /** Routing stays in private configuration, not copied into evidence outputs. */
-export const Source = z.object({
+export const Source = strictObject({
   category: Category,
   modelType: z.string().regex(
     /^@?[A-Za-z][A-Za-z0-9_-]*(\/[A-Za-z][A-Za-z0-9_-]*)+$/,
   ),
-  modelId: z.string().uuid(),
+  modelId: z.string().uuid().regex(/^[0-9a-f-]+$/),
   dataName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/),
-}).strict();
+});
 /** At most one source per fixed category; arbitrary labels/selectors are rejected. */
 export const Sources = z.array(Source).min(1).max(6).refine(
   (sources) => new Set(sources.map((s) => s.category)).size === sources.length,
   "Categories must be unique",
+).refine(
+  (sources) =>
+    new Set(sources.map((s) =>
+      JSON.stringify([
+        s.modelType,
+        s.modelId,
+        s.dataName,
+      ])
+    )).size === sources.length,
+  "A source resource cannot satisfy multiple categories",
 );
-const GlobalArgs = z.object({ sources: Sources }).strict();
+const GlobalArgs = strictObject({ sources: Sources });
 /** A missing resource is not a zero-valued or successful observation. */
-export const Observation = z.object({
+export const Observation = strictObject({
   category: Category,
   version: z.number().int().positive().safe().nullable(),
   available: z.boolean(),
   metadata: OperationalMetadata.nullable(),
-}).strict().refine(
+}).refine(
   (o) =>
     o.available === (o.metadata !== null) &&
     (!o.available || o.version !== null),
   "Availability requires versioned metadata",
 );
 /** Stored snapshot contains no arbitrary text or pre-rendered Markdown. */
-export const Snapshot = z.object({
+export const Snapshot = strictObject({
   collectedAt: z.iso.datetime({ precision: 3 }),
   observations: z.array(Observation).min(1).max(6).refine(
     (rows) => new Set(rows.map((r) => r.category)).size === rows.length,
     "Categories must be unique",
   ),
-}).strict();
+});
 /** Use Swamp's actual type object, obtained from the model repository/context. */
 export type TypeRef = { toString(): string; toDirectoryPath(): string };
 /** Public repository subset; no raw datastore or filesystem access. */
@@ -93,8 +113,39 @@ export type EvidenceRepository = {
 };
 /** Resolve configured UUIDs to the runtime's real model type, not a duck-typed path. */
 export type EvidenceModels = {
-  findByIdGlobal(id: string): Promise<{ type: TypeRef } | null>;
+  findAllByIdGlobal?(id: string): Promise<Array<{ type: TypeRef }>>;
 };
+
+// Bound caller waiting, not backend work: the repository API has no abort input.
+async function readWithin<T>(
+  read: (wait: <V>(pending: Promise<V>) => Promise<V>) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  signal?.throwIfAborted();
+  let timer: ReturnType<typeof setTimeout>;
+  let abort: () => void;
+  let timeout: Error | undefined;
+  const stopped = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timeout = Error("Evidence read timed out");
+      reject(timeout);
+    }, 30_000);
+    abort = () => reject(signal!.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    return await read(async (pending) => {
+      const value = await Promise.race([pending, stopped]);
+      // An already fulfilled first entry can win even when stopped rejected.
+      if (timeout) throw timeout;
+      signal?.throwIfAborted();
+      return value;
+    });
+  } finally {
+    clearTimeout(timer!);
+    signal?.removeEventListener("abort", abort!);
+  }
+}
 
 /**
  * Exact-name metadata lookup and pinned streaming content read. Limits this
@@ -108,35 +159,66 @@ export async function readStored(
   version?: number,
   signal?: AbortSignal,
 ): Promise<{ version: number; bytes: Uint8Array | null } | null> {
-  signal?.throwIfAborted();
-  const data = await repo.findByName(type, id, name, version);
-  signal?.throwIfAborted();
-  if (!data) return null;
-  if (data.name !== name) throw Error("Renamed evidence is not an exact match");
-  if (data.isDeleted) return null;
-  const size = data.size;
-  if (
-    !Number.isSafeInteger(data.version) || data.version < 1 ||
-    (version !== undefined && data.version !== version) ||
-    typeof size !== "number" || !Number.isSafeInteger(size) || size < 0 ||
-    size > MAX_SNAPSHOT_BYTES
-  ) throw Error("Invalid or oversized evidence metadata");
-  const buffer = new Uint8Array(MAX_SNAPSHOT_BYTES);
-  let used = 0;
-  for await (const chunk of repo.stream(type, id, name, data.version)) {
+  return await readWithin(async (wait) => {
+    const data = await wait(repo.findByName(type, id, name, version));
     signal?.throwIfAborted();
-    if (chunk.byteLength > MAX_SNAPSHOT_BYTES - used) {
-      throw Error("Evidence exceeds size limit");
+    if (!data) return null;
+    if (data.name !== name) {
+      throw Error("Renamed evidence is not an exact match");
     }
-    buffer.set(chunk, used);
-    used += chunk.byteLength;
-  }
-  signal?.throwIfAborted();
-  if (used !== size) throw Error("Evidence size differs from metadata");
-  return {
-    version: data.version,
-    bytes: used ? buffer.subarray(0, used) : null,
-  };
+    if (data.isDeleted) return null;
+    const size = data.size;
+    if (
+      !Number.isSafeInteger(data.version) || data.version < 1 ||
+      (version !== undefined && data.version !== version) ||
+      typeof size !== "number" || !Number.isSafeInteger(size) || size < 0 ||
+      size > MAX_SNAPSHOT_BYTES
+    ) throw Error("Invalid or oversized evidence metadata");
+    const buffer = new Uint8Array(MAX_SNAPSHOT_BYTES);
+    let used = 0;
+    let chunks = 0;
+    const iterator = repo.stream(type, id, name, data.version)
+      [Symbol.asyncIterator]();
+    let done = false;
+    try {
+      while (!done) {
+        const item = await wait(iterator.next());
+        signal?.throwIfAborted();
+        done = item.done === true;
+        if (done) break;
+        // Empty chunks consume a finite budget too. Yield to tasks so an
+        // immediately resolved iterator cannot starve deadline/abort timers.
+        if (++chunks > MAX_SNAPSHOT_BYTES) {
+          throw Error("Evidence exceeds chunk limit");
+        }
+        if (chunks % 64 === 0) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 1));
+          signal?.throwIfAborted();
+        }
+        const chunk = item.value;
+        if (chunk.byteLength > MAX_SNAPSHOT_BYTES - used) {
+          throw Error("Evidence exceeds size limit");
+        }
+        buffer.set(chunk, used);
+        used += chunk.byteLength;
+      }
+    } finally {
+      if (!done) {
+        // Do not wait indefinitely for a pending pull/close the API cannot cancel.
+        try {
+          void iterator.return?.().catch(() => undefined);
+        } catch {
+          // Cleanup must not replace cancellation or the original read failure.
+        }
+      }
+    }
+    signal?.throwIfAborted();
+    if (used !== size) throw Error("Evidence size differs from metadata");
+    return {
+      version: data.version,
+      bytes: used ? buffer.subarray(0, used) : null,
+    };
+  }, signal);
 }
 
 function decimalIdentity(text: string): string | null {
@@ -157,8 +239,28 @@ export function parseEvidence(bytes: Uint8Array): unknown {
   if (bytes.length > MAX_SNAPSHOT_BYTES) {
     throw Error("Evidence exceeds size limit");
   }
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  // Scan strings and structural tokens before JSON.parse discards duplicate
+  // members. Full syntax and decimal validation remain with JSON.parse below.
+  const stack: Array<{ keys: Set<string> | null; key: boolean }> = [];
+  for (const [token] of text.matchAll(/"(?:\\.|[^"\\])*"|[{}[\],:]/g)) {
+    const frame = stack.at(-1);
+    if (token === "{" || token === "[") {
+      stack.push({ keys: token === "{" ? new Set() : null, key: true });
+      if (stack.length > 16) throw Error("Evidence nesting exceeds limit");
+    } else if (token === "}" || token === "]") {
+      stack.pop();
+    } else if (token === "," && frame) {
+      frame.key = true;
+    } else if (token.startsWith('"') && frame?.keys && frame.key) {
+      const key = JSON.parse(token) as string;
+      if (frame.keys.has(key)) throw Error("Duplicate evidence member");
+      frame.keys.add(key);
+      frame.key = false;
+    }
+  }
   return JSON.parse(
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    text,
     (_key: string, value: unknown, context?: { source?: string }) => {
       if (
         typeof value === "number" &&
@@ -185,14 +287,23 @@ export async function collect(
   const out: z.infer<typeof Observation>[] = [];
   for (const source of sources) {
     signal?.throwIfAborted();
-    const producer = await models.findByIdGlobal(source.modelId);
+    if (!models.findAllByIdGlobal) {
+      throw Error("Collision-safe definition lookup is required");
+    }
+    const producers = await readWithin(
+      (wait) => wait(models.findAllByIdGlobal!(source.modelId)),
+      signal,
+    );
     signal?.throwIfAborted();
-    if (!producer || String(producer.type) !== source.modelType) {
-      throw Error("Source model type does not match configured UUID");
+    const matches = producers.filter((p) =>
+      String(p.type) === source.modelType
+    );
+    if (matches.length !== 1) {
+      throw Error("Source UUID/type is missing or ambiguous");
     }
     const stored = await readStored(
       repo,
-      producer.type,
+      matches[0].type,
       source.modelId,
       source.dataName,
       undefined,
@@ -251,7 +362,7 @@ export function render(observations: z.infer<typeof Observation>[]): string {
 /** Capture validated stored metadata with bounded retention and no backend authority. */
 export const model = {
   type: "@jpisgeek/documentation-evidence",
-  version: "2026.10.14.1",
+  version: "2026.10.14.2",
   globalArguments: GlobalArgs,
   resources: {
     snapshot: {
@@ -266,7 +377,7 @@ export const model = {
     capture: {
       description:
         "Validate operational metadata v1 from existing stored resources; no arbitrary projections",
-      arguments: z.object({}),
+      arguments: CaptureArgs,
       execute: async (args: Record<string, never>, context: {
         globalArgs: unknown;
         signal?: AbortSignal;
@@ -280,7 +391,7 @@ export const model = {
         ): Promise<{ name: string }>;
       }) => {
         try {
-          z.object({}).strict().parse(args);
+          CaptureArgs.parse(args);
           context.signal?.throwIfAborted();
           const { sources } = GlobalArgs.parse(context.globalArgs);
           context.logger?.info("Capturing fixed operational metadata");

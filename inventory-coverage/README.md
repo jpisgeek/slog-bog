@@ -9,8 +9,8 @@ probes backends or assumes retained evidence proves current health. Shared code
 comes from @jpisgeek/documentation-evidence, an intentionally public MIT sibling
 package in this repository, not a private deployment name.
 
-**Version** `2026.10.14.1` · **License** MIT · **Source**
-https://github.com/jpisgeek/slog-bog/tree/inventory-coverage-2026.10.14.1/inventory-coverage
+**Version** `2026.10.14.2` · **License** MIT · **Source**
+https://github.com/jpisgeek/slog-bog/tree/inventory-coverage-2026.10.14.2/inventory-coverage
 
 ## Install
 
@@ -79,7 +79,12 @@ unknown cannot exceed observed (disjoint subsets). Outcome is succeeded, failed
 or unknown. Flags are booleans or null. Time is null or a valid UTC ISO
 timestamp with exactly three fractional-second digits. Every object is strict:
 extra/missing keys, free text, unsupported enums, coerced values, arbitrary
-field selection and legacy zeroFields/trueFields/falseFields are rejected. Raw
+field selection and legacy zeroFields/trueFields/falseFields are rejected.
+Duplicate decoded JSON keys, including escape-equivalent names, are rejected at
+every object depth; nesting is limited to 16. UUIDs must be canonical lowercase.
+The reserved `__proto__` member is explicitly rejected, not silently discarded
+by Zod. Capture accepts no method inputs: its empty finite-key record schema
+keeps Swamp's global-argument merging separate from method-input validation. Raw
 collector resources need a separately reviewed fixed mapping, not an arbitrary
 projection. The unpublished projection draft is not supported.
 
@@ -105,21 +110,33 @@ validate derived fields/counters and read only the successful capture's exact
 summary version, with no fallback.
 
 Categories are compute, storage, network, applications, automation and
-documentation, one source per category (1-6). Source UUID/type/name routing
+documentation, one source per category (1-6). Source UUID/type/name routing is
+unique across categories: the same resource cannot satisfy two categories. It
 follows @jpisgeek/documentation-evidence's contract and is not copied into
-outputs. UUID must match its model type; rename redirects are rejected. Recorded
-sizes must be integers 0-64,000 before streaming. Source/report streams
-accumulate at most 64,000 bytes inside this extension; overflow or a final size
-differing from metadata is an error, never truncation. This is NOT a
-whole-platform allocation bound: Swamp may buffer metadata, scan definitions to
-resolve a UUID, enumerate versions without a latest marker, hydrate content or
-buffer remote-worker artifacts before yielding. The repository/backend and
-metadata writers are trusted; attacker-controlled storage is unsupported.
-Backend quotas/isolation are the operator's responsibility. Filesystem backend
-tested; hydration and remote-worker allocation not tested or claimed bounded.
-Requires definitionRepository.findByIdGlobal and
+outputs. UUID must have exactly one definition of the declared type; missing or
+copied same-type definitions produce an error row. Rename redirects are
+rejected. Recorded sizes must be integers 0-64,000 before streaming.
+Source/report streams accumulate at most 64,000 bytes inside this extension;
+overflow or a final size differing from metadata is an error, never truncation.
+Each stream permits at most 64,000 chunks, including empty chunks, and yields to
+tasks every 64 chunks so immediately resolved streams cannot starve
+cancellation/deadline timers. Exhausting this no-progress/chunk budget is an
+error. This is NOT a whole-platform allocation bound: Swamp may buffer metadata,
+scan definitions to resolve a UUID, enumerate versions without a latest marker,
+hydrate content or buffer remote-worker artifacts before yielding. The
+repository/backend and metadata writers are trusted; attacker-controlled storage
+is unsupported. Backend quotas/isolation are the operator's responsibility.
+Filesystem backend tested; hydration and remote-worker allocation not tested or
+claimed bounded. Requires definitionRepository.findAllByIdGlobal and
 dataRepository.findByName/stream; unsupported contexts fail rather than using
-unbounded fallback reads. Malformed UTF-8 and numeric
+unbounded fallback reads. Each definition lookup has a 30-second caller-wait
+deadline; each metadata-plus-content read has a separate 30-second deadline, not
+renewed by chunks. A timeout is an error row; caller cancellation rejects
+pending reads promptly and is never converted to a row. Iterator closure is
+requested, not awaited indefinitely. These APIs cannot cancel backend work;
+pending reads/close may continue. Backend timeouts/quotas remain necessary.
+Writes are platform-owned, outside this read deadline; abort cannot roll back
+data persisted during a write. Malformed UTF-8 and numeric
 rounding/underflow/non-finite/negative-zero evidence is an error. Numeric
 parsing requires JSON reviver source-context support. Retention is 30 days and
 at most 30 versions. Pure-data tests cover macOS ARM64 and Linux x86_64; this

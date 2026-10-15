@@ -43,6 +43,11 @@ caveats: |
   Future times are retained, never treated as fresh by @jpisgeek/inventory-coverage.
   Extra or missing keys at every object level, unsupported values, coercion,
   arbitrary selectors and free-text labels are rejected, not silently stripped.
+  Duplicate decoded JSON member names (including escape-equivalent keys) are
+  rejected at every object depth before schema validation; nesting is limited to 16.
+  The reserved `__proto__` member is explicitly rejected, not silently discarded
+  by Zod. Capture accepts no method inputs: its empty finite-key record schema
+  keeps Swamp's global-argument merging separate from method-input validation.
 
   Run `capture` against an existing producer; it writes one `snapshot` with
   `collectedAt` and observations. The latest exact named version is pinned;
@@ -53,15 +58,20 @@ caveats: |
   snapshot version and renders from validated fields; no older/latest fallback.
 
   Categories are compute, storage, network, applications, automation and
-  documentation, one source per category (1-6 total). Source model IDs are UUIDs;
-  types use slash-separated ASCII identifier segments. Resource names are
+  documentation, one source per category (1-6 total). Source model IDs are canonical lowercase UUIDs;
+  each (modelType, modelId, dataName) resource can satisfy only one category.
+  Types use slash-separated ASCII identifier segments. Resource names are
   1-200 ASCII letters/digits/dot/colon/underscore/hyphen, starting alphanumeric.
   These are storage routes, not shell paths. Routing identifiers stay in the
   configuration and are not copied to snapshots/reports. Exact-name metadata
-  lookup rejects rename redirects; the configured UUID must match its model type.
+  lookup rejects rename redirects; the configured UUID must have exactly one
+  definition of the declared type. Copied same-type definitions are ambiguous and rejected.
   Recorded size must be an integer from 0 to 64,000 before streaming begins.
   Source/report streams accumulate at most 64,000 bytes in this extension;
   overflow or a byte count differing from recorded size fails without truncation.
+  Each stream permits at most 64,000 chunks, including empty chunks, and yields
+  to the task queue every 64 chunks so immediately resolved reads cannot starve
+  cancellation/deadline timers. The chunk budget also bounds no-progress streams.
   This is NOT a whole-platform allocation bound: Swamp may buffer metadata,
   scan definitions to resolve a UUID, enumerate versions when a latest marker is absent, hydrate content or buffer
   remote-worker artifacts before yielding. The Swamp repository/backend and its
@@ -69,8 +79,14 @@ caveats: |
   Backend resource quotas/isolation are the operator's responsibility, not provided
   by this schema. Locally tested with the filesystem backend; remote-worker and
   hydration allocation are not tested or claimed bounded. Malformed UTF-8/JSON fails.
-  Requires context definitionRepository.findByIdGlobal plus dataRepository.findByName
+  Requires context definitionRepository.findAllByIdGlobal plus dataRepository.findByName
   and stream; unsupported contexts fail rather than falling back to unbounded reads.
+  Each definition lookup has a 30-second caller-wait deadline; each metadata-plus-content
+  read has a separate 30-second deadline, not renewed by chunks. Caller abort rejects
+  pending reads promptly and requests iterator closure. These APIs cannot cancel
+  backend work: a pending backend read/close may continue after timeout or abort.
+  Backend timeouts/quotas remain necessary. Writes are platform-owned and not subject
+  to this read deadline; an abort during a write cannot roll back persisted data.
   Numeric JSON must survive decimal round-trip; rounded,
   underflowed, non-finite and negative-zero values fail closed. Numeric parsing
   requires JSON reviver source-context support. Snapshots retain 30 days and

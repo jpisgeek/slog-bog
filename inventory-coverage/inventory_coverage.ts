@@ -1,24 +1,26 @@
 /** Coverage of fixed operational metadata, not arbitrary selected conditions. */
 import { z } from "npm:zod@4";
 import {
+  CaptureArgs,
   collect,
   type EvidenceModels,
   type EvidenceRepository,
   Observation,
   render as renderEvidence,
   Sources,
+  strictObject,
 } from "../documentation-evidence/documentation_evidence.ts";
 
-const Args = z.object({
+const Args = strictObject({
   sources: Sources,
   maxAgeSeconds: z.number().int().positive().max(31_536_000).default(3600),
-}).strict();
-const Row = z.object({
+});
+const Row = strictObject({
   observation: Observation,
   freshness: z.enum(["fresh", "stale", "unknown", "unavailable", "error"]),
   condition: z.enum(["clear", "degraded", "unknown"]),
   complete: z.boolean(),
-}).strict();
+});
 type Row = z.infer<typeof Row>;
 
 function assess(
@@ -55,7 +57,7 @@ function assess(
 }
 
 /** Coverage is complete evidence, not necessarily healthy services; derived fields are checked. */
-export const Summary = z.object({
+export const Summary = strictObject({
   assessedAt: z.iso.datetime({ precision: 3 }),
   maxAgeSeconds: z.number().int().positive().max(31_536_000),
   coverageComplete: z.boolean(),
@@ -63,7 +65,7 @@ export const Summary = z.object({
   fresh: z.number().int().min(0).max(6),
   degraded: z.number().int().min(0).max(6),
   rows: z.array(Row).min(1).max(6),
-}).strict().refine(
+}).refine(
   (s) =>
     s.sources === s.rows.length &&
     new Set(s.rows.map((r) => r.observation.category)).size === s.rows.length &&
@@ -150,7 +152,7 @@ export function render(input: z.infer<typeof Summary>): string {
 /** Fixed-contract stored-evidence model with no live-backend authority. */
 export const model = {
   type: "@jpisgeek/inventory-coverage",
-  version: "2026.10.14.1",
+  version: "2026.10.14.2",
   globalArguments: Args,
   resources: {
     summary: {
@@ -165,7 +167,7 @@ export const model = {
     capture: {
       description:
         "Assess operational metadata v1 without contacting external services",
-      arguments: z.object({}),
+      arguments: CaptureArgs,
       execute: async (args: Record<string, never>, ctx: {
         globalArgs: unknown;
         dataRepository: EvidenceRepository;
@@ -179,7 +181,7 @@ export const model = {
         ): Promise<{ name: string }>;
       }) => {
         try {
-          z.object({}).strict().parse(args);
+          CaptureArgs.parse(args);
           ctx.logger?.info("Assessing fixed operational metadata coverage");
           const summary = await capture(
             Args.parse(ctx.globalArgs),
