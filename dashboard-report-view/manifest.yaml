@@ -1,0 +1,31 @@
+manifestVersion: 1
+name: "@jpisgeek/dashboard-report-view"
+version: 2026.11.08.1
+description: >
+  Interactive HTML snapshots with readable state tables, local filters and a
+  named refresh button. Includes a fetch-handler factory for an existing host;
+  starts no server and keeps authorization with the host and Swamp Server.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/dashboard-report-view
+license: MIT
+paths:
+  base: manifest
+models:
+  - dashboard_report_view.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+  - HOSTING.md
+  - USE-CASES.md
+  - PROPOSAL.md
+platforms: []
+labels:
+  - dashboard
+  - html
+  - reporting
+  - interactive
+dependencies: []

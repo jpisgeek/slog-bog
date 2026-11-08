@@ -1,0 +1,42 @@
+package: "@jpisgeek/dashboard-report-view"
+purpose: >-
+  Turns an explicit snapshot into a human-readable HTML report with local text
+  and state filters, observation time, evidence, and a refresh button. A host
+  handler factory embeds it into an existing server without starting a new
+  listener. The host authorizes every read and refresh, then runs one configured
+  Swamp workflow. A portable successor to a working fleet health and leaderboard
+  report prototype; it does not install a native Swamp dashboard page.
+example: |
+  globalArguments:
+    snapshot:
+      schemaVersion: 1
+      title: Fleet health
+      observedAt: "2026-11-08T12:00:00.000Z"
+      sections:
+        - title: mac-mini
+          rows:
+            - label: Disk space
+              value: null
+              state: unknown
+              evidence: No observation yet
+        - title: mac-studio
+          rows:
+            - label: Memory
+              value: null
+              state: stale
+              evidence: Awaiting a fresh Swamp check
+caveats: >-
+  See USE-CASES.md for the Swamp Quest flow, fleet monitoring and other
+  compositions, and PROPOSAL.md for the native dashboard integration request.
+  The renderer reads only supplied data and
+  never fetches scores, infers freshness, or starts schedules. Producers must
+  label stale and unavailable state explicitly. Offline HTML supports filters;
+  live refresh requires the existing host adapter described in HOSTING.md.
+security: >-
+  No secrets, machine addresses, provider access, shell, process, or listener.
+  All snapshot strings are HTML-escaped. The host must authenticate and authorize
+  every request with scoped Swamp grants. Refresh is an empty POST to one fixed
+  path, with same-origin checks and a custom header. Request data never chooses
+  a workflow or supplies inputs. Errors suppress internal details. Hosting HTML
+  as a privileged dashboard document requires an appropriate isolation policy;
+  native dashboard embedding remains an upstream proposal.
