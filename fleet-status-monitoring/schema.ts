@@ -61,3 +61,28 @@ export const Observation = z.strictObject({
 });
 export type TargetValue = z.infer<typeof Target>;
 export type ObservationValue = z.infer<typeof Observation>;
+
+/** A scan identity written before any observations are attempted. */
+export const Cycle = z.strictObject({
+  cycleId: z.string().uuid(),
+  startedAt: z.iso.datetime(),
+});
+/** Safe reason classes; OS exception messages and paths are never retained. */
+export const ProbeFailure = z.enum([
+  "contract-validation",
+  "observation-failed",
+]);
+/** Native observation with its original timing and explicit failure classification. */
+export const LocalProbe = z.strictObject({
+  startedAt: z.iso.datetime(),
+  finishedAt: z.iso.datetime(),
+  state: z.enum(["observed", "unavailable"]),
+  failureKind: ProbeFailure.nullable(),
+  sample: Sample.nullable(),
+});
+/** The complete collector output for exactly one bounded inventory. */
+export const Collected = z.strictObject({
+  cycleId: z.string().uuid(),
+  checkedAt: z.iso.datetime(),
+  systems: z.array(Observation).min(1).max(100),
+});

@@ -26,6 +26,7 @@ additionalFiles:
   - HOSTING.md
   - USE-CASES.md
   - fleet_contract.ts
+  - evidence.ts
   - fleet_controls.ts
   - fleet_host.ts
   - fleet_view.ts

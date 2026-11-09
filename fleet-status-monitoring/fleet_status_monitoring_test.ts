@@ -4,6 +4,8 @@ import {
   Policy,
   summarize,
 } from "./fleet_status_monitoring.ts";
+import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20261105.71";
+import { projectObservation } from "./fleet_contract.ts";
 import { renderFleet } from "./fleet_view.ts";
 import { latestResult, normalize } from "./fleet_system_stats.ts";
 import {
@@ -63,15 +65,18 @@ const row = () => normalize(target, transport(), cycle, now);
 const policy = Policy.parse({});
 Deno.test("collector and report projection enforce the same workflow evidence ID limit", () => {
   for (const schema of [CollectorObservation, ProjectedObservation]) {
+    const evidence = schema === ProjectedObservation
+      ? projectObservation(row())
+      : row();
     check(
-      schema.safeParse({ ...row(), sourceWorkflowRunId: "r".repeat(100) })
+      schema.safeParse({ ...evidence, sourceWorkflowRunId: "r".repeat(100) })
         .success,
     );
     check(
-      !schema.safeParse({ ...row(), sourceWorkflowRunId: "r".repeat(101) })
+      !schema.safeParse({ ...evidence, sourceWorkflowRunId: "r".repeat(101) })
         .success,
     );
-    check(schema.safeParse({ ...row(), sourceWorkflowRunId: null }).success);
+    check(schema.safeParse({ ...evidence, sourceWorkflowRunId: null }).success);
   }
 });
 Deno.test("fresh counters normalize with source evidence and assess healthy", () => {
@@ -80,7 +85,7 @@ Deno.test("fresh counters normalize with source evidence and assess healthy", ()
     r.sample?.osVersion === "test-version" && r.sourceVersion === 3 &&
       r.sourceWorkflowRunId === "run-proof",
   );
-  check(assess(r, policy, now).health === "healthy");
+  check(assess(projectObservation(r), policy, now).health === "healthy");
 });
 Deno.test("ranking validates attempt identity and cannot revive success after a newer malformed payload", () => {
   const good = transport();
@@ -140,12 +145,14 @@ Deno.test("unexpected target, malformed output and future clocks fail closed", (
 Deno.test("zero headroom is a real alert; null counters are unknown", () => {
   const r = row();
   r.sample = { ...sample, memoryAvailableBytes: 0 };
-  check(assess(r, policy, now).health === "attention");
+  check(assess(projectObservation(r), policy, now).health === "attention");
   r.sample = { ...sample, memoryAvailableBytes: null };
-  check(assess(r, policy, now).health === "unknown");
+  check(assess(projectObservation(r), policy, now).health === "unknown");
 });
 Deno.test("stale observations are separated from unhealthy or healthy", () => {
-  check(assess(row(), policy, now + 1900000).health === "stale");
+  check(
+    assess(projectObservation(row()), policy, now + 1900000).health === "stale",
+  );
 });
 Deno.test("unsupported targets remain a coverage gap and are never called offline", () => {
   const r = normalize(
@@ -154,13 +161,17 @@ Deno.test("unsupported targets remain a coverage gap and are never called offlin
     cycle,
     now,
   );
-  check(assess(r, policy, now).health === "unsupported");
+  check(assess(projectObservation(r), policy, now).health === "unsupported");
 });
 Deno.test("OS coverage counts real observations independently of partial health counters", () => {
   const r = row();
   r.sample = { ...sample, memoryAvailableBytes: null };
   const state = summarize(
-    { cycleId: cycle.cycleId, systems: [r] },
+    {
+      cycleId: cycle.cycleId,
+      checkedAt: new Date(now).toISOString(),
+      systems: [r],
+    },
     cycle,
     policy,
     now,
@@ -174,8 +185,13 @@ Deno.test("OS coverage counts real observations independently of partial health 
 });
 Deno.test("different cycles and duplicate identities reject a misleading fleet summary", () => {
   for (
-    const raw of [{ cycleId: crypto.randomUUID(), systems: [row()] }, {
+    const raw of [{
+      cycleId: crypto.randomUUID(),
+      checkedAt: new Date(now).toISOString(),
+      systems: [row()],
+    }, {
       cycleId: cycle.cycleId,
+      checkedAt: new Date(now).toISOString(),
       systems: [row(), row()],
     }]
   ) {
@@ -192,7 +208,11 @@ Deno.test("readable HTML escapes labels and embeds exactly the canonical state",
   const r = row();
   r.label = "<img src=x onerror=alert(1)>";
   const state = summarize(
-    { cycleId: cycle.cycleId, systems: [r] },
+    {
+      cycleId: cycle.cycleId,
+      checkedAt: new Date(now).toISOString(),
+      systems: [r],
+    },
     cycle,
     policy,
     now,
@@ -221,17 +241,18 @@ Deno.test("capacity contract rejects free exceeding total and extra private fiel
   check(!Sample.safeParse({ ...sample, username: "unwanted" }).success);
 });
 Deno.test("begin creates persisted scan identity rather than performing transport", async () => {
-  const writes: unknown[] = [];
-  await behavior.methods.begin.execute(
-    {},
-    {
-      writeResource: async (...args: unknown[]) => {
-        writes.push(args);
-        return {};
-      },
-    } as never,
+  const t = createModelTestContext({ definition: { name: "fleet-health" } });
+  const result = await behavior.methods.begin.execute({}, t.context);
+  const [write] = t.getWrittenResources();
+  check(
+    t.getWrittenResources().length === 1 && write.specName === "cycle" &&
+      write.name === "cycle",
   );
-  check(writes.length === 1);
+  check(behavior.resources.cycle.schema.safeParse(write.data).success);
+  check(
+    result.dataHandles[0] === write.handle &&
+      t.getLogsByLevel("info").length === 2,
+  );
 });
 
 Deno.test("authentication failure is an access gap, not a claim that the system is offline", () => {
@@ -245,7 +266,8 @@ Deno.test("authentication failure is an access gap, not a claim that the system 
   const r = normalize(target, raw, cycle, now);
   check(
     r.state === "access-required" &&
-      assess(r, policy, now).health === "access-required" && r.sample === null,
+      assess(projectObservation(r), policy, now).health === "access-required" &&
+      r.sample === null,
   );
 });
 
@@ -266,7 +288,11 @@ function controlsFixture(versionMissing = false) {
     now,
   );
   const state = summarize(
-    { cycleId: cycle.cycleId, systems: [good, access] },
+    {
+      cycleId: cycle.cycleId,
+      checkedAt: new Date(now).toISOString(),
+      systems: [good, access],
+    },
     cycle,
     policy,
     now,
@@ -406,7 +432,7 @@ Deno.test("switching transport methods uses the latest attempt rather than unrel
 Deno.test("missing memory counters cannot hide known disk exhaustion", () => {
   const r = row();
   r.sample = { ...sample, memoryAvailableBytes: null, diskAvailableBytes: 0 };
-  const result = assess(r, policy, now);
+  const result = assess(projectObservation(r), policy, now);
   check(
     result.health === "attention" &&
       result.issues.includes("Low startup-data disk space"),

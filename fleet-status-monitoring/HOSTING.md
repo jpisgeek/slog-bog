@@ -63,8 +63,7 @@ Installing this package does not inject that link into native Swamp UI.
 The stored `fleet-report.html` file has no response headers of its own. If you
 serve it without `createFleetHandler`, authorize each viewer and apply the same
 Content-Security-Policy (including `frame-ancestors 'none'`),
-`Cache-Control:
-no-store`, content type, `nosniff` and no-referrer headers as
+`Cache-Control: no-store`, content type, `nosniff` and no-referrer headers as
 the handler.
 
 Before deployment, test the whole journey: dashboard and assets, report,

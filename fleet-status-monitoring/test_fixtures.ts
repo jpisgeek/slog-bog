@@ -9,6 +9,7 @@ export function fixtureState() {
   return summarize(
     {
       cycleId: cycle.cycleId,
+      checkedAt: new Date(now).toISOString(),
       systems: [{
         id: "mac-mini",
         label: "Mac Mini",
@@ -21,6 +22,7 @@ export function fixtureState() {
         state: "observed",
         reason: "Observed",
         sample: {
+          schemaVersion: 1,
           observedAt: new Date(now).toISOString(),
           family: "macos",
           osName: "macOS",
@@ -46,4 +48,40 @@ export function fixtureState() {
     1,
     "00000000-0000-4000-8000-000000000002",
   );
+}
+
+/** Complete synthetic SDK record for tests; no live datastore is read. */
+export function fixtureRecord(
+  attributes: Record<string, unknown>,
+  name = "observations",
+  workflowRunId = "00000000-0000-4000-8000-000000000002",
+  version = 1,
+) {
+  return {
+    id: "00000000-0000-4000-8000-000000000003",
+    name,
+    version,
+    isLatest: true,
+    createdAt: new Date().toISOString(),
+    namespace: "example",
+    attributes,
+    tags: {},
+    modelName: "example-behavior",
+    modelId: "00000000-0000-4000-8000-000000000004",
+    modelType: "example/type",
+    specName: name,
+    dataType: "resource",
+    contentType: "application/json",
+    lifetime: "30d",
+    ownerType: "model",
+    streaming: false,
+    size: 0,
+    content: attributes,
+    ownerRef: "example",
+    workflowRunId,
+    workflowName: "example-fleet",
+    jobName: "scan",
+    stepName: "example",
+    source: "test",
+  };
 }

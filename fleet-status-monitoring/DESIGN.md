@@ -19,8 +19,8 @@ process list, user-file contents or credential. On macOS it measures
 Linux it measures `/`. It never enumerates mounted installers or disk images,
 and never sums shared APFS capacity across volumes. An unavailable product
 version remains null; a kernel release is not substituted for it. Windows NT
-metadata is partial: load and capacity stay unavailable. Load is not CPU
-utilization. OS versions do not establish patch currency or support.
+metadata is partial: product version, load and capacity stay unavailable. Load
+is not CPU utilization. OS versions do not establish patch currency or support.
 
 `probe_source.ts` exports an optional fixed Python 3 source for
 restricted-command SSH deployments. It is not executed by the extension or the
@@ -58,3 +58,38 @@ retains at most 12 versions. At a 15-minute cadence those version caps are about
 two days and three hours respectively, less with manual refreshes. Runtime
 retention is not backup retention. Preserve needed evidence separately through
 your approved backup process.
+
+Global arguments, policy thresholds and owned resource contracts reject unknown
+keys. The report projection explicitly removes only `sourceHost`, the private
+transport locator; inventory enums and `sample.schemaVersion` are preserved.
+Official SSH evidence may contain other official fields: the adapter explicitly
+selects its six documented transport fields before validating a strict DTO.
+
+Own cycle and local-probe attributes are read with `readResource`. That API
+returns no version or workflow metadata, so a separate `readModelData` lookup
+matches the complete validated attributes to exactly one metadata record. A
+concurrent replacement fails the run instead of combining different versions.
+Cross-behavior singleton results are ranked by validated start/check time,
+independent of array order. Versions break timestamp ties only within the same
+resource instance. A newer invalid payload remains invalid; an older successful
+payload is never used as a substitute.
+
+All four methods log their start and completion using structured fields. Probe
+failures retain and log only `contract-validation` or `observation-failed`,
+never raw exception text, paths or command output. Collection logs coverage gaps
+at debug level. Missing prerequisites name the behavior and required workflow
+steps.
+
+Rendering and validation finish before either output is written. HTML is stored
+first; canonical `state` is committed last. These writes are not a transaction:
+if the final state write fails, a newer standalone HTML file can remain, while
+the canonical state and dashboard keep their previous timestamps. A failed run
+must not be reported as a successful refresh. Rerun the complete workflow;
+historical snapshots are not rewritten. Hosts should render from canonical state
+through `createFleetHandler`, rather than treating the latest standalone file as
+proof of a successful scan.
+
+Method tests use the pinned official Swamp test context with in-memory resource,
+file and logging ports. Observer and renderer factories permit deterministic
+failure injection; they are code-level test seams, not workflow arguments. No
+method test runs the native host observer or a remote probe.

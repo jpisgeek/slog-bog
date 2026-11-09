@@ -5,48 +5,19 @@ const Text = z.string().max(160).refine((s) =>
     return n < 32 || (n >= 127 && n <= 159);
   })
 );
-const Metric = z.number().finite().nonnegative().nullable();
-/** Validated public projection of the collector contract. */
-export const Sample = z.object({
-  observedAt: z.iso.datetime({ offset: true }),
-  family: z.enum(["macos", "linux", "windows", "other"]),
-  osName: Text,
-  osVersion: Text.nullable(),
-  kernel: Text,
-  architecture: Text,
-  logicalCores: z.number().int().positive().nullable(),
-  uptimeSeconds: Metric,
-  memoryTotalBytes: Metric,
-  memoryAvailableBytes: Metric,
-  memoryAvailableKind: Text,
-  diskTotalBytes: Metric,
-  diskAvailableBytes: Metric,
-  load1: Metric,
-});
-/** Validated public projection of the collector contract. */
-export const Observation = z.object({
-  id: z.string().min(1).max(64),
-  label: Text,
-  group: Text,
-  kind: Text,
-  collector: Text,
-  note: Text,
-  cycleId: z.string().uuid(),
-  checkedAt: z.iso.datetime(),
-  state: z.enum([
-    "observed",
-    "unreachable",
-    "access-required",
-    "unsupported",
-    "unavailable",
-  ]),
-  reason: Text,
-  sample: Sample.nullable(),
-  sourceVersion: z.number().int().positive().nullable(),
-  sourceWorkflowRunId: z.string().max(100).nullable(),
-});
+import { Observation as SourceObservation, Sample } from "./schema.ts";
+export { Sample } from "./schema.ts";
+/** Strict report projection: remove only the private transport locator. */
+export const Observation = SourceObservation.omit({ sourceHost: true });
+/** Explicitly project a validated source row; all enums and sample versions survive. */
+export function projectObservation(raw: unknown): z.infer<typeof Observation> {
+  const { sourceHost: _sourceHost, ...publicFields } = SourceObservation.parse(
+    raw,
+  );
+  return Observation.parse(publicFields);
+}
 /** Operator-defined thresholds and maximum observation age. */
-export const Policy = z.object({
+export const Policy = z.strictObject({
   maxAgeSeconds: z.number().int().min(60).max(86400).default(1800),
   minMemoryPercent: z.number().min(0).max(100).default(5),
   minDiskPercent: z.number().min(0).max(100).default(5),
@@ -64,10 +35,10 @@ export const Row = Observation.extend({
     "access-required",
     "unsupported",
   ]),
-  issues: z.array(Text),
+  issues: z.array(Text).max(16),
 });
 /** Canonical fleet report, preserving original observation and run evidence. */
-export const State = z.object({
+export const State = z.strictObject({
   schemaVersion: z.literal(1),
   title: z.literal("Fleet Status Monitoring"),
   generatedAt: z.iso.datetime(),
@@ -77,7 +48,7 @@ export const State = z.object({
   workflowRunId: z.string().max(100).nullable(),
   policy: Policy,
   systems: z.array(Row).min(1).max(100),
-  totals: z.object({
+  totals: z.strictObject({
     configured: z.number().int().nonnegative().max(100),
     scanned: z.number().int().nonnegative().max(100),
     healthy: z.number().int().nonnegative().max(100),
@@ -85,8 +56,8 @@ export const State = z.object({
     gaps: z.number().int().nonnegative().max(100),
   }),
   operatingSystems: z.array(
-    z.object({
-      family: Text,
+    z.strictObject({
+      family: Sample.shape.family,
       version: Text,
       count: z.number().int().min(1).max(100),
     }),

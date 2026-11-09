@@ -51,10 +51,10 @@ No arguments.
 
 ### Data written
 
-| resource       | lifetime | fields                                       | description                                                               |
-| -------------- | -------- | -------------------------------------------- | ------------------------------------------------------------------------- |
-| `localProbe`   | 30d      | `startedAt`, `finishedAt`, `state`, `sample` | Native local observation; the workflow owns when it runs                  |
-| `observations` | 30d      | `cycleId`, `checkedAt`, `systems`            | Per-system observations for one scan; failed attempts replace old success |
+| resource       | lifetime | fields                                                      | description                                                               |
+| -------------- | -------- | ----------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `localProbe`   | 30d      | `startedAt`, `finishedAt`, `state`, `failureKind`, `sample` | Native local observation; the workflow owns when it runs                  |
+| `observations` | 30d      | `cycleId`, `checkedAt`, `systems`                           | Per-system observations for one scan; failed attempts replace old success |
 
 ## `@jpisgeek/fleet-status-monitoring`
 
@@ -130,13 +130,14 @@ Follow QUICKSTART.md for server-backed setup and the unscheduled starter
 workflow. HOSTING.md documents the optional handler for an existing HTTPS host;
 pulling this package does not install a native dashboard page or start a server.
 USE-CASES.md covers fleet monitoring and a Quest composition. The native local
-probe supports macOS and Linux; Windows load and capacity remain explicitly
-unavailable. An optional fixed Python probe supports restricted-command SSH
-targets. The adapters themselves are platform independent. Remote targets
-require a separately configured official @swamp/ssh behavior. Only one local
-inventory target is allowed because it identifies the serve host. Runtime
-retention is bounded and is not backup proof. Example fleets in USE-CASES.md are
-generic compositions, not disclosures of a deployment.
+probe supports macOS and Linux; Windows product version, load and capacity
+remain explicitly unavailable; the NT kernel release is not used as a product
+version. An optional fixed Python probe supports restricted-command SSH targets.
+The adapters themselves are platform independent. Remote targets require a
+separately configured official @swamp/ssh behavior. Only one local inventory
+target is allowed because it identifies the serve host. Runtime retention is
+bounded and is not backup proof. Example fleets in USE-CASES.md are generic
+compositions, not disclosures of a deployment.
 
 ## Security
 
@@ -155,9 +156,11 @@ explicit inputs.
 **Stored infrastructure data:** `observations` retains the declared machine
 inventory, including SSH host names (`sourceHost`), labels and notes, along with
 OS measurements and source evidence. It keeps at most 192 versions or 30 days.
-The report's `state` and `fleet-report.html` omit `sourceHost` but include every
-system's label, note, OS name and version, kernel, uptime, capacity and health.
-Treat these artifacts as infrastructure data and authorize every viewer.
+The report's `state` and `fleet-report.html` explicitly remove only the
+transport locator `sourceHost`; they preserve the sample schema version and
+inventory enums, and include every system's label, note, OS name and version,
+kernel, uptime, capacity and health. Treat these artifacts as infrastructure
+data and authorize every viewer.
 
 | File output                  | Content                                                       | Retention                      |
 | ---------------------------- | ------------------------------------------------------------- | ------------------------------ |
