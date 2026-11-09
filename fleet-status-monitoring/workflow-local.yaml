@@ -1,0 +1,52 @@
+id: 121426d8-cc21-444e-aed9-a599ff4a18b8
+name: "@jpisgeek/fleet-status-monitoring/local"
+version: 1
+description: >-
+  Manual local Fleet Status Monitoring starter: native read-only system probe,
+  explicit gaps and a versioned HTML report. No schedule or key provisioning.
+vaults: []
+jobs:
+  - name: local-fleet
+    dependsOn: []
+    steps:
+      - name: begin-scan
+        dependsOn: []
+        allowFailure: false
+        task:
+          type: model_method
+          modelIdOrName: fleet-health
+          methodName: begin
+          inputs: {}
+      - name: probe-local
+        dependsOn:
+          - step: begin-scan
+            condition:
+              type: succeeded
+        allowFailure: true
+        task:
+          type: model_method
+          modelIdOrName: fleet-counters
+          methodName: probe
+          inputs: {}
+      - name: normalize
+        dependsOn:
+          - step: probe-local
+            condition:
+              type: completed
+        allowFailure: false
+        task:
+          type: model_method
+          modelIdOrName: fleet-counters
+          methodName: collect
+          inputs: {}
+      - name: render
+        dependsOn:
+          - step: normalize
+            condition:
+              type: succeeded
+        allowFailure: false
+        task:
+          type: model_method
+          modelIdOrName: fleet-health
+          methodName: render
+          inputs: {}

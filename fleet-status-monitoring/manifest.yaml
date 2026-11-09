@@ -1,0 +1,38 @@
+manifestVersion: 1
+name: "@jpisgeek/fleet-status-monitoring"
+version: 2026.11.09.1
+description: >
+  Fleet Status Monitoring: normalize versioned system probes, distinguish fresh
+  health from access and coverage gaps, and render a filterable report with an
+  authenticated host adapter. Includes an unscheduled local starter workflow.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/fleet-status-monitoring
+license: MIT
+paths:
+  base: manifest
+models:
+  - fleet_system_stats.ts
+  - fleet_status_monitoring.ts
+workflows:
+  - workflow-local.yaml
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+  - DESIGN.md
+  - QUICKSTART.md
+  - HOSTING.md
+  - USE-CASES.md
+  - fleet_contract.ts
+  - fleet_controls.ts
+  - fleet_host.ts
+  - fleet_view.ts
+  - native_probe.ts
+  - probe_source.ts
+  - schema.ts
+  - view_options.ts
+platforms: []
+labels: [fleet, monitoring, health, dashboard]
+dependencies: []
