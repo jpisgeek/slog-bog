@@ -1,0 +1,25 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:04.000
+Fleet Status Monitoring beta 2026.11.09.1. Synthetic examples; no live systems.
+
+00:00:04.000 --> 00:00:11.000
+The released report keeps configured systems, checked systems, health and coverage gaps distinct.
+
+00:00:11.000 --> 00:00:17.000
+Search for build and apply the filter. Filtering changes the view without running another check.
+
+00:00:17.000 --> 00:00:24.000
+The build host needs attention because startup-data free space is below the configured threshold.
+
+00:00:24.000 --> 00:00:31.000
+No configured access means no current observation. Missing measurements remain unknown, not zero.
+
+00:00:31.000 --> 00:00:38.000
+A one-hour-old sample exceeds the 30-minute freshness policy. It is marked stale, not healthy.
+
+00:00:38.000 --> 00:00:45.000
+The checks cover startup-data capacity and freshness. This offline example has no backend and live refresh is disabled.
+
+00:00:45.000 --> 00:00:50.000
+Download the interactive example or share this walkthrough. Install the beta channel explicitly.

@@ -1,0 +1,98 @@
+{
+  "title": "Fleet Status Monitoring beta example",
+  "version": "2026.11.09.1",
+  "channel": "beta",
+  "sourceCommit": "b859ddfa03501ff2a6fcb992f91f8a793b1526cd",
+  "sourceUrl": "https://github.com/jpisgeek/slog-bog/tree/b859ddfa03501ff2a6fcb992f91f8a793b1526cd/fleet-status-monitoring",
+  "data": "Entirely synthetic. Timestamps are generated when the example is opened or reset.",
+  "network": "No live backend. Content Security Policy blocks connections. Live refresh is disabled by the demo host.",
+  "sourceUnmodified": true,
+  "workflowRun": false,
+  "sourceFiles": [
+    {
+      "path": "fleet-status-monitoring/LICENSE",
+      "sha256": "a58839186da4e4f05a375bff769e52e5fec022f8fc28cc80deb2d056ed428b71"
+    },
+    {
+      "path": "fleet-status-monitoring/evidence.ts",
+      "sha256": "48d649ff7a7159ee06203018a310dd3bfe0056c71481ce0a4f9395b4f6901715"
+    },
+    {
+      "path": "fleet-status-monitoring/fleet_contract.ts",
+      "sha256": "f51e1e48fc932a3af4b480dc76da87c2692b68dc4c38d776fab03a8de44563b6"
+    },
+    {
+      "path": "fleet-status-monitoring/fleet_controls.ts",
+      "sha256": "919b6be057958a02dc72720c3990245c0e37d1daade5143c233b137dd54d452b"
+    },
+    {
+      "path": "fleet-status-monitoring/fleet_host.ts",
+      "sha256": "1c768fcf011b2a20b58eb8f91f52f28ecb9ae8e4d47d32279b99c52cff98c2cb"
+    },
+    {
+      "path": "fleet-status-monitoring/fleet_status_monitoring.ts",
+      "sha256": "6d2b740af8bdc833a9e6f3dc3b332ad8fffea341038f41d0abfe2191de42295e"
+    },
+    {
+      "path": "fleet-status-monitoring/fleet_view.ts",
+      "sha256": "db0ef12729a094d7dc461e73551df7d9ed1616bef037b08f9386521418fcd96f"
+    },
+    {
+      "path": "fleet-status-monitoring/manifest.yaml",
+      "sha256": "2fc6cc7b1f6d6b6ac9e87dab55421c35e864f1129797449d20b124941a0e6dcf"
+    },
+    {
+      "path": "fleet-status-monitoring/schema.ts",
+      "sha256": "cbd9296809a499b95b2239bcbb0a42cb90753679c296f5cd140ed8848ebc3afd"
+    },
+    {
+      "path": "fleet-status-monitoring/test_fixtures.ts",
+      "sha256": "03517355d79810587fae659a70cc0a4f03f1307296bb548334c943e6e600978f"
+    },
+    {
+      "path": "fleet-status-monitoring/view_options.ts",
+      "sha256": "0d0d8ac1c058d9afc57ab1e28797d216952724233f2eef58cbc84a64778907d0"
+    }
+  ],
+  "createdOn": "2026-11-10",
+  "walkthrough": {
+    "file": "fleet-beta-walkthrough.mp4",
+    "durationSeconds": 50,
+    "resolution": "1920x1080",
+    "codec": "H.264",
+    "frameRate": 30,
+    "audio": false,
+    "capture": "Edited still captures from actual browser interactions with the released-code synthetic example, not continuous live footage.",
+    "sha256": "59ed407a53e8250bd29e2ef5ed1845494f4c7c4678f59ef1d6b47b89b3ad1880"
+  },
+  "checks": {
+    "mixedScenario": {
+      "configured": 3,
+      "scanned": 2,
+      "healthy": 1,
+      "attention": 1,
+      "gaps": 1
+    },
+    "staleScenario": {
+      "configured": 3,
+      "scanned": 1,
+      "healthy": 0,
+      "attention": 1,
+      "gaps": 2
+    },
+    "browserInteractions": [
+      "name filter",
+      "Apply filters",
+      "clear name",
+      "group filter",
+      "status filter",
+      "empty result",
+      "mixed/stale scenario switch",
+      "reset example",
+      "live refresh disabled"
+    ],
+    "sourceToBundleParity": "Independent review confirmed identical output to pinned local source for both scenarios.",
+    "privateIdentifiers": "No private infrastructure data or credentials included.",
+    "mediaReview": "All eight compositions reviewed. Final caption timing and install-command continuation corrected; every video frame decoded successfully."
+  }
+}
