@@ -1,15 +1,22 @@
 package: "@jpisgeek/imagegen"
 publicationNote: >-
-  for security review requirements. Shared as GitHub source, not a Swamp registry release.
+  for the registry release security review requirements.
 install: |
-  Clone this repository and register the source in your Swamp repository:
+  Install the published behavior into your Swamp repository:
+
+  ```sh
+  swamp extension pull @jpisgeek/imagegen
+  ```
+
+  See [Mac setup](MAC_SETUP.md) before running the behavior. The package includes
+  an editable [workflow template](examples/imagegen.workflow.yaml).
+  This installs the adapter only, not mflux or model weights.
+
+  For source development instead, clone this repository and register the model:
 
   ```sh
   swamp extension source add /example/slog-bog/imagegen --only models
   ```
-
-  See [Mac setup](MAC_SETUP.md) before running the behavior. An editable
-  [workflow template](examples/imagegen.workflow.yaml) is included.
 purpose: >-
   Generate local PNG graphics with FLUX.1-schnell through mflux and MLX on Apple
   Silicon. The default is 4-bit weights, four inference steps and 1024 × 1024.
@@ -49,12 +56,14 @@ caveats: |
   Outputs are not deleted by Swamp receipt garbage collection. Failed runs can
   leave partial files; inspect and remove those manually.
 
-  Verification on Apple M5 with 32 GB memory: a real Swamp workflow generated
-  and recorded a decoded, visually inspected 512 × 512 PNG; a direct adapter
-  invocation also generated a 1024 × 1024 PNG. Both used four steps and offline
-  environment flags with local weights. Networking was not disabled, so these
-  runs do not establish network isolation. See MAC_SETUP.md for exact versions
-  and the tested checkpoint. Unit tests also run on Linux.
+  Verification on Apple M5 with 32 GB memory: real Swamp text-to-image and
+  image-to-image runs passed with decoded, visually inspected PNGs and receipts.
+  A direct adapter invocation also generated a 1024 × 1024 PNG. A separate
+  inference process loaded a re-saved checkpoint and rendered successfully with
+  network access denied; a socket control confirmed the restriction. This does
+  not establish whole-workflow isolation or a machine-wide air gap, and the
+  behavior does not enforce network denial itself. See MAC_SETUP.md for exact
+  versions, checkpoint and scope. Unit tests also run on Linux.
 security: |
   The configured executable, Python dependencies and checkpoint are trusted local
   inputs, not a sandbox. The process inherits the operator's permissions and
