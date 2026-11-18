@@ -30,13 +30,24 @@ control. Use Python's native arm64 build, not Rosetta.
 python3 -m venv /example/runtime
 /example/runtime/bin/python -m pip install 'mflux==0.24.0'
 /example/runtime/bin/mflux-generate --help
-/example/runtime/bin/mflux-save --model schnell --quantize 4 --path /example/models/schnell-q4
+/example/runtime/bin/python - <<'PYTHON'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="dhairyashil/FLUX.1-schnell-mflux-4bit",
+    revision="0e0b247ac48b8bf86fd5b440813b7da5854e238b",
+    local_dir="/example/models/schnell-q4",
+    allow_patterns=["*.json", "*.txt", "*.model", "*.safetensors"],
+    token=False,
+    max_workers=4,
+)
+PYTHON
 mkdir -p /example/output
 chmod 700 /example/output
 ```
 
-`mflux-save` may download upstream full-precision weights before quantization.
-Do this while online, then run one online smoke image to finish loading assets:
+The pinned prequantized model download is about 9 GB. The package includes no
+weights. Do this while online, then run one online smoke image to finish loading
+assets:
 
 ```sh
 /example/runtime/bin/mflux-generate \
@@ -66,9 +77,10 @@ pixels across runtime or model versions.
 
 ## Register and run with Swamp
 
-Register the source as shown in the generated README. Create an instance named
-`imagegen` of type `@jpisgeek/imagegen`, using the global arguments in that
-README. Use your installed Swamp's command help for instance creation:
+Install the registry package as shown in the generated README, or register the
+source if you are developing locally. Create an instance named `imagegen` of
+type `@jpisgeek/imagegen`, using the global arguments in that README. Use your
+installed Swamp's command help for instance creation:
 
 ```sh
 swamp help model create
@@ -121,14 +133,40 @@ Apple M5 Mac with 32 GB unified memory was tested on 2026-11-18:
   revision `0e0b247ac48b8bf86fd5b440813b7da5854e238b`.
 
 These timings are observations, not performance guarantees. The tested
-checkpoint was downloaded already quantized; the upstream `mflux-save`
-preparation route above was not separately tested. Check the model license
-before downloading. The adapter's Hugging Face offline flags were enabled and
-cached assets loaded, but networking was not disabled or firewalled during these
-runs. This verifies local inference, not enforced network isolation. Complete
-the disconnected smoke test above if you require that assurance. Image-to-image
-conditioning was covered by argument tests, not a real reference-image render.
-The tested setup required normal Metal access; an OS/process sandbox that hides
+checkpoint was downloaded already quantized. Exporting it again with the command
+below passed without new downloads:
+
+```sh
+/example/runtime/bin/mflux-save \
+  --model /example/models/schnell-q4 --base-model schnell --quantize 4 \
+  --path /example/models/schnell-q4-export
+```
+
+This tests local checkpoint loading and saving, not conversion from original
+full-precision weights. The alternative
+`mflux-save --model schnell --quantize 4
+--path /example/models/schnell-q4` may
+download full-precision weights and has not been separately tested. Check the
+model license before downloading.
+
+Image-to-image conditioning passed through a real Swamp method run: 512 × 512,
+seed 44, four steps, strength 0.4, using the 1024px output as reference. The
+receipt's reference hash matched the input and the output PNG decoded correctly.
+Visual inspection retained the main subject, but a requested eye-color change
+was not obeyed exactly. Treat conditioning as approximate, not guaranteed
+editing.
+
+The adapter's Hugging Face offline flags were enabled and cached assets loaded
+in the runs above, but networking was not disabled during those initial runs. A
+separate independent run loaded the re-saved checkpoint with the inference
+process denied network access. It succeeded at 512 × 512, seed 45, four steps;
+the PNG decoded correctly and was visually inspected. A socket control connected
+without the restriction and failed with EPERM under the same restriction. This
+verifies network-denied inference from the saved checkpoint, not an entire Swamp
+workflow under network denial or a machine-wide air gap. The behavior sets
+offline flags but does not install or enforce this process restriction itself.
+
+The tested setup requires normal Metal access; an OS/process sandbox that hides
 Metal cannot run inference.
 
 ## Primary references
