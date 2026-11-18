@@ -1,0 +1,36 @@
+# Import this template using your Swamp version's workflow creation/edit flow.
+# A new workflow ID is allocated by swamp workflow create; do not copy another ID.
+name: imagegen
+description: Generate a local swamp graphic with prepared offline schnell weights.
+version: 1
+inputs:
+  properties:
+    prompt:
+      type: string
+      description: Image description; do not include secrets.
+    seed:
+      type: integer
+      default: 42
+    width:
+      type: integer
+      default: 1024
+    height:
+      type: integer
+      default: 1024
+  required:
+    - prompt
+jobs:
+  - name: render
+    description: Local image generation, with a provenance receipt.
+    steps:
+      - name: generate
+        task:
+          type: model_method
+          modelIdOrName: imagegen
+          methodName: generate
+          inputs:
+            prompt: ${{ inputs.prompt }}
+            seed: ${{ inputs.seed }}
+            width: ${{ inputs.width }}
+            height: ${{ inputs.height }}
+            steps: 4
