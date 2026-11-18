@@ -1,0 +1,29 @@
+manifestVersion: 1
+name: "@jpisgeek/imagegen"
+version: 2026.11.18.1
+license: MIT
+description: Local offline FLUX.1-schnell image generation with mflux on Apple Silicon.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/imagegen
+paths:
+  base: manifest
+models:
+  - imagegen.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - readme.vars.yaml
+  - LICENSE
+  - imagegen_test.ts
+  - MAC_SETUP.md
+  - examples/imagegen.workflow.yaml
+platforms:
+  - darwin-aarch64
+labels:
+  - image
+  - offline
+  - mflux
+dependencies: []
