@@ -349,6 +349,18 @@ Deno.test("ownership needs the marker to match model, name, home, and instance d
 // Flows against a fake limactl
 // ---------------------------------------------------------------------------
 
+// Fake VM flows need a supported host even when the test runner is on Linux.
+// Restore it at the end of each test; refusal cases set their own OS and arch.
+function fakeHost(os: typeof Deno.build.os, arch: typeof Deno.build.arch) {
+  const build = Deno.build;
+  Object.defineProperty(Deno, "build", { value: { ...build, os, arch } });
+  return {
+    [Symbol.dispose]() {
+      Object.defineProperty(Deno, "build", { value: build });
+    },
+  };
+}
+
 type Fake = {
   dir: string;
   bin: string;
@@ -769,39 +781,82 @@ Deno.test("inspect: an instance with the right name but no marker is unmanaged; 
   }
 });
 
-Deno.test("plan: missing instance plans a create only on macOS; validate is called with the rendered file; config is stored", async () => {
-  const f = await fakeLimactl();
-  try {
-    const { ctx, written, files } = fakeCtx(withFake(f));
-    await behavior.methods.plan.execute({}, ctx as any);
-    const plan = written["plan-assistant-vm"] as Record<string, any>;
-    assertEquals(
-      plan.action,
-      Deno.build.os === "darwin" ? "create" : "blocked-prerequisites",
-    );
-    if (Deno.build.os !== "darwin") {
+for (
+  const { os, arch, action, prerequisites } of [
+    { os: "darwin", arch: "aarch64", action: "create", prerequisites: [] },
+    {
+      os: "linux",
+      arch: "aarch64",
+      action: "blocked-prerequisites",
+      prerequisites: ["host os is linux; Lima vz needs macOS"],
+    },
+    {
+      os: "darwin",
+      arch: "x86_64",
+      action: "blocked-prerequisites",
+      prerequisites: ["host arch x86_64 does not match requested aarch64"],
+    },
+    {
+      os: "linux",
+      arch: "x86_64",
+      action: "blocked-prerequisites",
+      prerequisites: [
+        "host os is linux; Lima vz needs macOS",
+        "host arch x86_64 does not match requested aarch64",
+      ],
+    },
+  ] as const
+) {
+  Deno.test(`plan: missing instance on ${os}/${arch}; validate is called with the rendered file; config is stored`, async () => {
+    using _host = fakeHost(os, arch);
+    const f = await fakeLimactl();
+    try {
+      const g = withFake(f);
+      const { ctx, written, files } = fakeCtx(g);
+      await behavior.methods.plan.execute({}, ctx as any);
+      const plan = written["plan-assistant-vm"] as Record<string, any>;
+      assertEquals(plan.action, action);
+      assertEquals(plan.prerequisites, prerequisites);
+      if (action === "blocked-prerequisites") {
+        for (const method of ["create", "start", "stop", "destroy"] as const) {
+          const error = await assertRejects(
+            () =>
+              behavior.methods[method].execute({
+                configHash: "0".repeat(64),
+                confirmName: "assistant-vm",
+                preservation: "no-unique-data",
+              } as never, fakeCtx(g).ctx as any),
+            Error,
+            "host is not ready",
+          );
+          for (const prerequisite of prerequisites) {
+            assertStringIncludes(error.message, prerequisite);
+          }
+        }
+        assert(
+          !(await f.calls()).some((c) =>
+            / (create|start|stop|delete) /.test(c)
+          ),
+        );
+      }
+      assertEquals(plan.validated, true);
+      assertMatch(plan.configHash, /^[0-9a-f]{64}$/);
+      const calls = await f.calls();
       assert(
-        plan.prerequisites.includes(
-          `host os is ${Deno.build.os}; Lima vz needs macOS`,
-        ),
+        calls.some((c) => c.startsWith("--tty=false validate ")),
+        calls.join("|"),
       );
+      assertEquals(Object.keys(files).length, 1);
+      const stored = JSON.parse(Object.values(files)[0]);
+      assertEquals(stored.mounts, []);
+    } finally {
+      await Deno.remove(f.dir, { recursive: true });
     }
-    assertEquals(plan.validated, true);
-    assertMatch(plan.configHash, /^[0-9a-f]{64}$/);
-    const calls = await f.calls();
-    assert(
-      calls.some((c) => c.startsWith("--tty=false validate ")),
-      calls.join("|"),
-    );
-    assertEquals(Object.keys(files).length, 1);
-    const stored = JSON.parse(Object.values(files)[0]);
-    assertEquals(stored.mounts, []);
-  } finally {
-    await Deno.remove(f.dir, { recursive: true });
-  }
-});
+  });
+}
 
 Deno.test("plan: prerequisites block; an unmanaged instance blocks; drift says replacement-required", async () => {
+  using _host = fakeHost("darwin", "aarch64");
   const f = await fakeLimactl();
   try {
     const g = withFake(f);
@@ -904,6 +959,7 @@ Deno.test("plan: prerequisites block; an unmanaged instance blocks; drift says r
 });
 
 Deno.test("create: refuses a wrong hash and a name collision; on success writes the marker and releases the lock", async () => {
+  using _host = fakeHost("darwin", "aarch64");
   const f = await fakeLimactl();
   try {
     const g = withFake(f);
@@ -984,6 +1040,7 @@ Deno.test("create: refuses a wrong hash and a name collision; on success writes 
 });
 
 Deno.test("create: a failed limactl create is reported and nothing is deleted", async () => {
+  using _host = fakeHost("darwin", "aarch64");
   const f = await fakeLimactl();
   try {
     const g = withFake(f);
@@ -1047,6 +1104,7 @@ Deno.test("OS lock refuses even an old live owner, releases on close, and refuse
 });
 
 Deno.test("start/stop/destroy refuse an unmanaged instance; destroy refuses a running one, a wrong name, and a bare backup claim", async () => {
+  using _host = fakeHost("darwin", "aarch64");
   const f = await fakeLimactl();
   try {
     const g = withFake(f);
@@ -1374,6 +1432,7 @@ Deno.test("all persisted process strings are escaped and bounded; verification u
 });
 
 Deno.test("start refuses desired drift, observed drift and missing config, including running no-op", async () => {
+  using _host = fakeHost("darwin", "aarch64");
   for (const status of ["Stopped", "Running"]) {
     const f = await fakeLimactl();
     try {
@@ -1419,6 +1478,7 @@ Deno.test("start refuses desired drift, observed drift and missing config, inclu
 });
 
 Deno.test("mutations observe ownership and state only after acquiring the lock", async () => {
+  using _host = fakeHost("darwin", "aarch64");
   for (const method of ["start", "stop", "destroy"] as const) {
     const f = await fakeLimactl();
     try {
@@ -1461,6 +1521,7 @@ Deno.test("mutations observe ownership and state only after acquiring the lock",
 });
 
 Deno.test("destroy rechecks running state and all mutations reject unmet prerequisites under lock", async () => {
+  using _host = fakeHost("darwin", "aarch64");
   const f = await fakeLimactl();
   try {
     const { inst } = await ownedFixture(f);
@@ -1516,6 +1577,7 @@ Deno.test("destroy rechecks running state and all mutations reject unmet prerequ
 });
 
 Deno.test("approved start and stopped destroy still work under their locks", async () => {
+  using _host = fakeHost("darwin", "aarch64");
   const f = await fakeLimactl();
   try {
     const { inst } = await ownedFixture(f);
