@@ -11,7 +11,7 @@ X11, host keys, and proxy environment all switched off. It records what it
 observes, refuses what it does not own, and stops on drift rather than reshaping
 a VM underneath whatever is running in it.
 
-**Version** `2026.11.19.1` · **License** MIT · **Source**
+**Version** `2026.11.19.2` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/lima
 
 ## Install

@@ -1203,8 +1203,14 @@ async function guestShell(
 /** The @jpisgeek/lima model: inspect, plan, create, start, verify, stop, destroy. */
 export const model = {
   type: "@jpisgeek/lima",
-  version: "2026.11.19.1",
+  version: "2026.11.19.2",
   globalArguments: GlobalArgsObjectSchema,
+  upgrades: [{
+    toVersion: "2026.11.19.2",
+    description:
+      "Bound CLI cancellation cleanup; global arguments are unchanged",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }],
   resources: {
     host: {
       description:

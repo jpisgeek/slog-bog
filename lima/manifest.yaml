@@ -1,7 +1,7 @@
 manifestVersion: 1
 license: MIT
 name: "@jpisgeek/lima"
-version: 2026.11.19.1
+version: 2026.11.19.2
 description: >
   One dedicated Linux VM on a Mac, owned and driven through Lima. Renders the
   whole configuration from pinned inputs instead of inheriting Lima's default
