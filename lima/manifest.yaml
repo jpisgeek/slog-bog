@@ -1,0 +1,35 @@
+manifestVersion: 1
+license: MIT
+name: "@jpisgeek/lima"
+version: 2026.11.19.1
+description: >
+  One dedicated Linux VM on a Mac, owned and driven through Lima. Renders the
+  whole configuration from pinned inputs instead of inheriting Lima's default
+  template, so the guest gets no host home, no agent or X11 forwarding, no
+  host keys, no proxy environment, and no port that was not listed. Ownership
+  is a marker this model wrote; a VM that merely shares the name is left
+  alone. Drift is reported as replacement-required and never repaired in
+  place, a failed create deletes nothing, and destroy is a separate door
+  that wants the exact name, a stopped VM, and a preservation decision.
+repository: https://github.com/jpisgeek/slog-bog/tree/main/lima
+paths:
+  base: manifest
+models:
+  - lima.ts
+workflows: []
+vaults: []
+drivers: []
+datastores: []
+reports: []
+additionalFiles:
+  - README.md
+  - LICENSE
+platforms:
+  - darwin-aarch64
+labels:
+  - lima
+  - vm
+  - macos
+  - virtualization
+  - isolation
+dependencies: []
