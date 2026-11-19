@@ -769,13 +769,23 @@ Deno.test("inspect: an instance with the right name but no marker is unmanaged; 
   }
 });
 
-Deno.test("plan: missing instance plans a create; validate is called with the rendered file; config is stored", async () => {
+Deno.test("plan: missing instance plans a create only on macOS; validate is called with the rendered file; config is stored", async () => {
   const f = await fakeLimactl();
   try {
     const { ctx, written, files } = fakeCtx(withFake(f));
     await behavior.methods.plan.execute({}, ctx as any);
     const plan = written["plan-assistant-vm"] as Record<string, any>;
-    assertEquals(plan.action, "create");
+    assertEquals(
+      plan.action,
+      Deno.build.os === "darwin" ? "create" : "blocked-prerequisites",
+    );
+    if (Deno.build.os !== "darwin") {
+      assert(
+        plan.prerequisites.includes(
+          `host os is ${Deno.build.os}; Lima vz needs macOS`,
+        ),
+      );
+    }
     assertEquals(plan.validated, true);
     assertMatch(plan.configHash, /^[0-9a-f]{64}$/);
     const calls = await f.calls();
