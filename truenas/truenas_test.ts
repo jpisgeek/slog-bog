@@ -20,7 +20,7 @@
  * assert on an error message.
  */
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert@1";
-import { __testOnly, model } from "./truenas.ts";
+import { model } from "./truenas.ts";
 
 // Behavioral tests need an in-memory socket, but the published model must not
 // expose a factory that could bypass its maxPayload guard. Load a test-only
@@ -29,6 +29,14 @@ import { __testOnly, model } from "./truenas.ts";
 // payload/redirect tests below.
 const productionSource = await Deno.readTextFile(
   new URL("./truenas.ts", import.meta.url),
+);
+// Test-only hooks exist in this unshipped harness, never in the release module.
+const hookSource =
+  `export const __testOnly = {\n  assertConnectedDestination,\n  assertNoApiKeyInGeneratedName,\n  RawSystemSchema,\n  RawPoolSchema,\n  RawDiskSchema,\n  RawAlertSchema,\n  RawCertificateSchema,\n  classifyFrame,\n  encodeIdentity,\n  identityPart,\n  instanceName,\n  parsePercent,\n  safeRemoteText,\n  toIsoOrNull,\n};`;
+const { __testOnly } = await import(
+  `data:application/typescript,${
+    encodeURIComponent(productionSource + "\n" + hookSource)
+  }#test-hooks`
 );
 const factoryStartMarker =
   "const openBoundedWebSocket: OpenWebSocket = (url) =>";
@@ -1168,7 +1176,7 @@ Deno.test("the hint is scoped to auth: a later RPC failure does not claim it", a
   );
   assertEquals(err !== null, true);
   assertEquals(err!.message.includes("pool is busy"), true);
-  assertEquals(err!.message.includes(String(remoteCode)), false);
+  assertEquals(err!.message.includes(String(remoteCode)), true);
   assertEquals(err!.message.includes("auth.login_ex"), false);
 });
 
@@ -1275,8 +1283,11 @@ Deno.test("an oversized RPC error message is bounded the same way", async () => 
   assertEquals(err !== null, true);
   assertEquals(err!.message.length < 500, true);
   assertEquals(err!.message.includes("truncated"), true);
-  assertEquals(err!.message.startsWith("TrueNAS RPC failure:"), true);
-  assertEquals(err!.message.includes("11"), false);
+  assertEquals(
+    err!.message.startsWith("TrueNAS RPC pool.query failed (code 11):"),
+    true,
+  );
+  assertEquals(err!.message.includes("11"), true);
 });
 
 // ---------------------------------------------------------------------------
@@ -1919,7 +1930,7 @@ Deno.test("a malformed fragmentation throws instead of reporting a pristine 0%",
   }
 });
 
-Deno.test("an absent fragmentation is still the benign 0", async () => {
+Deno.test("an absent fragmentation is unknown", async () => {
   const rec = recorder();
   await withFakeWs(
     () => model.methods.discover.execute({}, ctxFor(OK, { recorder: rec })),
@@ -1937,12 +1948,9 @@ Deno.test("an absent fragmentation is still the benign 0", async () => {
       }),
     },
   );
-  // Argued, not overlooked: 0% fragmentation is never itself an alarming
-  // value, so no gate is lulled by it. Tightening the malformed case must not
-  // drag the absent one along with it.
   assertEquals(
     rec.written.find((w) => w.type === "pool")!.data.fragmentationPercent,
-    0,
+    -1,
   );
 });
 
@@ -2849,7 +2857,11 @@ Deno.test("the handshake refuses a redirect outright: the second origin is never
   // wrong. The only thing that makes a redirect harmless is that it is never
   // taken.
   let targetHits = 0;
-  const target = Deno.serve({ port: 0, onListen: () => {} }, (req) => {
+  const target = Deno.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    onListen: () => {},
+  }, (req) => {
     targetHits++;
     if (req.headers.get("upgrade") === "websocket") {
       const { response } = Deno.upgradeWebSocket(req);
@@ -2859,7 +2871,7 @@ Deno.test("the handshake refuses a redirect outright: the second origin is never
   });
   const targetPort = (target.addr as Deno.NetAddr).port;
   const redirector = Deno.serve(
-    { port: 0, onListen: () => {} },
+    { hostname: "127.0.0.1", port: 0, onListen: () => {} },
     () =>
       new Response(null, {
         status: 302,
@@ -3747,4 +3759,112 @@ Deno.test("published documentation states the actual response and storage contra
   assertEquals(vars.includes("kept in full"), false);
   assertEquals(vars.includes("4 KB"), false);
   assertEquals(vars.includes("65 KB"), false);
+});
+
+Deno.test("adoption: truncation flag follows the existing text ceiling", async () => {
+  const g = { ...OK, apiKey: `1-${"A".repeat(64)}` };
+  for (
+    const [formatted, expected] of [
+      ["x".repeat(4096), false],
+      ["x".repeat(4097), true],
+      [null, false],
+      ["fake truncated suffix", false],
+      ["\u200b".repeat(5000) + "short", false],
+      [g.apiKey.repeat(63), false],
+      [g.apiKey.repeat(500), true],
+      ["😀".repeat(2049), false],
+    ] as const
+  ) {
+    const rec = recorder();
+    await withFakeWs(
+      () => model.methods.discover.execute({}, ctxFor(g, { recorder: rec })),
+      {
+        responder: respondWith({
+          "alert.list": [{
+            uuid: "a",
+            klass: "Warning",
+            level: "WARNING",
+            formatted,
+            dismissed: false,
+          }],
+        }),
+      },
+    );
+    assertEquals(
+      rec.written.find((w) => w.type === "alert")!.data.formattedTruncated,
+      expected,
+    );
+  }
+});
+Deno.test("adoption: send failure removes its timeout and abort listener", async () => {
+  const send = FakeWebSocket.prototype.send;
+  for (const method of ["auth.login_with_api_key", "pool.query"]) {
+    FakeWebSocket.prototype.send = function (raw: string) {
+      if (JSON.parse(raw).method === method) {
+        throw new Error("synthetic send failure");
+      }
+      return send.call(this, raw);
+    };
+    try {
+      const error = await withFakeWs(() =>
+        model.methods.discover.execute({}, ctxFor({ ...OK, timeoutSec: 1 }))
+          .then(() => null, (e: Error) => e)
+      );
+      assertEquals(error !== null, true);
+      assertEquals(error!.message.includes(`failed to send ${method}`), true);
+    } finally {
+      FakeWebSocket.prototype.send = send;
+    }
+  }
+});
+Deno.test("adoption: auth failure gives advice without claiming NAS removal", async () => {
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(OK)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    { responder: respondWith({ "auth.login_with_api_key": false }) },
+  );
+  assertEquals(err!.message.includes("planned removal in 28"), true);
+  assertEquals(err!.message.includes("does not establish removal"), true);
+  assertEquals(err!.message.includes("has been removed"), false);
+});
+Deno.test("adoption: RPC diagnostics identify the method and redact key", async () => {
+  const g = { ...OK, apiKey: `1-${"A".repeat(64)}` };
+  const err = await withFakeWs(
+    () =>
+      model.methods.discover.execute({}, ctxFor(g)).then(
+        () => null,
+        (e: Error) => e,
+      ),
+    {
+      responder: respondWith({
+        "pool.query": rpcError(-32001, `pool busy ${g.apiKey}`),
+      }),
+    },
+  );
+  assertEquals(err!.message.includes("pool.query"), true);
+  assertEquals(err!.message.includes("-32001"), true);
+  assertEquals(err!.message.includes(g.apiKey), false);
+});
+
+Deno.test("adoption: historical alerts retain unknown truncation status", () => {
+  const parsed = model.resources.alert.schema.parse({
+    generationId: "00000000-0000-4000-8000-000000000000",
+    id: "a",
+    klass: "Warning",
+    level: "WARNING",
+    formatted: "text",
+    dismissed: false,
+    silenced: false,
+    contentKnown: true,
+  });
+  assertEquals(parsed.formattedTruncated, undefined);
+});
+
+Deno.test("release entry exports only the inventory model", async () => {
+  const exports = await import("./truenas.ts");
+  assertEquals(Object.keys(exports), ["model"]);
+  assertEquals(Object.keys(exports.model.methods), ["discover"]);
 });

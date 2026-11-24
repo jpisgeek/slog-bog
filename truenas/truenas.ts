@@ -732,6 +732,7 @@ const PoolSchema = z.object({
   freeBytes: knownOrUnknownInteger(MAX_REMOTE_BYTES),
   sizeBytes: knownOrUnknownInteger(MAX_REMOTE_BYTES),
   usedPercent: knownOrUnknownPercent,
+  /** -1 means fragmentation was not reported. */
   fragmentationPercent: knownOrUnknownPercent,
   /**
    * False when TrueNAS reported no `allocated`/`free` for this pool;
@@ -772,6 +773,8 @@ const AlertSchema = z.object({
   klass: z.string(),
   level: z.string(),
   formatted: z.string(),
+  /** Whether text exceeded the stored ceiling; absent on historical records. */
+  formattedTruncated: z.boolean().optional(),
   dismissed: z.boolean(),
   /**
    * True when the alert is real but hidden from the TrueNAS UI because
@@ -1381,27 +1384,14 @@ function assertNoApiKeyInGeneratedName(name: string, apiKey: string): void {
 }
 
 /**
- * TrueNAS reports pool fragmentation as a nullable percentage, sometimes with
- * a trailing "%".
- *
- * ABSENT still means 0, and that is argued, not overlooked. Unlike a missing
- * capacity or a missing certificate expiry, 0% fragmentation is not itself an
- * alarming value, so no gate can be lulled by it -- the worst a consumer does
- * is see a healthy fragmentation figure for a pool that reported none.
- *
- * MALFORMED is a completely different fact and used to be folded into the
- * same 0. `Number("busy")` is NaN, `Number.isFinite(NaN)` is false, and the
- * old line answered 0 -- so `fragmentation: "ERROR"`, or a future release
- * changing the field to an object, or a value of 4e9, all reported as a
- * pristine pool. That is contract drift or a hostile payload wearing the
- * exact disguise this model exists to strip off, so it throws. Bounds too:
- * a percentage outside 0-100 is not a percentage.
+ * Missing fragmentation is unknown (-1); malformed or out-of-range values
+ * still fail. Consumers must exclude negative sentinels from numeric gates.
  */
 function parsePercent(
   value: string | number | null | undefined,
   safe: Safe,
 ): number {
-  if (value === null || value === undefined) return 0;
+  if (value === null || value === undefined) return -1;
   let n: number;
   if (typeof value === "number") {
     n = value;
@@ -1510,27 +1500,16 @@ function resolveCertificateExpiry(
 }
 
 /**
- * `auth.login_with_api_key` is deprecated and scheduled for removal in
- * TrueNAS 27. `auth.login_ex` with the API_KEY_PLAIN mechanism is the
- * replacement, but it also requires a `username`, which this model does not
- * currently collect. Rather than ship an auth path that has never been run
- * against a real host, support is capped explicitly and the limit is stated
- * wherever an operator can actually hit it.
- *
- * That last part was the defect. The hint used to live *only* in the
- * post-connect warning below, which runs after `system.info` -- i.e. only on a
- * run where authentication already succeeded. On the host the hint exists for,
- * the one where the call is gone, auth is what fails, `system.info` never runs
- * and the warning never printed. The operator got a bare RPC error and no
- * explanation. So the hint is now attached to the auth failure itself
- * (AUTH_REMOVAL_HINT, used in discover()), and this warning covers the other
- * case: a 27+ host where the deprecated call still happens to work, which is a
- * heads-up rather than a diagnosis.
+ * The TrueNAS 27 deprecation table lists legacy authentication as deprecated
+ * with planned removal in 28. A failed login does not establish its cause.
+ * https://www.truenas.com/docs/scale/27/gettingstarted/deprecations/
+ * Keep the existing authentication contract; do not infer NAS capabilities.
  */
 const AUTH_REMOVAL_HINT =
-  "If this host is TrueNAS 27 or newer, auth.login_with_api_key has been " +
-  "removed: this model has not moved to auth.login_ex, which additionally " +
-  "requires a username it does not collect.";
+  "TrueNAS 27 documentation lists auth.login_with_api_key as deprecated, " +
+  "with planned removal in 28. This failure does not establish removal; " +
+  "check credentials, permissions and host compatibility. This client has " +
+  "not migrated to auth.login_ex.";
 
 function warnIfVersionUnsupported(
   version: string,
@@ -1543,9 +1522,9 @@ function warnIfVersionUnsupported(
   if (Number.isFinite(major) && major >= 27) {
     logger.warning(
       "TrueNAS reports version {version}; auth.login_with_api_key is " +
-        "scheduled for removal starting with 27. It still worked this run, " +
-        "but this model has not moved to auth.login_ex, so a later upgrade " +
-        "will break discovery.",
+        "deprecated in the TrueNAS 27 documentation, with planned removal " +
+        "in 28. It succeeded this run; verify compatibility before upgrades. " +
+        "This client has not migrated to auth.login_ex.",
       // Remote free text; bound it like every other remote string that
       // reaches a log line.
       { version: safe(version, 64) },
@@ -1564,7 +1543,7 @@ function warnIfVersionUnsupported(
 type RpcFrame =
   | { kind: "notification" }
   | { kind: "result"; id: number; result: unknown }
-  | { kind: "error"; id: number; message: string }
+  | { kind: "error"; id: number; code: number; message: string }
   | { kind: "invalid"; id?: number; detail: string };
 
 /**
@@ -1696,7 +1675,7 @@ function classifyFrame(raw: unknown, safe: Safe): RpcFrame {
         detail: `error.message is ${typeof eo.message}, not a string`,
       };
     }
-    return { kind: "error", id, message: eo.message };
+    return { kind: "error", id, code: eo.code, message: eo.message };
   }
   if (!hasResult) {
     return {
@@ -1858,7 +1837,9 @@ class TrueNasRpc {
               // number- or date-shaped misconfiguration must not escape the
               // string-only credential boundary through a primitive field.
               ? "TrueNAS RPC authentication failed"
-              : `TrueNAS RPC failure: ${this.#safe(frame.message)}`,
+              : `TrueNAS RPC ${waiter.method} failed (code ${frame.code}): ${
+                this.#safe(frame.message)
+              }`,
           ),
         );
       } else {
@@ -2038,7 +2019,21 @@ class TrueNasRpc {
         },
       });
       this.#signal.addEventListener("abort", onAbort, { once: true });
-      this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      try {
+        this.#ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      } catch (error) {
+        settle();
+        this.#pending.delete(id);
+        reject(
+          new Error(
+            method === "auth.login_with_api_key"
+              ? "failed to send auth.login_with_api_key"
+              : `failed to send ${method}: ${
+                this.#safe(error instanceof Error ? error.message : error)
+              }`,
+          ),
+        );
+      }
     });
   }
 
@@ -2330,14 +2325,7 @@ async function discoverWithSocket(
           : size > 0
           ? Math.round((allocated / size) * 1000) / 10
           : 0,
-        // parsePercent still defaults an ABSENT fragmentation to 0, and that
-        // stays: unlike capacity, 0% fragmentation is not itself an alarming
-        // value, so a gate reading it cannot be lulled the way a capacity
-        // gate could. Argued rather than swept in with the rest of the class.
-        // A MALFORMED or out-of-range fragmentation is a different fact and
-        // now throws rather than reporting the same reassuring 0. It throws
-        // during PLANNING, before anything is written, which is what makes
-        // that throw all-or-nothing rather than mid-write.
+        // Missing fragmentation is unknown; malformed values still throw.
         fragmentationPercent: parsePercent(p.fragmentation ?? null, safe),
         capacityKnown,
       },
@@ -2465,6 +2453,9 @@ async function discoverWithSocket(
         // reads like the alert's own text would be worse than an empty one.
         // `contentKnown` is what says the text is missing.
         formatted,
+        formattedTruncated: a.formatted != null &&
+          Array.from(safe(a.formatted, Infinity)).length >
+            MAX_STORED_REMOTE_CHARS,
         dismissed,
         // A dismissed alert is hidden in the TrueNAS UI but the condition
         // behind it is still true. Surface it rather than inherit the
@@ -2751,35 +2742,6 @@ const discover = (_args: unknown, ctx: DiscoverContext) =>
   discoverWithSocket(_args, ctx, openBoundedWebSocket);
 
 /**
- * Test-only surface. Not part of the model contract, not addressed by any
- * workflow, and not referenced anywhere inside this file.
- *
- * It exists because several of the properties this module now guarantees are
- * invisible from `model` alone -- that the raw schemas STRIP undeclared keys
- * instead of retaining them, that two identity tuples differing only by a
- * control character get different digests, that a malformed JSON-RPC frame is
- * classified rather than cast. A fix nobody can observe is a fix that ships
- * dead, which has happened in this repo often enough to be the rule these
- * exports exist to break.
- */
-export const __testOnly = {
-  assertConnectedDestination,
-  assertNoApiKeyInGeneratedName,
-  RawSystemSchema,
-  RawPoolSchema,
-  RawDiskSchema,
-  RawAlertSchema,
-  RawCertificateSchema,
-  classifyFrame,
-  encodeIdentity,
-  identityPart,
-  instanceName,
-  parsePercent,
-  safeRemoteText,
-  toIsoOrNull,
-};
-
-/**
  * The `@jpisgeek/truenas` model definition: a single `discover` method
  * producing five read-only resource types (system, pool, disk, alert,
  * certificate) plus a `summary` roll-up. See the module header above for
@@ -2788,7 +2750,7 @@ export const __testOnly = {
  */
 export const model = {
   type: "@jpisgeek/truenas",
-  version: "2026.09.05.1",
+  version: "2026.11.24.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -2803,7 +2765,8 @@ export const model = {
     },
     pool: {
       description: "One record per ZFS pool with status, health, capacity, " +
-        "fragmentation. Check `capacityKnown` before gating on capacity: " +
+        "fragmentation. A fragmentationPercent of -1 means unknown; exclude " +
+        "unknowns from numeric gates and roll-ups. Check `capacityKnown` before gating on capacity: " +
         "when TrueNAS reports no allocated/free the four capacity fields are " +
         "-1, not 0, so an unknown pool cannot read as an empty one.",
       schema: PoolSchema,
@@ -2825,7 +2788,9 @@ export const model = {
     },
     alert: {
       description:
-        "One record per active TrueNAS alert. `silenced` marks alerts that " +
+        "One record per active TrueNAS alert. `formattedTruncated` marks text " +
+        "that exceeded the stored ceiling after screening and redaction. " +
+        "`silenced` marks alerts that " +
         "were dismissed in the UI. Still true, just no longer visible there. " +
         "`contentKnown` is false when TrueNAS sent no usable class, level " +
         "or text: " +

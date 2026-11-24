@@ -1,15 +1,3 @@
-publicationNote: >-
-  for the repository's security review requirements. This version is shared as
-  GitHub source and is not published to the Swamp registry.
-install: |
-  Clone this GitHub repository and register this extension's source in your Swamp repo.
-  Replace the example path with the canonical location of your clone:
-
-  ```sh
-  swamp extension source add /example/slog-bog/truenas --only models
-  ```
-
-  This repaired version is distributed through GitHub source, not a registry release.
 package: "@jpisgeek/truenas"
 types:
   - "@jpisgeek/truenas"
@@ -33,6 +21,12 @@ example: |
     certWarnDays: 30
     allowInsecureHttp: false
 caveats: >-
+  Alert records include `formattedTruncated` when screened/redacted text exceeds
+  the stored ceiling. Historical records missing this flag remain unknown.
+  The TrueNAS 27 [deprecation table](https://www.truenas.com/docs/scale/27/gettingstarted/deprecations/)
+  lists planned legacy authentication removal in 28; a failed login alone does
+  not prove method removal. The existing authentication mechanism is unchanged.
+
   Discovery only: there is no write path to TrueNAS anywhere in this model.
   Certificate expiry is computed independently of TrueNAS's own alert state.
   A `CertificateIsExpiring` alert dismissed in the UI is still reported, with
@@ -90,9 +84,7 @@ caveats: >-
   one cannot mask a valid peer, an unreadable peer is never ignored, and two
   different valid values abort as conflicting. Blank preferred identifiers do
   not mask usable fallbacks, and duplicate derived kind/name pairs are rejected before any write. An
-  absent fragmentation is the one deliberate exception and
-  still reads `0`: unlike capacity, 0% fragmentation is not itself an alarming
-  value, so no gate is lulled by it.
+  absent fragmentation reads `-1` (unknown), not `0`; exclude unknowns from numeric gates and roll-ups.
 
 
   **Sizes and values are capped before expensive work.** The pinned WebSocket
