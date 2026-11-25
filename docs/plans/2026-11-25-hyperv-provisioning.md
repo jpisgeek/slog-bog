@@ -1,6 +1,11 @@
 # Plan: Hyper-V provisioning for `@jpisgeek/hyperv`
 
-Status: ready for implementation · Owner of plan and acceptance tests: reviewer · Implementer: assigned worker
+Status: ready for implementation, **revision 1** · Owner of plan and acceptance tests: reviewer · Implementer: assigned worker
+
+Revision 1 (2026-11-25): secrets and large payloads now travel on SSH stdin, never in argv. The implementer
+raised it: passwords inside `-EncodedCommand` are only base64, which shows up in local `ps` output and in the
+host's process command line. See "Secrets and large payloads travel on stdin" below. The acceptance tests gained
+a matching section.
 
 ## Goal
 
@@ -57,9 +62,9 @@ to the parent**. With a `guest` block it specializes the child **offline, before
 
 1. `Mount-VHD` the child (never the parent), find its Windows partition.
 2. Write `Windows\Panther\unattend.xml` from `renderUnattend` (computer name, encoded admin password, OOBE
-   skipped, time zone).
+   skipped, time zone). The XML arrives in the stdin request's data (`$Data`), never in the script text.
 3. Write `Windows\Setup\Scripts\SetupComplete.cmd`, a one-line launcher for `SetupComplete.ps1` from
-   `renderSetupComplete`. That script runs as SYSTEM at the end of setup. It enables sshd (installing the
+   `renderSetupComplete` (also delivered in `$Data`). That script runs as SYSTEM at the end of setup. It enables sshd (installing the
    capability only if the service is missing), opens 22/TCP and writes the authorized keys. After a successful
    run it deletes itself and the unattend file, which holds the encoded password.
 4. Dismount in `finally`.
@@ -78,16 +83,42 @@ first non-link-local IPv4) until `timeoutSec` runs out. With `tcpPort` set, it a
 and the elapsed time, and it records the address on the VM resource. Timing out is an error that says which
 condition never became true.
 
-`guestExec` runs `Invoke-Command -VMName <name> -Credential <cred> -ScriptBlock { ... }` on the host. Build the
-credential from `user` and `password` on the host side **without the password appearing in the command line or
-in any log**. Pass it inside the encoded script. The guest script is passed as an encoded string and run with
+`guestExec` runs `Invoke-Command -VMName <name> -Credential <cred> -ScriptBlock { ... }` on the host. The host
+script builds the credential from `$Data.user` and `$Data.password` (`ConvertTo-SecureString -AsPlainText
+-Force`). Both arrive on stdin. The guest script also arrives in `$Data` and runs with
 `[scriptblock]::Create`. Output is capped at `MAX_OUTPUT_BYTES` like every other method, and it is recorded as
 an `exec` resource with exit status and truncation flag. The password is never recorded.
+
+### Secrets and large payloads travel on stdin
+
+The rule: **no secret, and no reversible encoding of one (base64 of UTF-8 or UTF-16LE, the unattend encoding),
+ever appears in argv**, either in local ssh's (readable by any local user through `ps`) or in the remote process
+command line (`Win32_Process.CommandLine`). Secrets also stay out of logs, resources and error text, as before.
+
+How:
+
+- `STDIN_LAUNCHER` is one fixed, ASCII PowerShell script with no placeholders. It reads
+  `[Console]::In.ReadToEnd()`, parses the JSON with `ConvertFrom-Json`, exposes the `data` member to the request
+  script as `$Data`, and runs the `script` member as a script block. It is the only thing ever encoded into argv
+  for methods that carry a secret or a large payload. Its argv is the same for every request.
+- `stdinRequest(script, data)` is the JSON document written to ssh's stdin, with no BOM. Write it, then close
+  stdin so `ReadToEnd` returns.
+- `guestExecRequest(args)` and `createVmRequest(args)` parse their arguments through the schemas (so they throw on
+  bad input) and return `{ script, data }`. The script text references `$Data` and never holds a secret.
+- `invocation(globalArgs, request)` returns `{ argv, stdin }`, where `argv` is exactly
+  `sshArgs(globalArgs, encodeCommand(STDIN_LAUNCHER))`. The hardened ssh arguments are reused unchanged.
+- `runPowerShell` gains an optional `input` argument. Without it, behaviour is byte-identical to today
+  (`stdin: "null"`), so the existing methods and `hyperv_test.ts` stay untouched. With it, stdin is piped,
+  written and closed. Output caps, kill-on-overflow and the abort/timeout distinction apply unchanged.
+- `buildWindowsImage` and `waitReady` carry no secret and may keep the direct `-EncodedCommand` path, as long as
+  their encoded command stays under 8,000 characters (cmd.exe's limit is 8,191). Otherwise they use the launcher
+  too.
 
 ### Rules carried over from the existing model (non-negotiable)
 
 - Every remote command goes through `encodeCommand` and `runPowerShell`. Every caller-supplied value
-  interpolated into PowerShell goes through `psQuote`. No exceptions for "safe" values.
+  interpolated into PowerShell goes through `psQuote`, unless it travels in `$Data`, which is never interpolated
+  into script text. No exceptions for "safe" values.
 - No defaults for identity or location: `host`, `user`, `isoPath`, `baseImage` and `switchName` are always
   explicit.
 - `classifyRemote` handles stderr. Remote text is never echoed back raw.
@@ -115,6 +146,10 @@ The acceptance tests import these from `hyperv.ts`. Names and shapes are fixed. 
 | `encodeUnattendPassword(pw, kind)` | function | base64 of UTF-16LE(`pw + kind`), `kind` ∈ `AdministratorPassword`, `Password`. |
 | `renderUnattend({ computerName, adminPassword, timeZone? })` | function | Deterministic unattend XML for passes specialize and oobeSystem, amd64. Encoded password with `PlainText` false, OOBE pages hidden, default time zone `UTC`. Throws on invalid input. |
 | `renderSetupComplete({ enableSsh, authorizedKeys })` | function | ASCII PowerShell. See the acceptance tests for the exact invariants: SIDs, no `Out-File`, BOM-free writes, capability install only when sshd is missing, nothing SSH-related when `enableSsh` is false. |
+| `STDIN_LAUNCHER` | string | Fixed, ASCII, secret-free launcher that reads the stdin request (see above). |
+| `stdinRequest(script, data)` | function | JSON `{ script, data }`, no BOM. |
+| `guestExecRequest(args)` / `createVmRequest(args)` | function | Parse through the schemas (throw on invalid input) and return `{ script, data }`. No secret, or encoding of one, in `script`. |
+| `invocation(globalArgs, request)` | function | `{ argv, stdin }`, with `argv` equal to `sshArgs(globalArgs, encodeCommand(STDIN_LAUNCHER))` and independent of every secret. |
 
 New resources: `image` (one per golden image) and `exec` (one per `guestExec` run). The `vm` resource gains an
 optional `ipv4`.
@@ -134,6 +169,9 @@ Run from a scratch swamp repo, never from a repo that `swamp serve` is serving. 
 with the prefix `e2e-`. Any other VM on the host is read, never written. The run passes only if every step
 passes:
 
+0. Stdin probe → send a 1 MiB `stdinRequest` through `invocation` and the real runner. A script that returns the
+   SHA-256 of `$Data` must return the same hash computed locally. This proves Windows PowerShell 5.1 reads the
+   whole request under `-EncodedCommand` and that closing stdin ends `ReadToEnd`.
 1. `discover` → record the VM list and states as the **before** snapshot.
 2. `buildWindowsImage` → a golden image. Run it a second time with the same arguments and it must return the
    existing record in under 10 s, without rebuilding.
@@ -156,6 +194,9 @@ the worker's report.
 - Whether this Windows Server 2025 media ships OpenSSH Server preinstalled (the capability check in
   `SetupComplete` must work either way, and the report says which branch ran).
 - That the `encodeUnattendPassword` encoding is what setup accepts: the live run's `guestExec` login proves it.
+- That `[Console]::In.ReadToEnd()` behaves under Windows PowerShell 5.1 started by sshd with `-EncodedCommand`
+  (live step 0). If it doesn't (for example PowerShell consumes stdin itself), stop and report with evidence.
+  Do not fall back to argv.
 - That `delete`'s existing disk-chain logic removes a differencing child and never its parent. Step 8 proves it.
   If it does not, stop and report. Do not patch `delete` as part of this plan.
 

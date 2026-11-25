@@ -1,7 +1,7 @@
 /**
  * Acceptance tests for the provisioning surface of the Hyper-V model.
  *
- * Plan: docs/plans/2026-11-25-hyperv-provisioning.md
+ * Plan: docs/plans/2026-11-25-hyperv-provisioning.md (revision 1: secrets travel on stdin)
  *
  * The reviewer owns this file. Implementers make it pass and must not edit it:
  * its SHA-256 is recorded in the plan, and a changed hash fails review on its
@@ -26,11 +26,19 @@ import {
   BuildImageArgsSchema,
   ComputerName,
   CreateVmArgsSchema,
+  createVmRequest,
+  encodeCommand,
   encodeUnattendPassword,
+  GlobalArgsSchema,
   GuestExecArgsSchema,
+  guestExecRequest,
+  invocation,
   renderSetupComplete,
   renderUnattend,
+  sshArgs,
   SshPublicKey,
+  STDIN_LAUNCHER,
+  stdinRequest,
   WaitReadyArgsSchema,
   WindowsPath,
 } from "./hyperv.ts";
@@ -540,4 +548,170 @@ Deno.test("renderSetupComplete refuses keys the schema refuses", () => {
       authorizedKeys: [`ssh-ed25519 ${BLOB_A} x'; Remove-Item C:\\ -Recurse #`],
     })
   );
+});
+
+// ---------------------------------------------------------------------------
+// Revision 1: secrets travel on stdin.
+//
+// No secret, and no reversible encoding of one, may appear in ssh's argv.
+// Locally any user can read argv with `ps`; on the host it lands in the
+// process command line that Win32_Process exposes. Base64 is not protection.
+// Only a fixed, secret-free launcher goes in argv; the script and its data go
+// on stdin, inside the ssh channel.
+// ---------------------------------------------------------------------------
+
+const G = GlobalArgsSchema.parse({ host: "10.0.0.5", user: "Administrator" });
+const OTHER_PASSWORD = "Quartz-Fennel-77-orbit";
+
+function b64Utf8(s: string): string {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+}
+
+function decodeUtf16leB64(b64: string): string {
+  const bin = atob(b64);
+  let out = "";
+  for (let i = 0; i + 1 < bin.length; i += 2) {
+    out += String.fromCharCode(
+      bin.charCodeAt(i) | (bin.charCodeAt(i + 1) << 8),
+    );
+  }
+  return out;
+}
+
+/** Every rendering of a secret that would let someone recover it. */
+function secretForms(pw: string): string[] {
+  return [
+    pw,
+    b64Utf8(pw),
+    b64Utf16le(pw),
+    encodeUnattendPassword(pw, "AdministratorPassword"),
+    encodeUnattendPassword(pw, "Password"),
+  ];
+}
+
+/** argv as ssh receives it, plus the decoded -EncodedCommand payload. */
+function argvSurface(argv: string[]): string {
+  const remote = argv.at(-1) ?? "";
+  const m = remote.match(/-EncodedCommand\s+([A-Za-z0-9+/=]+)\s*$/);
+  assert(m, "remote command is not an -EncodedCommand launcher");
+  return argv.join("\u0000") + "\u0000" + decodeUtf16leB64(m[1]);
+}
+
+const GUEST_EXEC = {
+  vmName: "e2e-win01",
+  user: "Administrator",
+  password: PASSWORD,
+  script: "hostname",
+};
+
+const CREATE_WITH_GUEST = {
+  vmName: "e2e-win01",
+  baseImage: "C:\\vm-images\\ws2025-std.vhdx",
+  switchName: "lan",
+  guest: {
+    os: "windows" as const,
+    computerName: "E2E-WIN01",
+    adminPassword: PASSWORD,
+    authorizedKeys: [KEY_A],
+  },
+};
+
+Deno.test("STDIN_LAUNCHER is a fixed, ASCII, secret-free reader of stdin", () => {
+  assertMatch(STDIN_LAUNCHER, ASCII_ONLY);
+  assertStringIncludes(STDIN_LAUNCHER, "[Console]::In.ReadToEnd()");
+  assertStringIncludes(STDIN_LAUNCHER, "ConvertFrom-Json");
+  assertFalse(STDIN_LAUNCHER.includes(PASSWORD));
+});
+
+Deno.test("stdinRequest is one JSON document carrying the script and its data", () => {
+  const body = stdinRequest("Get-Date", { a: 1, s: "x'y\"z" });
+  const parsed = JSON.parse(body);
+  assertEquals(parsed.script, "Get-Date");
+  assertEquals(parsed.data, { a: 1, s: "x'y\"z" });
+  assertFalse(body.startsWith("\uFEFF"), "BOM in stdin request");
+});
+
+Deno.test("invocation reuses the hardened ssh arguments unchanged", () => {
+  const inv = invocation(G, guestExecRequest(GUEST_EXEC));
+  assertEquals(inv.argv, sshArgs(G, encodeCommand(STDIN_LAUNCHER)));
+});
+
+Deno.test("guestExec's password goes on stdin and nowhere in argv", () => {
+  const req = guestExecRequest(GUEST_EXEC);
+  for (const form of secretForms(PASSWORD)) {
+    assertFalse(req.script.includes(form), "password in the script text");
+  }
+  assert(
+    JSON.stringify(req.data).includes(PASSWORD),
+    "password missing from data",
+  );
+
+  const inv = invocation(G, req);
+  const surface = argvSurface(inv.argv);
+  for (const form of secretForms(PASSWORD)) {
+    assertFalse(surface.includes(form), "a secret form reached argv");
+  }
+  const sent = JSON.parse(inv.stdin);
+  assertEquals(sent.script, req.script);
+  assertEquals(sent.data, req.data);
+});
+
+Deno.test("argv does not depend on the secret at all", () => {
+  const a = invocation(G, guestExecRequest(GUEST_EXEC));
+  const b = invocation(
+    G,
+    guestExecRequest({ ...GUEST_EXEC, password: OTHER_PASSWORD }),
+  );
+  assertEquals(a.argv, b.argv);
+  const c = invocation(G, createVmRequest(CREATE_WITH_GUEST));
+  const d = invocation(
+    G,
+    createVmRequest({
+      ...CREATE_WITH_GUEST,
+      guest: { ...CREATE_WITH_GUEST.guest, adminPassword: OTHER_PASSWORD },
+    }),
+  );
+  assertEquals(c.argv, d.argv);
+});
+
+Deno.test("createVm's unattend and first-boot script travel as data, not script", () => {
+  const req = createVmRequest(CREATE_WITH_GUEST);
+  for (const form of secretForms(PASSWORD)) {
+    assertFalse(
+      req.script.includes(form),
+      "a secret form is in the script text",
+    );
+  }
+  const data = JSON.stringify(req.data);
+  assertStringIncludes(
+    data,
+    encodeUnattendPassword(PASSWORD, "AdministratorPassword"),
+  );
+  assertStringIncludes(data, BLOB_A);
+  const surface = argvSurface(invocation(G, req).argv);
+  for (const form of secretForms(PASSWORD)) {
+    assertFalse(surface.includes(form), "a secret form reached argv");
+  }
+});
+
+Deno.test("createVm without guest setup sends no unattend at all", () => {
+  const { guest: _g, ...bare } = CREATE_WITH_GUEST;
+  const data = JSON.stringify(createVmRequest(bare).data);
+  assertFalse(data.includes("urn:schemas-microsoft-com:unattend"));
+  assertFalse(data.includes("AdministratorPassword"));
+});
+
+Deno.test("the remote command line stays far below cmd.exe's 8191-character limit", () => {
+  const inv = invocation(
+    G,
+    guestExecRequest({ ...GUEST_EXEC, script: "x".repeat(65536) }),
+  );
+  const remote = inv.argv.at(-1) ?? "";
+  assert(remote.length < 4096, `remote command is ${remote.length} characters`);
+});
+
+Deno.test("request builders refuse what the schemas refuse", () => {
+  assertThrows(() => guestExecRequest({ ...GUEST_EXEC, password: "" }));
+  assertThrows(() => guestExecRequest({ ...GUEST_EXEC, script: "" }));
+  assertThrows(() => createVmRequest({ ...CREATE_WITH_GUEST, vmName: "" }));
 });
