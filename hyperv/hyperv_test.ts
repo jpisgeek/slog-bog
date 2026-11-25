@@ -20,6 +20,7 @@ import {
   assertRestoreConfirmed,
   CheckpointArgsSchema,
   classifyRemote,
+  createVmRequest,
   DeleteArgsSchema,
   DiscoverEnvelope,
   DiskDeleteEnvelope,
@@ -1323,4 +1324,62 @@ Deno.test("disk deletion matches the exact pre-fix main script", async () => {
     await sha256Hex(script),
     "262c48e30ce23e3b6e8182537ad7b082ca4655d68dc7a798ff5985cda636cebc",
   );
+});
+
+Deno.test("provisioning disk ownership checks walk current and checkpoint chains", async () => {
+  const source = await Deno.readTextFile(
+    new URL("./hyperv.ts", import.meta.url),
+  );
+  const walk = source.split("function Find-AttachedDisk(")[1].split(
+    "async function deleteDisk(",
+  )[0];
+  assertStringIncludes(walk, "Get-VM -ErrorAction Stop");
+  assertStringIncludes(walk, "Get-VMHardDiskDrive -VM $vm -ErrorAction Stop");
+  assertStringIncludes(
+    walk,
+    "foreach ($snapshot in @(Get-VMSnapshot -VM $vm -ErrorAction Stop))",
+  );
+  assertStringIncludes(
+    walk,
+    "Get-VMHardDiskDrive -VMSnapshot $snapshot -ErrorAction Stop",
+  );
+  assertStringIncludes(walk, "foreach ($disk in $drives)");
+  assertStringIncludes(
+    walk,
+    "if ($depth -ge 32) { throw 'disk chain too deep' }",
+  );
+  assertStringIncludes(walk, "Get-VHD -Path $cur -ErrorAction Stop");
+  assertStringIncludes(walk, "$cur = $next");
+  assertStringIncludes(
+    source,
+    "script: " + String.fromCharCode(96) + "$" + "{FindAttachedDisk}",
+  );
+  assertStringIncludes(source, "script: FindAttachedDisk + String.raw");
+});
+
+Deno.test("failed VM creation removes only the empty directory it created", () => {
+  const { script } = createVmRequest({
+    vmName: "fixture-win01",
+    baseImage: "C:\\images\\golden.vhdx",
+    switchName: "fixture",
+  });
+  assertStringIncludes(script, "$folderCreated = $false");
+  assertStringIncludes(
+    script,
+    "New-Item -Path $folder -ItemType Directory | Out-Null\n  $folderCreated = $true",
+  );
+  const rollback = script.split("} catch {")[1];
+  assertStringIncludes(
+    rollback,
+    "if ($created) { Remove-Item -LiteralPath $diskPath }\n  if ($folderCreated",
+  );
+  assertStringIncludes(
+    rollback,
+    "Test-Path -LiteralPath $folder -PathType Container",
+  );
+  assertStringIncludes(
+    rollback,
+    "@([IO.Directory]::EnumerateFileSystemEntries($folder)).Count -eq 0",
+  );
+  assertStringIncludes(rollback, "[IO.Directory]::Delete($folder, $false)");
 });

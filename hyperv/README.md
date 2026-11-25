@@ -190,6 +190,9 @@ globalArguments:
 
 ## Caveats
 
+**Change notes.** VM-only `delete` is fixed in this version. It skips disk
+ownership checks when `deleteDisks` is false.
+
 **Authentication is public-key only, and left to ssh.** Load an identity the
 target authorizes before running anything here — from an agent, or from your own
 ssh configuration. This model leaves key selection to SSH and restricts host

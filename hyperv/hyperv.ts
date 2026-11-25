@@ -1882,8 +1882,14 @@ const ExecSchema = z.object({
 const FindAttachedDisk = String.raw`
 function Find-AttachedDisk([string]$path) {
   $target = [IO.Path]::GetFullPath($path)
-  foreach ($vm in @(Get-VM)) {
-    foreach ($disk in @(Get-VMHardDiskDrive -VM $vm)) {
+  foreach ($vm in @(Get-VM -ErrorAction Stop)) {
+    $drives = @(
+      Get-VMHardDiskDrive -VM $vm -ErrorAction Stop
+      foreach ($snapshot in @(Get-VMSnapshot -VM $vm -ErrorAction Stop)) {
+        Get-VMHardDiskDrive -VMSnapshot $snapshot -ErrorAction Stop
+      }
+    )
+    foreach ($disk in $drives) {
       $cur = $disk.Path
       $depth = 0
       while ($cur) {
@@ -2127,10 +2133,12 @@ $folder = Join-Path $root $name
 if (Test-Path -LiteralPath $folder) { throw 'VM folder already exists' }
 $diskPath = Join-Path $folder 'system.vhdx'
 $parentPath = $null
+$folderCreated = $false
 $created = $false
 $vm = $null
 try {
   New-Item -Path $folder -ItemType Directory | Out-Null
+  $folderCreated = $true
   if ($Data.diskMode -eq 'differencing') {
     New-VHD -Path $diskPath -ParentPath $Data.baseImage -Differencing | Out-Null
     $parentPath = (Get-VHD -Path $diskPath).ParentPath
@@ -2165,6 +2173,10 @@ try {
 } catch {
   if ($vm) { Remove-VM -Force -VM $vm }
   if ($created) { Remove-Item -LiteralPath $diskPath }
+  if ($folderCreated -and (Test-Path -LiteralPath $folder -PathType Container) -and
+      @([IO.Directory]::EnumerateFileSystemEntries($folder)).Count -eq 0) {
+    [IO.Directory]::Delete($folder, $false)
+  }
   throw
 }
 $additional = @{}
