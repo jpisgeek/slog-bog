@@ -20,8 +20,7 @@ example: |
 caveats: |
   **Authentication is public-key only, and left to ssh.** Load an identity the
   target authorizes before running anything here — from an agent, or from your
-  own ssh configuration. This model handles no key material and takes no
-  password argument, and it restricts ssh to public-key authentication so a
+  own ssh configuration. This model leaves key selection to SSH and restricts host authentication to public keys so a
   host offering passwords or keyboard-interactive cannot be used as a
   fallback. It does not claim to control which identity files ssh loads; that
   remains yours to configure.
@@ -55,12 +54,13 @@ security: |
   configuration names or defaults to. This model narrows ssh to public-key
   authentication but does not choose the key; that remains yours to configure,
   and it is listed as an operator decision below rather than a guarantee.
-  Nothing is read, stored, or accepted
-  as an argument.
+  Use vault expressions for the Windows setup and PowerShell Direct passwords.
+  These methods carry sensitive inputs over SSH stdin using a fixed launcher.
 
-  **What is written.** Summaries only: names, states, capacity, switch types,
-  checkpoint names and timestamps. No device contents, no console credentials,
-  no guest filesystem data.
+  **What is written.** Inventory and lifecycle records include capacity, state,
+  checkpoint metadata, and virtual disk paths. PowerShell Direct stores the
+  supplied script's bounded output and exit status. Treat guest output as
+  sensitive if the script reads private data.
 
   **What the identifiers themselves reveal.** Resource IDs are not opaque. Each
   is built as `<kind>--<target>--<name>[--<name>]-<sha256>`, where `<target>`

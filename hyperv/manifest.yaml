@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@jpisgeek/hyperv"
-version: 2026.08.29.1
+version: 2026.11.25.1
 description: >
   Read a Hyper-V host over SSH and act on its VMs. Collection is read-only:
   the host's capacity, one record per virtual machine, and one per virtual

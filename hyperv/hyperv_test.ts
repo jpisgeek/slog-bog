@@ -41,9 +41,11 @@ import {
   PsVmRow,
   RemoteText,
   RemoveCheckpointArgsSchema,
+  renderDeleteScript,
   resourceId,
   RestoreArgsSchema,
   safeState,
+  sha256Hex,
   slugPart,
   sshArgs,
   StopArgsSchema,
@@ -430,17 +432,20 @@ Deno.test("user strings that would smuggle an option are refused", () => {
 Deno.test("create and remove no longer share one description", () => {
   // They shared a schema, so removeCheckpoint published the exact inverse of
   // the truth: that the checkpoint must NOT already exist.
-  const create = z.toJSONSchema(CheckpointArgsSchema) as Record<string, any>;
-  const remove = z.toJSONSchema(RemoveCheckpointArgsSchema) as Record<
-    string,
-    any
-  >;
+  const create = z.toJSONSchema(CheckpointArgsSchema) as {
+    properties: Record<string, { description: string }>;
+  };
+  const remove = z.toJSONSchema(RemoveCheckpointArgsSchema) as {
+    properties: Record<string, { description: string }>;
+  };
   assertStringIncludes(create.properties.name.description, "Must not already");
   assertStringIncludes(remove.properties.name.description, "Must already");
 });
 
 Deno.test("deleting a running VM needs the power-off acknowledged", () => {
-  const args = z.toJSONSchema(DeleteArgsSchema) as Record<string, any>;
+  const args = z.toJSONSchema(DeleteArgsSchema) as {
+    properties: Record<string, { description: string }>;
+  };
   assertStringIncludes(
     args.properties.confirmForcePowerOff.description,
     "RUNNING",
@@ -1283,4 +1288,39 @@ Deno.test("no bare Test-Path survives after the point of no return", async () =>
     if (line.trim().startsWith("#")) continue;
     assertStringIncludes(line, "try");
   }
+});
+
+Deno.test("VM-only delete has no disk ownership or duplicate checks", () => {
+  const script = renderDeleteScript({
+    vmName: "fixture-win01",
+    confirmName: "fixture-win01",
+    deleteDisks: false,
+    confirmForcePowerOff: true,
+  });
+  for (
+    const diskGuard of [
+      "Normalise-Path",
+      "Get-OtherDiskSet",
+      "$disks",
+      "$shared",
+      "$selfDup",
+    ]
+  ) {
+    assertEquals(script.includes(diskGuard), false, diskGuard);
+  }
+  assertStringIncludes(script, "Remove-VM -VM $vm -Force");
+  assertStringIncludes(script, "diskCount = 0");
+});
+
+Deno.test("disk deletion matches the exact pre-fix main script", async () => {
+  const script = renderDeleteScript({
+    vmName: "fixture-win01",
+    confirmName: "fixture-win01",
+    deleteDisks: true,
+    confirmForcePowerOff: true,
+  });
+  assertEquals(
+    await sha256Hex(script),
+    "262c48e30ce23e3b6e8182537ad7b082ca4655d68dc7a798ff5985cda636cebc",
+  );
 });

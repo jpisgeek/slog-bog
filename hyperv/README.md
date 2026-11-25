@@ -10,7 +10,7 @@ not a periodic sweep. Lifecycle methods mutate, and each destructive one makes
 the caller name what it is about to destroy. There is no REST or JSON-RPC
 surface for Hyper-V, so PowerShell is the API and SSH is how it is reached.
 
-**Version** `2026.08.29.1` · **License** MIT · **Source**
+**Version** `2026.11.25.1` · **License** MIT · **Source**
 https://github.com/jpisgeek/slog-bog/tree/main/hyperv
 
 ## Install
@@ -31,6 +31,66 @@ swamp extension pull @jpisgeek/hyperv
 | `timeoutSec` | integer | no       | `30`    |                                                                                                                             |
 
 ### Methods
+
+#### `buildWindowsImage`
+
+Build a generic Windows image from an exact ISO edition.
+
+| argument     | type    | required | default | description |
+| ------------ | ------- | -------- | ------- | ----------- |
+| `isoPath`    | string  | yes      |         |             |
+| `edition`    | string  | yes      |         |             |
+| `outputPath` | string  | yes      |         |             |
+| `sizeGb`     | integer | no       | `64`    |             |
+| `rebuild`    | boolean | no       | `false` |             |
+
+#### `createVm`
+
+Create a stopped Generation 2 VM from a Windows image. For a differencing child,
+leave disks in place when deleting the VM, then remove only its child with
+deleteDisk.
+
+| argument     | type                     | required | default          | description                         |
+| ------------ | ------------------------ | -------- | ---------------- | ----------------------------------- |
+| `vmName`     | string                   | yes      |                  | Name of the target virtual machine. |
+| `baseImage`  | string                   | yes      |                  |                                     |
+| `switchName` | string                   | yes      |                  |                                     |
+| `cpuCount`   | integer                  | no       | `2`              |                                     |
+| `memoryGb`   | integer                  | no       | `4`              |                                     |
+| `diskMode`   | `differencing` \| `copy` | no       | `"differencing"` |                                     |
+| `guest`      | any                      | no       |                  |                                     |
+
+#### `waitReady`
+
+Wait for heartbeat, IPv4, and the optional TCP port.
+
+| argument     | type    | required | default | description                         |
+| ------------ | ------- | -------- | ------- | ----------------------------------- |
+| `vmName`     | string  | yes      |         | Name of the target virtual machine. |
+| `timeoutSec` | integer | no       | `600`   |                                     |
+| `tcpPort`    | integer | no       |         |                                     |
+
+#### `guestExec`
+
+Execute a PowerShell script inside the VM.
+
+| argument     | type    | required | default | description                         |
+| ------------ | ------- | -------- | ------- | ----------------------------------- |
+| `vmName`     | string  | yes      |         | Name of the target virtual machine. |
+| `user`       | string  | yes      |         |                                     |
+| `password`   | string  | yes      |         |                                     |
+| `script`     | string  | yes      |         |                                     |
+| `timeoutSec` | integer | no       | `120`   |                                     |
+
+#### `deleteDisk`
+
+Remove one unattached disk after exact confirmation.
+
+| argument        | type    | required | default | description |
+| --------------- | ------- | -------- | ------- | ----------- |
+| `path`          | string  | yes      |         |             |
+| `confirmPath`   | string  | yes      |         |             |
+| `allowBaseDisk` | boolean | no       | `false` |             |
 
 #### `discover`
 
@@ -94,8 +154,9 @@ state of the VM.
 #### `delete`
 
 Delete a VM. DESTRUCTIVE: confirmName must exactly equal vmName. Disks are LEFT
-IN PLACE unless deleteDisks is set, matching Hyper-V's own default rather than
-being harsher than it.
+IN PLACE unless deleteDisks is set, matching Hyper-V's default. For a
+differencing VM from createVm, leave disks in place and use deleteDisk on its
+child.
 
 | argument               | type    | required | default | description                                                                                                                                                                                                                                                                                                                |
 | ---------------------- | ------- | -------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -106,12 +167,15 @@ being harsher than it.
 
 ### Data written
 
-| resource     | lifetime | fields                                                                                                 | description                                                                                               |
-| ------------ | -------- | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| `vmHost`     | infinite | `name`, `logicalProcessorCount`, `memoryCapacityBytes`, `virtualMachinePath`, `vmCount`, `switchCount` | The Hyper-V host itself: capacity and where it keeps VMs.                                                 |
-| `vm`         | infinite | `name`, `state`, `status`, `generation`, `cpuCount`, `memoryAssignedBytes`, `uptimeSeconds`            | One record per virtual machine. Summary only -- no device contents, no console credentials.               |
-| `checkpoint` | infinite | `vmName`, `name`, `checkpointType`, `createdAt`, `parentName`                                          | One record per checkpoint. createdAt is normalised to ISO-8601 from the /Date(ms)/ form PowerShell emits. |
-| `vmSwitch`   | infinite | `name`, `switchType`                                                                                   | One record per virtual switch, with its type resolved from the numeric form PowerShell returns.           |
+| resource     | lifetime | fields                                                                                                                                                  | description                                                                                               |
+| ------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `image`      | infinite | `path`, `sizeGb`, `isoPath`, `isoLength`, `isoLastWriteTime`, `edition`, `editionIndex`, `buildNumber`, `buildDurationMs`                               | Windows golden image metadata.                                                                            |
+| `exec`       | infinite | `vmName`, `output`, `exitStatus`, `truncated`                                                                                                           | PowerShell Direct output and status.                                                                      |
+| `diskDelete` | infinite | `path`, `vhdType`, `parentPath`                                                                                                                         | Verified removal of one virtual disk.                                                                     |
+| `vmHost`     | infinite | `name`, `logicalProcessorCount`, `memoryCapacityBytes`, `virtualMachinePath`, `vmCount`, `switchCount`                                                  | The Hyper-V host itself: capacity and where it keeps VMs.                                                 |
+| `vm`         | infinite | `name`, `state`, `status`, `generation`, `cpuCount`, `memoryAssignedBytes`, `uptimeSeconds`, `diskPath`, `parentPath`, `ipv4`, `heartbeat`, `elapsedMs` | One record per virtual machine. Summary only -- no device contents, no console credentials.               |
+| `checkpoint` | infinite | `vmName`, `name`, `checkpointType`, `createdAt`, `parentName`                                                                                           | One record per checkpoint. createdAt is normalised to ISO-8601 from the /Date(ms)/ form PowerShell emits. |
+| `vmSwitch`   | infinite | `name`, `switchType`                                                                                                                                    | One record per virtual switch, with its type resolved from the numeric form PowerShell returns.           |
 
 ## Example
 
@@ -128,11 +192,10 @@ globalArguments:
 
 **Authentication is public-key only, and left to ssh.** Load an identity the
 target authorizes before running anything here — from an agent, or from your own
-ssh configuration. This model handles no key material and takes no password
-argument, and it restricts ssh to public-key authentication so a host offering
-passwords or keyboard-interactive cannot be used as a fallback. It does not
-claim to control which identity files ssh loads; that remains yours to
-configure.
+ssh configuration. This model leaves key selection to SSH and restricts host
+authentication to public keys so a host offering passwords or
+keyboard-interactive cannot be used as a fallback. It does not claim to control
+which identity files ssh loads; that remains yours to configure.
 
 **The Windows sshd's default shell is `cmd.exe`.** Anything with a quote, pipe,
 or brace gets mangled twice before PowerShell ever sees it, so commands are sent
@@ -162,12 +225,14 @@ the first time the count changes.
 identity ssh selects — an agent identity, or an identity file your own ssh
 configuration names or defaults to. This model narrows ssh to public-key
 authentication but does not choose the key; that remains yours to configure, and
-it is listed as an operator decision below rather than a guarantee. Nothing is
-read, stored, or accepted as an argument.
+it is listed as an operator decision below rather than a guarantee. Use vault
+expressions for the Windows setup and PowerShell Direct passwords. These methods
+carry sensitive inputs over SSH stdin using a fixed launcher.
 
-**What is written.** Summaries only: names, states, capacity, switch types,
-checkpoint names and timestamps. No device contents, no console credentials, no
-guest filesystem data.
+**What is written.** Inventory and lifecycle records include capacity, state,
+checkpoint metadata, and virtual disk paths. PowerShell Direct stores the
+supplied script's bounded output and exit status. Treat guest output as
+sensitive if the script reads private data.
 
 **What the identifiers themselves reveal.** Resource IDs are not opaque. Each is
 built as `<kind>--<target>--<name>[--<name>]-<sha256>`, where `<target>` is the

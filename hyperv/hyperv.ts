@@ -4,8 +4,7 @@
  * Reached by SSH to the Windows OpenSSH server, running PowerShell there.
  * There is no REST or JSON-RPC surface for Hyper-V, so PowerShell is the API,
  * and SSH is how we get to it. Authentication is whatever identity the ambient
- * ssh-agent already holds, so no password or WinRM credential is accepted,
- * read, or stored by this model.
+ * ssh-agent already holds, and separate guest credentials travel on SSH stdin.
  *
  * Two things make the transport less fragile than it looks:
  *
@@ -23,7 +22,7 @@
  * Authentication is public key only, and which key is offered is ssh's
  * decision, not this model's. An agent identity or an identity file named by
  * the caller's ssh configuration will both be used; this model handles no key
- * material and takes no password argument, and it narrows ssh to publickey so
+ * material and narrows ssh to publickey so
  * a host offering passwords cannot be used as a fallback. It does not claim
  * to control which identities ssh loads -- that is listed as an operator
  * decision in the README rather than as a guarantee.
@@ -360,6 +359,11 @@ const VmSchema = z.object({
   cpuCount: z.number().int().nullable(),
   memoryAssignedBytes: z.number().nullable(),
   uptimeSeconds: z.number().nullable(),
+  diskPath: z.string().optional(),
+  parentPath: z.string().nullable().optional(),
+  ipv4: z.ipv4().optional(),
+  heartbeat: z.string().optional(),
+  elapsedMs: z.number().nonnegative().optional(),
 });
 
 const CheckpointSchema = z.object({
@@ -377,6 +381,203 @@ const VmSwitchSchema = z.object({
   switchType: z.string(),
 });
 
+/** Drive-absolute Windows filesystem path. */
+export const WindowsPath = RemoteText(240).refine(
+  (path) =>
+    /^[A-Za-z]:\\/.test(path) &&
+    path.slice(3).split("\\").every((part) =>
+      !!part && !/[\/:"<>|*?]/.test(part) && part.trim() === part &&
+      !part.endsWith(".") &&
+      !/^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part)
+    ),
+  "expected a drive-absolute Windows path without traversal or device names",
+);
+
+/** Windows guest computer name. */
+export const ComputerName = z.string().min(1).max(15).regex(
+  /^(?!\d+$)[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/,
+);
+
+/** An OpenSSH public key with a matching wire-format type. */
+export const SshPublicKey = z.string().max(16384).refine((key) => {
+  const fields =
+    /^(ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|ssh-rsa) ([A-Za-z0-9+/]+={0,2})(?: [A-Za-z0-9@._+:= -]+)?$/
+      .exec(key);
+  if (!fields || fields[0] !== key) return false;
+  try {
+    const bytes = atob(fields[2]);
+    const embeddedType = fields[1];
+    return bytes.startsWith(
+      "\0\0\0" + String.fromCharCode(embeddedType.length) +
+        embeddedType,
+    ) && bytes.length > 4 + embeddedType.length;
+  } catch {
+    return false;
+  }
+}, "expected an OpenSSH public key without options");
+
+/** Windows setup password. */
+export const AdminPassword = RemoteText(127).refine(
+  (value) => value.length >= 14,
+  "password must contain at least 14 characters",
+).meta({ sensitive: true });
+
+const TimeZone = z.string().min(1).max(128).regex(/^[A-Za-z0-9 ()._+-]+$/);
+const AuthorizedKeys = z.array(SshPublicKey).max(16).refine(
+  (keys) => new Set(keys.map((key) => key.split(" ")[1])).size === keys.length,
+  "authorized keys must be unique",
+);
+const UnattendInput = z.object({
+  computerName: ComputerName,
+  adminPassword: AdminPassword,
+  timeZone: TimeZone.optional(),
+});
+const SetupCompleteInput = z.object({
+  enableSsh: z.boolean().default(true),
+  authorizedKeys: AuthorizedKeys,
+});
+
+const VhdxPath = WindowsPath.refine((path) => /\.vhdx$/i.test(path));
+const DeleteDiskPath = WindowsPath.refine((path) => /\.a?vhdx$/i.test(path));
+
+/** Arguments for building a generic Windows disk. */
+export const BuildImageArgsSchema = z.object({
+  isoPath: WindowsPath.refine((path) => /\.iso$/i.test(path)),
+  edition: RemoteText(128).refine((edition) => edition.length > 0),
+  outputPath: VhdxPath,
+  sizeGb: z.number().int().min(32).max(2048).default(64),
+  rebuild: z.boolean().default(false),
+});
+
+/** Arguments for creating a Generation 2 VM. */
+export const CreateVmArgsSchema = VmNameArgs.extend({
+  baseImage: VhdxPath,
+  switchName: SafeName,
+  cpuCount: z.number().int().min(1).max(64).default(2),
+  memoryGb: z.number().int().min(1).max(256).default(4),
+  diskMode: z.enum(["differencing", "copy"]).default("differencing"),
+  guest: z.discriminatedUnion("os", [
+    UnattendInput.merge(SetupCompleteInput).extend({
+      os: z.literal("windows"),
+    }),
+  ]).optional(),
+});
+
+/** Arguments for a readiness probe. */
+export const WaitReadyArgsSchema = VmNameArgs.extend({
+  timeoutSec: z.number().int().min(30).max(1800).default(600),
+  tcpPort: z.number().int().min(1).max(65535).optional(),
+});
+
+/** Arguments for a PowerShell Direct invocation. */
+export const GuestExecArgsSchema = VmNameArgs.extend({
+  user: z.string().min(1).max(64).regex(USERLIKE),
+  password: AdminPassword,
+  script: z.string().min(1).max(65536),
+  timeoutSec: z.number().int().min(1).max(600).default(120),
+});
+
+/** Arguments for deleting an unattached virtual disk. */
+export const DeleteDiskArgsSchema = z.object({
+  path: DeleteDiskPath,
+  confirmPath: DeleteDiskPath,
+  allowBaseDisk: z.boolean().default(false),
+});
+
+/** Require the caller to repeat the disk path exactly. */
+export function assertDiskDeleteConfirmed(path: string, confirmPath: string) {
+  if (path !== confirmPath) {
+    throw new Error("confirmPath must exactly match path");
+  }
+}
+
+/** Encode a password field in the format Windows Setup expects. */
+export function encodeUnattendPassword(
+  password: string,
+  kind: "AdministratorPassword" | "Password",
+): string {
+  if (kind !== "AdministratorPassword" && kind !== "Password") {
+    throw new Error("unsupported unattended password field");
+  }
+  return encodeCommand(password + kind);
+}
+
+/** Render an unattended Windows setup answer file. */
+export function renderUnattend(input: unknown): string {
+  const { computerName, adminPassword, timeZone = "UTC" } = UnattendInput.parse(
+    input,
+  );
+  const component =
+    'name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS"';
+  return `<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="specialize">
+    <component ${component}>
+      <ComputerName>${computerName}</ComputerName>
+      <TimeZone>${timeZone}</TimeZone>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component ${component}>
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>${
+    encodeUnattendPassword(adminPassword, "AdministratorPassword")
+  }</Value>
+          <PlainText>false</PlainText>
+        </AdministratorPassword>
+      </UserAccounts>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+    </component>
+  </settings>
+</unattend>`;
+}
+
+/** Render the first-boot guest configuration and cleanup. */
+export function renderSetupComplete(input: unknown): string {
+  const { enableSsh, authorizedKeys } = SetupCompleteInput.parse(input);
+  const ssh = enableSsh
+    ? `$branch = 'preinstalled'
+if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue)) {
+  Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
+  $branch = 'installed'
+}
+$dir = Join-Path $env:ProgramData 'ssh'
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$keys = Join-Path $dir 'administrators_authorized_keys'
+[IO.File]::WriteAllLines($keys, [string[]]@(${
+      authorizedKeys.map(psQuote).join(", ")
+    }), $utf8)
+icacls.exe $keys /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'could not set key file ACL' }
+$config = Join-Path $dir 'sshd_config'
+if (-not (Test-Path -LiteralPath $config)) {
+  Copy-Item -LiteralPath (Join-Path $env:WINDIR 'System32\\OpenSSH\\sshd_config_default') -Destination $config
+}
+$original = [IO.File]::ReadAllText($config)
+[IO.File]::WriteAllText($config, "PasswordAuthentication no\`r\`nKbdInteractiveAuthentication no\`r\`n" + $original, $utf8)
+if (-not (Get-NetFirewallRule -Name 'Swamp-OpenSSH-Server' -ErrorAction SilentlyContinue)) {
+  New-NetFirewallRule -Name 'Swamp-OpenSSH-Server' -DisplayName 'OpenSSH Server' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 | Out-Null
+}
+Set-Service -Name sshd -StartupType Automatic
+Start-Service -Name sshd
+[IO.File]::WriteAllText((Join-Path $env:WINDIR 'Setup\\Scripts\\OpenSSH-provisioning.txt'), $branch, $utf8)
+`
+    : "";
+  return `$ErrorActionPreference = 'Stop'
+${ssh}Remove-Item -LiteralPath (Join-Path $env:WINDIR 'Panther\\unattend.xml') -Force
+Remove-Item -LiteralPath $PSCommandPath -Force
+`;
+}
+
 type Ctx = {
   signal: AbortSignal;
   globalArgs: Record<string, unknown>;
@@ -390,6 +591,7 @@ type Ctx = {
   // guarantee only validated values reach a resource, and a signature of
   // `(...a: any[]) => Promise<any>` guarantees nothing at all -- it would
   // accept the raw remote object just as happily as the parsed one.
+  readResource?: (id: string) => Promise<unknown>;
   writeResource: (
     spec: string,
     id: string,
@@ -486,15 +688,44 @@ export function encodeCommand(ps: string): string {
   return btoa(String.fromCharCode(...u16));
 }
 
-async function runPowerShell(
+/** Fixed launcher for requests whose values must travel over SSH stdin. */
+export const STDIN_LAUNCHER = `$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$request = ConvertFrom-Json -InputObject ([Console]::In.ReadToEnd())
+$Data = $request.data
+& ([scriptblock]::Create($request.script))`;
+
+type StdinRequest = { script: string; data: unknown };
+
+/** Serialize one request without a byte order mark. */
+export function stdinRequest(script: string, data: unknown): string {
+  return JSON.stringify({ script, data });
+}
+
+/** Use the fixed command line for every stdin request. */
+export function invocation(
+  g: z.infer<typeof GlobalArgsSchema>,
+  request: StdinRequest,
+): { argv: string[]; stdin: string } {
+  return {
+    argv: sshArgs(g, encodeCommand(STDIN_LAUNCHER)),
+    stdin: stdinRequest(request.script, request.data),
+  };
+}
+
+/** Run a PowerShell command with optional JSON request data over SSH stdin. */
+export async function runPowerShell(
   g: z.infer<typeof GlobalArgsSchema>,
   ps: string,
   signal: AbortSignal,
+  input?: StdinRequest,
 ): Promise<string> {
+  const request = input === undefined ? undefined : invocation(g, input);
   const timedOut = AbortSignal.timeout((g.timeoutSec + 10) * 1000);
   const cmd = new Deno.Command("ssh", {
-    args: sshArgs(g, encodeCommand(ps)),
-    stdin: "null",
+    args: request?.argv ?? sshArgs(g, encodeCommand(ps)),
+    stdin: request ? "piped" : "null",
     stdout: "piped",
     stderr: "piped",
     signal: AbortSignal.any([signal, timedOut]),
@@ -519,10 +750,17 @@ async function runPowerShell(
       child.kill("SIGKILL");
     } catch { /* already gone */ }
   };
-  const [stdoutRaw, stderrRaw, status] = await Promise.all([
+  const writeInput = request
+    ? new Blob([request.stdin]).stream().pipeTo(child.stdin).then(
+      () => true,
+      () => false,
+    )
+    : Promise.resolve(true);
+  const [stdoutRaw, stderrRaw, status, inputWritten] = await Promise.all([
     readCapped(child.stdout, kill, () => killed),
     readCapped(child.stderr, kill, () => killed),
     child.status,
+    writeInput,
   ]);
 
   if (killed) {
@@ -560,6 +798,9 @@ async function runPowerShell(
         classifyRemote(new TextDecoder().decode(stderrRaw))
       }`,
     );
+  }
+  if (!inputWritten) {
+    throw new Error("could not write the complete PowerShell request");
   }
   return stdout;
 }
@@ -634,7 +875,14 @@ async function readCapped(
  * default and is only safe by luck.
  */
 export function classifyRemote(stderr: string): string {
+  const stage = stderr.match(
+    /win-image-stage:(mount-iso|resolve-media|select-edition|prepare-output|create-vhd|mount-vhd|partition-vhd|apply-image|install-boot-files|record-image)\b/,
+  );
+  if (stage) return "win-image-" + stage[1];
   const patterns: [RegExp, string][] = [
+    [/base disk refused/i, "base-disk-refused"],
+    [/VM already exists/i, "vm-already-exists"],
+    [/disk is attached|image is attached/i, "disk-attached"],
     [
       /host key verification failed|remote host identification/i,
       "host-key-refused",
@@ -1605,31 +1853,528 @@ Remove-VMSnapshot -VMSnapshot $snaps[0]`,
   return await collectCheckpoints(g, args.vmName, ctx);
 }
 
-async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
-  assertDeleteConfirmed(args.vmName, args.confirmName);
-  const g = GlobalArgsSchema.parse(ctx.globalArgs);
-  const before = await vmState(g, args.vmName, ctx.signal);
-  if (before === null) throw new Error(`no VM named ${args.vmName}`);
+const DiskDeleteSchema = z.object({
+  path: DeleteDiskPath,
+  vhdType: RemoteText(64),
+  parentPath: WindowsPath.nullable(),
+});
 
-  // A courtesy pre-check: it fails fast with a clear message before anything
-  // is touched. It is NOT the guard -- a VM can start between this call and
-  // the delete script, so the binding refusal lives inside that script, on
-  // the host, using the state it sees at the moment it acts.
-  if (before !== "Off" && !args.confirmForcePowerOff) {
+const ImageSchema = z.object({
+  path: VhdxPath,
+  sizeGb: z.number().int().min(32).max(2048),
+  isoPath: WindowsPath,
+  isoLength: z.number().int().positive(),
+  isoLastWriteTime: z.iso.datetime(),
+  edition: RemoteText(128),
+  editionIndex: z.number().int().positive(),
+  buildNumber: RemoteText(64),
+  buildDurationMs: z.number().nonnegative(),
+});
+
+const ExecSchema = z.object({
+  vmName: SafeName,
+  output: z.string().max(MAX_OUTPUT_BYTES),
+  exitStatus: z.number().int(),
+  truncated: z.boolean(),
+});
+
+// This walk uses the same depth bound and fail-closed semantics as delete.
+const FindAttachedDisk = String.raw`
+function Find-AttachedDisk([string]$path) {
+  $target = [IO.Path]::GetFullPath($path)
+  foreach ($vm in @(Get-VM)) {
+    foreach ($disk in @(Get-VMHardDiskDrive -VM $vm)) {
+      $cur = $disk.Path
+      $depth = 0
+      while ($cur) {
+        if ([IO.Path]::GetFullPath($cur) -eq $target) { return $vm.Name }
+        if ($depth -ge 32) { throw 'disk chain too deep' }
+        $next = (Get-VHD -Path $cur -ErrorAction Stop).ParentPath
+        if ($next -eq $cur) { throw 'disk chain is cyclic' }
+        $cur = $next
+        $depth++
+      }
+    }
+  }
+}
+`;
+
+async function deleteDisk(
+  input: z.infer<typeof DeleteDiskArgsSchema>,
+  ctx: Ctx,
+) {
+  const args = DeleteDiskArgsSchema.parse(input);
+  assertDiskDeleteConfirmed(args.path, args.confirmPath);
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const request = {
+    data: { path: args.path, allowBaseDisk: args.allowBaseDisk },
+    script: `${FindAttachedDisk}
+$path = $Data.path
+if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'disk is missing' }
+$disk = Get-VHD -Path $path
+if ($disk.Attached -or (Find-AttachedDisk $path)) { throw 'disk is attached' }
+if ($disk.VhdType -ne 'Differencing' -and -not $Data.allowBaseDisk) { throw 'base disk refused' }
+if ((Get-VHD -Path $path).Attached -or (Find-AttachedDisk $path)) { throw 'disk is attached' }
+Remove-Item -LiteralPath $path
+if (Test-Path -LiteralPath $path) { throw 'disk remains present' }
+@{ path = $path; vhdType = $disk.VhdType.ToString(); parentPath = $disk.ParentPath } |
+  ConvertTo-Json -Compress
+`,
+  };
+  const raw = await runPowerShell(g, "", ctx.signal, request);
+  const record = parseRow(
+    DiskDeleteSchema,
+    oneEnvelope(raw, "deleteDisk"),
+    "disk deletion",
+  );
+  if (record.path !== args.path) throw new Error("deleteDisk target mismatch");
+  return [
+    await ctx.writeResource(
+      "diskDelete",
+      await resourceId(targetKey(g), "diskdelete", args.path),
+      record,
+    ),
+  ];
+}
+
+async function buildWindowsImage(
+  input: z.infer<typeof BuildImageArgsSchema>,
+  ctx: Ctx,
+) {
+  const args = BuildImageArgsSchema.parse(input);
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const id = await resourceId(
+    targetKey(g),
+    "image",
+    args.outputPath.toLowerCase(),
+  );
+  const prior = ImageSchema.safeParse(await ctx.readResource?.(id));
+  const request = {
+    data: { ...args, prior: prior.success ? prior.data : null },
+    script: FindAttachedDisk + String.raw`
+$ProgressPreference = 'SilentlyContinue'
+$timer = [Diagnostics.Stopwatch]::StartNew()
+$iso = Get-Item -LiteralPath $Data.isoPath
+$output = $Data.outputPath
+$stamp = $iso.LastWriteTimeUtc.ToString('o')
+$exists = Test-Path -LiteralPath $output
+$prior = $Data.prior
+if ($exists -and -not $Data.rebuild) {
+  if ($prior -and $prior.path -eq $output -and $prior.isoPath -eq $Data.isoPath -and
+      $prior.isoLength -eq $iso.Length -and $prior.isoLastWriteTime -ceq $stamp -and
+      $prior.edition -ceq $Data.edition -and $prior.sizeGb -eq $Data.sizeGb -and
+      (Get-VHD -Path $output).Size -eq ($Data.sizeGb * 1GB)) {
+    $prior | ConvertTo-Json -Compress
+    return
+  }
+  throw 'existing image does not match the request'
+}
+if ($exists) {
+  $owner = Find-AttachedDisk $output
+  if ($owner) { @{ owner = $owner } | ConvertTo-Json -Compress; return }
+  if ((Get-VHD -Path $output).Attached) { throw 'image is attached' }
+}
+$mountedIso = $false
+$mountedVhd = $false
+$created = $false
+$complete = $false
+$stage = 'mount-iso'
+try {
+  try {
+    $image = Get-DiskImage -ImagePath $iso.FullName
+    if (-not $image.Attached) {
+      $image = Mount-DiskImage -ImagePath $iso.FullName -PassThru
+      $mountedIso = $true
+    }
+    $stage = 'resolve-media'
+    $volume = $image | Get-Volume
+    if (-not $volume.DriveLetter) { throw 'ISO has no drive letter' }
+    $source = Join-Path ($volume.DriveLetter + ':\') 'sources\install.wim'
+    if (-not (Test-Path -LiteralPath $source)) {
+      $source = Join-Path ($volume.DriveLetter + ':\') 'sources\install.esd'
+    }
+    $stage = 'select-edition'
+    $editions = @(Get-WindowsImage -ImagePath $source)
+    $matching = @($editions | Where-Object { $_.ImageName -ceq $Data.edition })
+    if ($matching.Count -ne 1) {
+      @{ editions = @($editions | ForEach-Object { $_.ImageName }) } | ConvertTo-Json -Compress
+      return
+    }
+    $entry = Get-WindowsImage -ImagePath $source -Index $matching[0].ImageIndex
+    $stage = 'prepare-output'
+    $folder = Split-Path -Parent $output
+    [void][IO.Directory]::CreateDirectory($folder)
+    if ($exists) {
+      if ((Find-AttachedDisk $output) -or (Get-VHD -Path $output).Attached) { throw 'image is attached' }
+      Remove-Item -LiteralPath $output
+    }
+    $stage = 'create-vhd'
+    New-VHD -Path $output -Dynamic -SizeBytes ($Data.sizeGb * 1GB) | Out-Null
+    $created = $true
+    $stage = 'mount-vhd'
+    $vhd = Mount-VHD -Path $output -PassThru
+    $mountedVhd = $true
+    $number = $vhd.DiskNumber
+    $stage = 'partition-vhd'
+    Initialize-Disk -Number $number -PartitionStyle GPT
+    $efi = New-Partition -DiskNumber $number -Size 260MB -AssignDriveLetter -GptType '{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}'
+    $efi | Format-Volume -FileSystem FAT32 -Confirm:$false | Out-Null
+    $efi = Get-Partition -DiskNumber $number -PartitionNumber $efi.PartitionNumber
+    if ($efi.DriveLetter -notmatch '^[A-Z]$') {
+      $efi | Add-PartitionAccessPath -AssignDriveLetter
+      $efi = Get-Partition -DiskNumber $number -PartitionNumber $efi.PartitionNumber
+    }
+    if ($efi.DriveLetter -notmatch '^[A-Z]$') { throw 'EFI partition has no drive letter' }
+    New-Partition -DiskNumber $number -Size 16MB -GptType '{e3c9e316-0b5c-4db8-817d-f92df00215ae}' | Out-Null
+    $os = New-Partition -DiskNumber $number -UseMaximumSize -AssignDriveLetter -GptType '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}'
+    $os | Format-Volume -FileSystem NTFS -Confirm:$false | Out-Null
+    $root = $os.DriveLetter + ':\'
+    $stage = 'apply-image'
+    Expand-WindowsImage -ImagePath $source -Index $entry.ImageIndex -ApplyPath $root | Out-Null
+    $stage = 'install-boot-files'
+    $efiTarget = [string]$efi.DriveLetter + ':'
+    $windowsPath = Join-Path $root 'Windows'
+    $bootTool = Join-Path $env:WINDIR 'System32\bcdboot.exe'
+    & $bootTool $windowsPath /s $efiTarget /f UEFI | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'bcdboot failed' }
+    $stage = 'record-image'
+    $record = @{
+      path = $output; sizeGb = $Data.sizeGb; isoPath = $Data.isoPath
+      isoLength = $iso.Length; isoLastWriteTime = $stamp
+      edition = $entry.ImageName; editionIndex = $entry.ImageIndex
+      buildNumber = [string]$entry.Build; buildDurationMs = $timer.ElapsedMilliseconds
+    }
+  } finally {
+    try {
+      if ($mountedVhd) { Dismount-VHD -Path $output }
+    } finally {
+      if ($mountedIso) { Dismount-DiskImage -ImagePath $iso.FullName | Out-Null }
+    }
+  }
+  $complete = $true
+} catch {
+  throw ('win-image-stage:' + $stage)
+} finally {
+  if ($created -and -not $complete) { Remove-Item -LiteralPath $output }
+}
+$record | ConvertTo-Json -Compress
+`,
+  };
+  const raw = await runPowerShell(g, "", ctx.signal, request);
+  const result = oneEnvelope(raw, "buildWindowsImage");
+  if ("owner" in result) {
+    const owner = parseRow(SafeName, result.owner, "image owner");
+    throw new Error(`image is in use by VM ${owner}`);
+  }
+  if ("editions" in result) {
+    const editions = parseRow(
+      z.array(RemoteText(128)).max(256),
+      result.editions,
+      "editions",
+    );
     throw new Error(
-      `${args.vmName} is ${
-        safeState(before)
-      }. Deleting it cuts power with no graceful ` +
-        `shutdown, risking the guest filesystem. Stop it first, or pass ` +
-        `confirmForcePowerOff to accept that.`,
+      `edition must match exactly once. Available editions: ${
+        editions.join(", ")
+      }`,
     );
   }
+  return [
+    await ctx.writeResource(
+      "image",
+      id,
+      parseRow(ImageSchema, result, "image"),
+    ),
+  ];
+}
 
+const ProvisionVmRecord = VmSchema.extend({
+  diskPath: WindowsPath.nullable(),
+  parentPath: WindowsPath.nullable(),
+  ipv4: z.ipv4().optional(),
+});
+
+const VmResultScript = String.raw`
+@{
+  name = $vm.Name; state = $vm.State.ToString(); status = [string]$vm.Status
+  generation = $vm.Generation; cpuCount = $vm.ProcessorCount
+  memoryAssignedBytes = $vm.MemoryAssigned; uptimeSeconds = $vm.Uptime.TotalSeconds
+  diskPath = $diskPath; parentPath = $parentPath
+} + $additional | ConvertTo-Json -Compress
+`;
+
+/** Prepare first-boot content and a host request without embedding secrets in scripts. */
+export function createVmRequest(input: unknown): StdinRequest {
+  const { guest, ...args } = CreateVmArgsSchema.parse(input);
+  return {
+    data: {
+      ...args,
+      ...(guest &&
+        {
+          unattend: renderUnattend(guest),
+          setupComplete: renderSetupComplete(guest),
+        }),
+    },
+    script: String.raw`
+$ProgressPreference = 'SilentlyContinue'
+$name = $Data.vmName
+if (Get-VM | Where-Object { $_.Name -eq $name }) { throw 'VM already exists' }
+if (@(Get-VMSwitch | Where-Object { $_.Name -eq $Data.switchName }).Count -ne 1) {
+  throw 'switch does not exist'
+}
+$root = (Get-VMHost).VirtualMachinePath
+if ($name -match '[\\/:<>|"?*]' -or $name.EndsWith('.')) { throw 'VM name is not a safe directory component' }
+$folder = Join-Path $root $name
+if (Test-Path -LiteralPath $folder) { throw 'VM folder already exists' }
+$diskPath = Join-Path $folder 'system.vhdx'
+$parentPath = $null
+$created = $false
+$vm = $null
+try {
+  New-Item -Path $folder -ItemType Directory | Out-Null
+  if ($Data.diskMode -eq 'differencing') {
+    New-VHD -Path $diskPath -ParentPath $Data.baseImage -Differencing | Out-Null
+    $parentPath = (Get-VHD -Path $diskPath).ParentPath
+  } else {
+    Copy-Item -LiteralPath $Data.baseImage -Destination $diskPath
+  }
+  $created = $true
+  if ($null -ne $Data.unattend) {
+    $mounted = Mount-VHD -Path $diskPath -PassThru
+    try {
+      $windows = @(Get-Partition -DiskNumber $mounted.DiskNumber | Where-Object {
+        $_.DriveLetter -and (Test-Path -LiteralPath ($_.DriveLetter + ':\Windows\System32\config\SYSTEM'))
+      })
+      if ($windows.Count -ne 1) { throw 'expected exactly one Windows partition' }
+      $win = $windows[0].DriveLetter + ':\Windows'
+      $panther = Join-Path $win 'Panther'
+      $scripts = Join-Path $win 'Setup\Scripts'
+      [void][IO.Directory]::CreateDirectory($panther)
+      [void][IO.Directory]::CreateDirectory($scripts)
+      $utf8 = [System.Text.UTF8Encoding]::new($false)
+      [IO.File]::WriteAllText((Join-Path $panther 'unattend.xml'), $Data.unattend, $utf8)
+      [IO.File]::WriteAllText((Join-Path $scripts 'SetupComplete.ps1'), $Data.setupComplete, $utf8)
+      [IO.File]::WriteAllText((Join-Path $scripts 'SetupComplete.cmd'), 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0SetupComplete.ps1"', $utf8)
+    } finally { Dismount-VHD -Path $diskPath }
+  }
+  $vm = New-VM -Name $name -Path $root -Generation 2 -VHDPath $diskPath -SwitchName $Data.switchName -MemoryStartupBytes ($Data.memoryGb * 1GB)
+  Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate MicrosoftWindows
+  Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
+  Set-VMProcessor -VM $vm -Count $Data.cpuCount
+  Enable-VMIntegrationService -VM $vm -Name 'Guest Service Interface'
+  $vm = Get-VM -Id $vm.Id
+} catch {
+  if ($vm) { Remove-VM -Force -VM $vm }
+  if ($created) { Remove-Item -LiteralPath $diskPath }
+  throw
+}
+$additional = @{}
+` + VmResultScript,
+  };
+}
+
+async function createVm(input: z.infer<typeof CreateVmArgsSchema>, ctx: Ctx) {
+  const args = CreateVmArgsSchema.parse(input);
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const raw = await runPowerShell(g, "", ctx.signal, createVmRequest(args));
+  return await writeProvisionVm(g, args.vmName, raw, ctx);
+}
+
+async function writeProvisionVm(
+  g: z.infer<typeof GlobalArgsSchema>,
+  name: string,
+  raw: string,
+  ctx: Ctx,
+) {
+  const record = parseRow(
+    ProvisionVmRecord,
+    oneEnvelope(raw, "VM result"),
+    "VM result",
+  );
+  if (record.name.toLowerCase() !== name.toLowerCase()) {
+    throw new Error("VM result target mismatch");
+  }
+  return [
+    await ctx.writeResource(
+      "vm",
+      await resourceId(targetKey(g), "vm", record.name),
+      record,
+      { tags: { state: safeState(record.state) } },
+    ),
+  ];
+}
+
+const ReadyHeartbeats: readonly unknown[] = [
+  "OkApplicationsHealthy",
+  "OkApplicationsUnknown",
+];
+const FailedHeartbeats: readonly unknown[] = [
+  "OkApplicationsCritical",
+  "Error",
+  "Paused",
+  "Disabled",
+];
+
+/** Classify only exact Hyper-V heartbeat names. */
+export function classifyHeartbeat(
+  value: unknown,
+): "ready" | "waiting" | "failed" {
+  if (ReadyHeartbeats.includes(value)) return "ready";
+  if (FailedHeartbeats.includes(value)) return "failed";
+  return "waiting";
+}
+
+async function waitReady(input: z.infer<typeof WaitReadyArgsSchema>, ctx: Ctx) {
+  const args = WaitReadyArgsSchema.parse(input);
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const request = {
+    data: {
+      ...args,
+      readyHeartbeats: ReadyHeartbeats,
+      failedHeartbeats: FailedHeartbeats,
+    },
+    script: String.raw`
+$ProgressPreference = 'SilentlyContinue'
+$timer = [Diagnostics.Stopwatch]::StartNew()
+$condition = 'heartbeat'
+while ($timer.Elapsed.TotalSeconds -lt $Data.timeoutSec) {
+  $vm = Get-VM -Name $Data.vmName
+  $heartbeat = [string]$vm.Heartbeat
+  if ($heartbeat -cin $Data.failedHeartbeats) {
+    @{ heartbeat = $heartbeat; failed = $true } | ConvertTo-Json -Compress
+    return
+  }
+  if ($heartbeat -cin $Data.readyHeartbeats) {
+    $condition = 'ipv4'
+    $ip = @(Get-VMNetworkAdapter -VM $vm | ForEach-Object { $_.IPAddresses } |
+      Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notmatch '^(169\.254|127\.|0\.)' } |
+      Select-Object -First 1)
+    if ($ip.Count) {
+      $condition = 'tcp'
+      if (-not $Data.tcpPort -or (Test-NetConnection -ComputerName $ip[0] -Port $Data.tcpPort -InformationLevel Quiet -WarningAction SilentlyContinue)) {
+        $diskPath = Get-VMHardDiskDrive -VM $vm | Select-Object -First 1 -ExpandProperty Path
+        $parentPath = if ($diskPath) { (Get-VHD -Path $diskPath).ParentPath } else { $null }
+        $additional = @{ ipv4 = $ip[0]; heartbeat = $heartbeat; elapsedMs = $timer.ElapsedMilliseconds }
+        break
+      }
+    }
+  } else { $condition = 'heartbeat' }
+  Start-Sleep -Seconds 2
+}
+if (-not $additional) { @{ timeout = $condition; heartbeat = $heartbeat } | ConvertTo-Json -Compress; return }
+` + VmResultScript,
+  };
+  const raw = await runPowerShell(
+    { ...g, timeoutSec: args.timeoutSec + 15 },
+    "",
+    ctx.signal,
+    request,
+  );
+  const record = oneEnvelope(raw, "waitReady");
+  const heartbeat = classifyHeartbeat(record.heartbeat);
+  const name = typeof record.heartbeat === "string" &&
+      /^(?:[A-Za-z][A-Za-z0-9]{0,63}|[0-9]{1,10})$/.test(record.heartbeat)
+    ? record.heartbeat
+    : "(empty or invalid)";
+  if (heartbeat === "failed") {
+    throw new Error(`waitReady failed on heartbeat ${name}`);
+  }
+  if ("timeout" in record) {
+    const condition = parseRow(
+      z.enum(["heartbeat", "ipv4", "tcp"]),
+      record.timeout,
+      "readiness condition",
+    );
+    throw new Error(`waitReady timed out waiting for ${condition}`);
+  }
+  if (heartbeat !== "ready") {
+    throw new Error("waitReady returned an invalid readiness result");
+  }
+  return await writeProvisionVm(g, args.vmName, raw, ctx);
+}
+
+/** Prepare the PowerShell Direct request, carrying credentials only in data. */
+export function guestExecRequest(input: unknown): StdinRequest {
+  const args = GuestExecArgsSchema.parse(input);
+  return {
+    data: args,
+    script: String.raw`
+$secure = ConvertTo-SecureString $Data.password -AsPlainText -Force
+$cred = [pscredential]::new($Data.user, $secure)
+Invoke-Command -VMName $Data.vmName -Credential $cred -ArgumentList $Data.script -ScriptBlock {
+  param([string]$text)
+  $status = 0
+  $global:LASTEXITCODE = 0
+  $limit = 524288
+  $buffer = [Text.StringBuilder]::new()
+  $truncated = $false
+  try {
+    & ([scriptblock]::Create($text)) 2>&1 | ForEach-Object {
+      $line = [string]$_
+      $remaining = $limit - $buffer.Length
+      if ($line.Length + 1 -gt $remaining) { $truncated = $true }
+      if ($remaining -gt 0) {
+        $value = $line + [char]10
+        [void]$buffer.Append($value, 0, [Math]::Min($remaining, $value.Length))
+      }
+      if ($_ -is [Management.Automation.ErrorRecord]) { $status = 1 }
+    }
+    if ($LASTEXITCODE) { $status = $LASTEXITCODE }
+  } catch { $status = 1 }
+  @{ output = $buffer.ToString(); exitStatus = $status; truncated = $truncated } | ConvertTo-Json -Compress
+}
+`,
+  };
+}
+
+async function guestExec(input: z.infer<typeof GuestExecArgsSchema>, ctx: Ctx) {
+  const args = GuestExecArgsSchema.parse(input);
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const raw = await runPowerShell(
+    { ...g, timeoutSec: args.timeoutSec },
+    "",
+    ctx.signal,
+    guestExecRequest(args),
+  );
+  const result = oneEnvelope(raw, "guestExec");
+  const record = parseRow(
+    ExecSchema,
+    { ...result, vmName: args.vmName },
+    "guest execution",
+  );
+  for (
+    const value of [
+      args.password,
+      btoa(
+        Array.from(
+          new TextEncoder().encode(args.password),
+          (byte) => String.fromCharCode(byte),
+        ).join(""),
+      ),
+      encodeCommand(args.password),
+      encodeUnattendPassword(args.password, "AdministratorPassword"),
+      encodeUnattendPassword(args.password, "Password"),
+    ]
+  ) {
+    record.output = record.output.replaceAll(value, "[redacted]");
+  }
+  return [
+    await ctx.writeResource(
+      "exec",
+      await resourceId(targetKey(g), "exec", args.vmName, crypto.randomUUID()),
+      record,
+    ),
+  ];
+}
+
+/** Render the VM deletion command after validating the requested target. */
+export function renderDeleteScript(input: unknown): string {
+  const args = DeleteArgsSchema.parse(input);
+  assertDeleteConfirmed(args.vmName, args.confirmName);
   // Disk removal reports per file. It used to run with -ErrorAction
   // SilentlyContinue while the method logged "disks removed" and threw the
   // result object away, so a disk that could not be deleted -- locked, in use,
   // on a disconnected volume -- was indistinguishable from one that was.
-  const ps = `${resolveOneVm(args.vmName)}
+  return `${resolveOneVm(args.vmName)}
 $name = $vm.Name
 $allowForce = ${args.confirmForcePowerOff ? "$true" : "$false"}
 ${
@@ -1726,9 +2471,7 @@ function Get-OtherDiskSet {
 function Normalise-Path([string]$p) {
   try { return [System.IO.Path]::GetFullPath($p) } catch { return $p }
 }
-$othersDisks = Get-OtherDiskSet`
-      : "# Disks are staying: no chain is walked and no ownership judged. An\n# unreadable VHD chain must not block an operation that never asked to\n# touch a disk."
-  }
+$othersDisks = Get-OtherDiskSet
 $shared = @($disks | Where-Object { $othersDisks.Contains((Normalise-Path $_)) })
 # The same file attached twice to THIS VM is the other half of the promise the
 # README makes, and it was never implemented. Left undetected, the first pass
@@ -1742,7 +2485,9 @@ foreach ($d in $disks) {
 }
 # Collapse only NOW, after the guard above has had a chance to see the
 # duplicates. The removal loop should then visit each file once.
-$disks = @($disks | Select-Object -Unique)
+$disks = @($disks | Select-Object -Unique)`
+      : "# Disks are staying: no chain is walked and no ownership judged. An\n# unreadable VHD chain must not block an operation that never asked to\n# touch a disk."
+  }
 $state = $vm.State.ToString()
 # The acknowledgement is enforced HERE, not only before the call. Checking
 # state in one SSH round trip and powering off in a later one leaves a window
@@ -1828,8 +2573,33 @@ for ($i = 0; $i -lt $disks.Count; $i++) {
 }`
       : ""
   }
-[pscustomobject]@{ diskCount = $disks.Count; results = @($results) } | ConvertTo-Json -Depth 4 -Compress`
+[pscustomobject]@{ diskCount = ${
+    args.deleteDisks ? "$disks.Count" : "0"
+  }; results = @($results) } | ConvertTo-Json -Depth 4 -Compress`
     .trim();
+}
+
+async function deleteVm(args: z.infer<typeof DeleteArgsSchema>, ctx: Ctx) {
+  assertDeleteConfirmed(args.vmName, args.confirmName);
+  const g = GlobalArgsSchema.parse(ctx.globalArgs);
+  const before = await vmState(g, args.vmName, ctx.signal);
+  if (before === null) throw new Error(`no VM named ${args.vmName}`);
+
+  // A courtesy pre-check: it fails fast with a clear message before anything
+  // is touched. It is NOT the guard -- a VM can start between this call and
+  // the delete script, so the binding refusal lives inside that script, on
+  // the host, using the state it sees at the moment it acts.
+  if (before !== "Off" && !args.confirmForcePowerOff) {
+    throw new Error(
+      `${args.vmName} is ${
+        safeState(before)
+      }. Deleting it cuts power with no graceful ` +
+        `shutdown, risking the guest filesystem. Stop it first, or pass ` +
+        `confirmForcePowerOff to accept that.`,
+    );
+  }
+
+  const ps = renderDeleteScript(args);
   const envelope = parseRow(
     DiskDeleteEnvelope,
     oneEnvelope(await runPowerShell(g, ps, ctx.signal), "disk deletion"),
@@ -1937,10 +2707,28 @@ for ($i = 0; $i -lt $disks.Count; $i++) {
  */
 export const model = {
   type: "@jpisgeek/hyperv",
-  version: "2026.08.29.1",
+  version: "2026.11.25.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {
+    image: {
+      description: "Windows golden image metadata.",
+      schema: ImageSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    exec: {
+      description: "PowerShell Direct output and status.",
+      schema: ExecSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    diskDelete: {
+      description: "Verified removal of one virtual disk.",
+      schema: DiskDeleteSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
     vmHost: {
       description: "The Hyper-V host itself: capacity and where it keeps VMs.",
       schema: VmHostSchema,
@@ -1971,6 +2759,32 @@ export const model = {
   },
 
   methods: {
+    buildWindowsImage: {
+      description: "Build a generic Windows image from an exact ISO edition.",
+      arguments: BuildImageArgsSchema,
+      execute: buildWindowsImage,
+    },
+    createVm: {
+      description:
+        "Create a stopped Generation 2 VM from a Windows image. For a differencing child, leave disks in place when deleting the VM, then remove only its child with deleteDisk.",
+      arguments: CreateVmArgsSchema,
+      execute: createVm,
+    },
+    waitReady: {
+      description: "Wait for heartbeat, IPv4, and the optional TCP port.",
+      arguments: WaitReadyArgsSchema,
+      execute: waitReady,
+    },
+    guestExec: {
+      description: "Execute a PowerShell script inside the VM.",
+      arguments: GuestExecArgsSchema,
+      execute: guestExec,
+    },
+    deleteDisk: {
+      description: "Remove one unattached disk after exact confirmation.",
+      arguments: DeleteDiskArgsSchema,
+      execute: deleteDisk,
+    },
     discover: {
       description: "Read-only sweep of the Hyper-V host, its VMs, and its " +
         "virtual switches. Writes one resource each and never mutates.",
@@ -2012,7 +2826,7 @@ export const model = {
     delete: {
       description: "Delete a VM. DESTRUCTIVE: confirmName must exactly " +
         "equal vmName. Disks are LEFT IN PLACE unless deleteDisks is set, " +
-        "matching Hyper-V's own default rather than being harsher than it.",
+        "matching Hyper-V's default. For a differencing VM from createVm, leave disks in place and use deleteDisk on its child.",
       arguments: DeleteArgsSchema,
       execute: deleteVm,
     },
