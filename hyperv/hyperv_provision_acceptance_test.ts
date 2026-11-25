@@ -1,7 +1,7 @@
 /**
  * Acceptance tests for the provisioning surface of the Hyper-V model.
  *
- * Plan: docs/plans/2026-11-25-hyperv-provisioning.md (revision 2: secrets travel on stdin; differencing children are removed with deleteDisk, never through delete --deleteDisks)
+ * Plan: docs/plans/2026-11-25-hyperv-provisioning.md (rev 3: heartbeat readiness; rev 2: deleteDisk; rev 1: secrets on stdin)
  *
  * The reviewer owns this file. Implementers make it pass and must not edit it:
  * its SHA-256 is recorded in the plan, and a changed hash fails review on its
@@ -25,6 +25,7 @@ import {
   AdminPassword,
   assertDiskDeleteConfirmed,
   BuildImageArgsSchema,
+  classifyHeartbeat,
   ComputerName,
   CreateVmArgsSchema,
   createVmRequest,
@@ -791,4 +792,56 @@ Deno.test("assertDiskDeleteConfirmed never echoes the paths it compared", () => 
     Error,
   );
   assertFalse(err.message.includes("acme-merger"), "refusal quoted a path");
+});
+
+// ---------------------------------------------------------------------------
+// Revision 3: heartbeat readiness.
+//
+// A healthy guest whose applications report nothing shows
+// OkApplicationsUnknown, and that is the normal state for Server Core. "Ok"
+// is not a value Hyper-V reports. Only exact names can be ready, and anything
+// unrecognised waits rather than passes.
+// ---------------------------------------------------------------------------
+
+Deno.test("classifyHeartbeat: a running heartbeat is ready whatever the application health", () => {
+  assertEquals(classifyHeartbeat("OkApplicationsHealthy"), "ready");
+  assertEquals(classifyHeartbeat("OkApplicationsUnknown"), "ready");
+});
+
+Deno.test("classifyHeartbeat: states that waiting cannot fix fail at once", () => {
+  for (const v of ["OkApplicationsCritical", "Error", "Paused", "Disabled"]) {
+    assertEquals(classifyHeartbeat(v), "failed", v);
+  }
+});
+
+Deno.test("classifyHeartbeat: boot-time states keep waiting", () => {
+  for (const v of ["NoContact", "LostCommunication", "Unknown"]) {
+    assertEquals(classifyHeartbeat(v), "waiting", v);
+  }
+});
+
+Deno.test("classifyHeartbeat: nothing but an exact name can be ready", () => {
+  for (
+    const v of [
+      "Ok", // not a value Hyper-V reports; revision 2's mistake
+      "ok",
+      "okapplicationshealthy",
+      " OkApplicationsHealthy",
+      "OkApplicationsHealthy ",
+      "OkApplicationsSomethingNew",
+      "",
+      2, // enum number: names must be resolved PowerShell-side
+      7,
+      null,
+      undefined,
+      {},
+      ["OkApplicationsHealthy"],
+    ]
+  ) {
+    assertEquals(
+      classifyHeartbeat(v),
+      "waiting",
+      JSON.stringify(v) ?? String(v),
+    );
+  }
 });

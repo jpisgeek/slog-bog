@@ -1,6 +1,10 @@
 # Plan: Hyper-V provisioning for `@jpisgeek/hyperv`
 
-Status: ready for implementation, **revision 2** · Owner of plan and acceptance tests: reviewer · Implementer: assigned worker
+Status: ready for implementation, **revision 3** · Owner of plan and acceptance tests: reviewer · Implementer: assigned worker
+
+Revision 3 (2026-11-25): live step 4 showed a healthy guest reporting `OkApplicationsUnknown`. The plan accepted
+only `OkApplicationsHealthy` or `Ok`, and Hyper-V never reports `Ok`. Readiness is now `classifyHeartbeat`. See
+"Heartbeat readiness".
 
 Revision 2 (2026-11-25): the implementer showed from source that `delete` with `deleteDisks: true` treats a
 differencing VM's golden parent as VM-owned. `delete` keeps its reviewed contract unchanged. A new guarded
@@ -105,11 +109,25 @@ start the VM. The caller runs `start`.
 
 ### Waiting and reaching the guest
 
-`waitReady` polls `Get-VM` (heartbeat `OkApplicationsHealthy` or `Ok`) and `Get-VMNetworkAdapter` (`IPAddresses`,
-first non-link-local IPv4) until `timeoutSec` runs out. With `tcpPort` set, it also requires
+`waitReady` polls `Get-VM` (heartbeat, classified by `classifyHeartbeat` below) and `Get-VMNetworkAdapter`
+(`IPAddresses`, first non-link-local IPv4) until `timeoutSec` runs out. With `tcpPort` set, it also requires
 `Test-NetConnection -Port` from the host to that address to succeed. It returns the address, the heartbeat state
 and the elapsed time, and it records the address on the VM resource. Timing out is an error that says which
 condition never became true.
+
+**Heartbeat readiness (revision 3).** Hyper-V reports the heartbeat integration (the primary status) and guest
+application health (the secondary status) in one value. A healthy guest whose applications report nothing,
+which is normal for Server Core, shows `OkApplicationsUnknown`. `Ok` is not a value Hyper-V reports.
+Resolve the value to its **name** on the PowerShell side (`[string]$vm.Heartbeat`), never the enum number, as
+the model already does for `State`. Then `classifyHeartbeat(name)` returns:
+
+| Result | Values | `waitReady` does |
+|---|---|---|
+| `ready` | `OkApplicationsHealthy`, `OkApplicationsUnknown` | The heartbeat condition is met. |
+| `failed` | `OkApplicationsCritical`, `Error`, `Paused`, `Disabled` | Stops at once with an error naming the value. Waiting cannot fix any of these. |
+| `waiting` | `NoContact`, `LostCommunication`, `Unknown`, and **anything else**, including numbers, empty, null or unrecognised names | Keeps polling. At timeout, the error names the last value seen. |
+
+Unrecognised values wait rather than pass, so a value Microsoft adds later can never be read as healthy.
 
 `guestExec` runs `Invoke-Command -VMName <name> -Credential <cred> -ScriptBlock { ... }` on the host. The host
 script builds the credential from `$Data.user` and `$Data.password` (`ConvertTo-SecureString -AsPlainText
@@ -170,6 +188,7 @@ The acceptance tests import these from `hyperv.ts`. Names and shapes are fixed. 
 | `BuildImageArgsSchema` | zod object | `isoPath` (`.iso`), `edition` (1–128 printable), `outputPath` (`.vhdx`), `sizeGb` 32–2048 integer, default 64, `rebuild` default false. |
 | `CreateVmArgsSchema` | zod object | `vmName` (`SafeName`), `baseImage` (`.vhdx`), `switchName` (`SafeName`), `cpuCount` 1–64 default 2, `memoryGb` 1–256 default 4, `diskMode` `differencing` or `copy`, optional `guest` discriminated on `os`. Phase 1 has only `"windows"`: `computerName`, `adminPassword`, `authorizedKeys` (≤16, unique), `enableSsh` default true, optional `timeZone`. |
 | `WaitReadyArgsSchema` | zod object | `vmName`, `timeoutSec` 30–1800 default 600, optional `tcpPort` 1–65535. |
+| `classifyHeartbeat(value)` | function | `"ready" \| "waiting" \| "failed"` per the heartbeat table. Takes `unknown`, and only exact string names can be `ready`. |
 | `GuestExecArgsSchema` | zod object | `vmName`, `user` (plain login name), `password` (sensitive, required), `script` 1–65536 characters, `timeoutSec` ≤600 default 120. |
 | `encodeUnattendPassword(pw, kind)` | function | base64 of UTF-16LE(`pw + kind`), `kind` ∈ `AdministratorPassword`, `Password`. |
 | `renderUnattend({ computerName, adminPassword, timeZone? })` | function | Deterministic unattend XML for passes specialize and oobeSystem, amd64. Encoded password with `PlainText` false, OOBE pages hidden, default time zone `UTC`. Throws on invalid input. |
