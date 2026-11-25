@@ -1,7 +1,7 @@
 /**
  * Acceptance tests for the provisioning surface of the Hyper-V model.
  *
- * Plan: docs/plans/2026-11-25-hyperv-provisioning.md (revision 1: secrets travel on stdin)
+ * Plan: docs/plans/2026-11-25-hyperv-provisioning.md (revision 2: secrets travel on stdin; differencing children are removed with deleteDisk, never through delete --deleteDisks)
  *
  * The reviewer owns this file. Implementers make it pass and must not edit it:
  * its SHA-256 is recorded in the plan, and a changed hash fails review on its
@@ -23,10 +23,12 @@ import {
 import type { z } from "npm:zod@4";
 import {
   AdminPassword,
+  assertDiskDeleteConfirmed,
   BuildImageArgsSchema,
   ComputerName,
   CreateVmArgsSchema,
   createVmRequest,
+  DeleteDiskArgsSchema,
   encodeCommand,
   encodeUnattendPassword,
   GlobalArgsSchema,
@@ -714,4 +716,79 @@ Deno.test("request builders refuse what the schemas refuse", () => {
   assertThrows(() => guestExecRequest({ ...GUEST_EXEC, password: "" }));
   assertThrows(() => guestExecRequest({ ...GUEST_EXEC, script: "" }));
   assertThrows(() => createVmRequest({ ...CREATE_WITH_GUEST, vmName: "" }));
+});
+
+// ---------------------------------------------------------------------------
+// Revision 2: deleteDisk.
+//
+// The existing `delete` treats a VM's whole disk chain as VM-owned, so with
+// deleteDisks it would remove the golden parent of a differencing VM (or
+// refuse outright when another VM shares it). `delete` keeps that reviewed
+// contract unchanged. A VM made by createVm is removed with deleteDisks false,
+// and its run-owned child disk is removed by deleteDisk, whose defaults refuse
+// base disks, so a golden image cannot go through it by accident.
+// ---------------------------------------------------------------------------
+
+const CHILD = "C:\\source\\e2e-win01\\e2e-win01.vhdx";
+
+Deno.test("deleteDisk requires an exact path confirmation and refuses base disks by default", () => {
+  const a = DeleteDiskArgsSchema.parse({ path: CHILD, confirmPath: CHILD });
+  assertEquals(a.allowBaseDisk, false);
+  assert(
+    ok(DeleteDiskArgsSchema, {
+      path: "C:\\x\\disk.AVHDX",
+      confirmPath: "C:\\x\\disk.AVHDX",
+    }),
+  );
+  assertFalse(
+    ok(DeleteDiskArgsSchema, { path: CHILD }),
+    "confirmPath must be required",
+  );
+  assertFalse(
+    ok(DeleteDiskArgsSchema, {
+      path: "C:\\x\\image.iso",
+      confirmPath: "C:\\x\\image.iso",
+    }),
+  );
+  assertFalse(
+    ok(DeleteDiskArgsSchema, {
+      path: "C:\\x\\notes.txt",
+      confirmPath: "C:\\x\\notes.txt",
+    }),
+  );
+  assertFalse(
+    ok(DeleteDiskArgsSchema, {
+      path: "\\\\nas\\share\\d.vhdx",
+      confirmPath: "\\\\nas\\share\\d.vhdx",
+    }),
+  );
+  assertFalse(
+    ok(DeleteDiskArgsSchema, {
+      path: "C:\\x\\..\\y\\d.vhdx",
+      confirmPath: "C:\\x\\..\\y\\d.vhdx",
+    }),
+  );
+});
+
+Deno.test("assertDiskDeleteConfirmed accepts only the identical path", () => {
+  assertDiskDeleteConfirmed(CHILD, CHILD);
+  for (
+    const wrong of [
+      "C:\\source\\e2e-win01\\E2E-WIN01.vhdx", // case differs: still not the same string
+      "C:\\source\\e2e-win01\\e2e-win02.vhdx",
+      "C:\\source\\e2e-win01\\",
+      "",
+    ]
+  ) {
+    assertThrows(() => assertDiskDeleteConfirmed(CHILD, wrong), Error);
+  }
+});
+
+Deno.test("assertDiskDeleteConfirmed never echoes the paths it compared", () => {
+  const secretish = "C:\\clients\\acme-merger\\d.vhdx";
+  const err = assertThrows(
+    () => assertDiskDeleteConfirmed(secretish, CHILD),
+    Error,
+  );
+  assertFalse(err.message.includes("acme-merger"), "refusal quoted a path");
 });

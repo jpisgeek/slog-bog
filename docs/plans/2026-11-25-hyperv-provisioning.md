@@ -1,6 +1,11 @@
 # Plan: Hyper-V provisioning for `@jpisgeek/hyperv`
 
-Status: ready for implementation, **revision 1** · Owner of plan and acceptance tests: reviewer · Implementer: assigned worker
+Status: ready for implementation, **revision 2** · Owner of plan and acceptance tests: reviewer · Implementer: assigned worker
+
+Revision 2 (2026-11-25): the implementer showed from source that `delete` with `deleteDisks: true` treats a
+differencing VM's golden parent as VM-owned. `delete` keeps its reviewed contract unchanged. A new guarded
+`deleteDisk` method removes only the child, and live step 8 is rewritten around it. See "Removing a differencing
+VM: `deleteDisk`".
 
 Revision 1 (2026-11-25): secrets and large payloads now travel on SSH stdin, never in argv. The implementer
 raised it: passwords inside `-EncodedCommand` are only base64, which shows up in local `ps` output and in the
@@ -24,6 +29,7 @@ back to nothing, without a person at the console. The first consumer is the live
 | `createVm` | host | Creates a Generation 2 VM on a differencing child of a golden image (or a full copy) and specializes the guest offline. |
 | `waitReady` | no | Waits for the guest heartbeat, an IPv4 address from the integration services, and optionally an open TCP port. |
 | `guestExec` | guest | Runs a PowerShell script inside the guest over PowerShell Direct (VMBus, no guest network needed). |
+| `deleteDisk` | host disk | Deletes one VHDX/AVHDX that no VM uses. Refuses base (non-differencing) disks unless `allowBaseDisk`. This is how a differencing VM's child is removed. |
 
 `start`, `stop`, `delete` and the checkpoint methods already exist and are reused as they are.
 
@@ -71,6 +77,28 @@ to the parent**. With a `guest` block it specializes the child **offline, before
 5. `New-VM -Generation 2`, `Set-VMFirmware -SecureBootTemplate MicrosoftWindows`, attach the child, connect the
    switch, set CPU and memory (static memory: dynamic memory makes `waitReady` timing noisy), and enable the
    Guest Service Interface integration service.
+
+`createVm` records the child's path and its parent's path on the `vm` resource (`diskPath`, `parentPath`).
+
+### Removing a differencing VM: `deleteDisk`
+
+The existing `delete` treats the attached disk **and every parent behind it** as VM-owned. That is right for
+checkpoint chains, where the parent is the VM's own original disk. It is wrong for a `createVm` child, whose
+parent is a shared golden image. With `deleteDisks: true` it would delete the golden image when no other VM uses
+it, and refuse the whole delete when one does. `delete` keeps its reviewed contract unchanged. A VM created with
+`diskMode: "differencing"` is removed with `delete` (`deleteDisks: false`), then `deleteDisk` on its child. The
+README must say this in `delete`'s and `createVm`'s sections.
+
+`deleteDisk` (`path`, `confirmPath`, `allowBaseDisk` default false) refuses, before touching anything, when:
+- `confirmPath` is not the identical string. Checked locally with `assertDiskDeleteConfirmed`, whose error never
+  quotes either path.
+- The file does not exist or `Get-VHD` cannot read it (fail closed).
+- Any VM has it attached, or it appears anywhere in the parent chain of any disk attached to any VM. Reuse the
+  existing chain walk, applied to all VMs, with its depth bound and its fail-closed handling of unreadable chains.
+- It is not a differencing disk and `allowBaseDisk` is false.
+
+It re-checks attachment immediately before `Remove-Item`, as `delete` does, and records a `diskDelete` resource
+with the path, the VHD type and the parent path.
 
 `createVm` refuses if a VM with that name exists. It does not adopt, modify or "fix" an existing VM. It does not
 start the VM. The caller runs `start`.
@@ -149,6 +177,8 @@ The acceptance tests import these from `hyperv.ts`. Names and shapes are fixed. 
 | `STDIN_LAUNCHER` | string | Fixed, ASCII, secret-free launcher that reads the stdin request (see above). |
 | `stdinRequest(script, data)` | function | JSON `{ script, data }`, no BOM. |
 | `guestExecRequest(args)` / `createVmRequest(args)` | function | Parse through the schemas (throw on invalid input) and return `{ script, data }`. No secret, or encoding of one, in `script`. |
+| `DeleteDiskArgsSchema` | zod object | `path` and `confirmPath` (`WindowsPath`, ending `.vhdx` or `.avhdx`, case-insensitive), `allowBaseDisk` default false. |
+| `assertDiskDeleteConfirmed(path, confirmPath)` | function | Throws unless the two strings are identical (case included). The error never contains either path. |
 | `invocation(globalArgs, request)` | function | `{ argv, stdin }`, with `argv` equal to `sshArgs(globalArgs, encodeCommand(STDIN_LAUNCHER))` and independent of every secret. |
 
 New resources: `image` (one per golden image) and `exec` (one per `guestExec` run). The `vm` resource gains an
@@ -182,8 +212,14 @@ passes:
    SetupComplete script → both gone.
 6. SSH to the guest with the test key → `whoami` succeeds. A password login attempt fails.
 7. `createVm` `e2e-win01` again → refuses (exists).
-8. `delete` `e2e-win01` with `deleteDisks: true` and `confirmName: e2e-win01` (stop it first, or also pass `confirmForcePowerOff: true`) → the VM and its child VHDX are gone, and
-   **the golden image still exists with an unchanged hash**.
+8. Remove the VM and only the disk this run created. `delete` is **never** called with `deleteDisks: true` here.
+   1. Record the golden image's SHA-256, then read the child's path and parent from the `vm` resource that
+      `createVm` wrote.
+   2. `delete` `e2e-win01` with `deleteDisks: false` and `confirmName: e2e-win01` (stop it first, or also pass
+      `confirmForcePowerOff: true`) → the VM is gone and the child VHDX is still on disk.
+   3. `deleteDisk` with the golden image's path → **refused** (base disk, `allowBaseDisk` not set). Nothing changes.
+   4. `deleteDisk` with the child's path and `confirmPath` → the child is gone.
+   5. The golden image exists and its SHA-256 equals the one recorded in 8.1.
 9. `discover` → the **after** snapshot equals **before** for every VM not named `e2e-*`.
 
 Record the duration of each step and the evidence (resource ids, hashes, command output with secrets removed) in
@@ -197,12 +233,13 @@ the worker's report.
 - That `[Console]::In.ReadToEnd()` behaves under Windows PowerShell 5.1 started by sshd with `-EncodedCommand`
   (live step 0). If it doesn't (for example PowerShell consumes stdin itself), stop and report with evidence.
   Do not fall back to argv.
-- That `delete`'s existing disk-chain logic removes a differencing child and never its parent. Step 8 proves it.
-  If it does not, stop and report. Do not patch `delete` as part of this plan.
+- (Settled in revision 2.) `delete` with `deleteDisks: true` treats the whole chain, parents included, as
+  VM-owned. `delete` stays as reviewed: do not patch it. Removing a differencing VM is `delete` with
+  `deleteDisks: false`, then `deleteDisk` on the child.
 
 ## Definition of done
 
-The offline tests and checks are green. The live run passes all nine steps with evidence. README sections for
-the four methods are generated from `readme.vars.yaml` as for the existing ones, and the version is bumped
+The offline tests and checks are green. The live run passes steps 0–9 with evidence. README sections for
+the five new methods are generated from `readme.vars.yaml` as for the existing ones, and the version is bumped
 through `swamp extension version`. Nothing is pushed to any remote and nothing is published: publishing is a
 separate, human-approved step after the reviewer's PASS.
