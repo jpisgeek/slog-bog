@@ -164,6 +164,42 @@ Deno.test("cost amounts remain exact minor-unit decimals for both account kinds"
   );
   assertEquals((enterpriseCosts.totals as Json[])[0].amountMinor, "125");
 });
+Deno.test("grouped Enterprise costs preserve fractional cents with unattributed requests", async () => {
+  const amount = "125.000000000000000001";
+  const result = await run(
+    "enterprise",
+    (input) =>
+      Promise.resolve(Response.json(page(
+        String(input).includes("cost_report")
+          ? [cost(true, { amount, requests: null })]
+          : [usage(true)],
+      ))),
+  );
+  assertEquals((result.costStatus as Json).state, "complete");
+  const costs = result.costs as Json;
+  assertEquals(costs.totals, [{ currency: "USD", amountMinor: amount }]);
+  const row = (costs.breakdowns as Json[])[0];
+  assertEquals(row.amountMinor, amount);
+  assertEquals("requests" in row, false);
+  assertEquals((result.usage as Json).requests, 2);
+});
+
+Deno.test("grouped Enterprise costs reject invalid non-null request counts", async () => {
+  for (const requests of [-1, 1.5, "2"]) {
+    const result = await run(
+      "enterprise",
+      (input) =>
+        Promise.resolve(Response.json(page(
+          String(input).includes("cost_report")
+            ? [cost(true, { requests })]
+            : [usage(true)],
+        ))),
+    );
+    assertEquals(result.costs, null);
+    assertEquals((result.costStatus as Json).errorKind, "invalid-response");
+  }
+});
+
 // Anthropic documents data_refreshed_at as RFC 3339, which permits a numeric
 // offset. The snapshot schema is Z-only, so the unchecked passthrough turned a
 // legal value into an uncaught ZodError after both fetches had succeeded.
@@ -370,8 +406,8 @@ Deno.test("a requested grouping that is absent or mistyped invalidates the dimen
   assertEquals((enterprise.costStatus as Json).errorKind, "invalid-response");
 });
 // An explicit null is a value Anthropic chose to send. It is legal on the
-// identifier dimensions it genuinely leaves unattributed, and never on a
-// counter or on a currency amount.
+// identifier dimensions it genuinely leaves unattributed, and is invalid on
+// the Platform usage counters exercised below.
 Deno.test("explicit null is accepted on identifiers and refused on counters", async () => {
   const ungrouped = await run(
     "platform",

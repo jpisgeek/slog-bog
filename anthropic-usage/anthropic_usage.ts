@@ -304,7 +304,8 @@ const EnterpriseCostResultSchema = z.strictObject({
   token_type: dimension(),
   service_tier: dimension(),
   list_amount: z.string().regex(/^\d+(\.\d+)?$/).optional(),
-  requests: z.number().int().nonnegative().optional(),
+  // Grouped cost rows can omit request attribution or report it as null.
+  requests: z.number().int().nonnegative().nullish(),
   claude_tag_category: dimension(),
   claude_tag_user_id: dimension(),
   rbac_group_id: dimension(),
