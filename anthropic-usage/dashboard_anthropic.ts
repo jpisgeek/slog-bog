@@ -438,8 +438,14 @@ const StatusSchema = z.object({
   pagesRead: z.number().int().nonnegative(),
   // Stored diagnostic text is outside the report's disclosure boundary.
   errorKind: z.enum([
-    "", "unsupported", "unauthorized", "rate-limited", "timeout",
-    "unreachable", "invalid-response", "http-error",
+    "",
+    "unsupported",
+    "unauthorized",
+    "rate-limited",
+    "timeout",
+    "unreachable",
+    "invalid-response",
+    "http-error",
   ]),
 });
 const RefreshStateSchema = z.enum(["absent", "observed", "invalid"]);
@@ -737,7 +743,10 @@ function unavailable(id: string, title: string, status: Status) {
       scope: `Anthropic organization ${id}`,
       notes: status.errorKind || "No authoritative response",
     },
-    freshness: { state: "unknown", reason: status.errorKind || "No observation" },
+    freshness: {
+      state: "unknown",
+      reason: status.errorKind || "No observation",
+    },
     completeness: {
       state: "unknown",
       reason: status.errorKind || "No authoritative response",
@@ -1061,7 +1070,7 @@ export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
     generatedAt: new Date().toISOString(),
     producer: {
       extension: "@jpisgeek/anthropic-usage",
-      extensionVersion: "2026.09.05.1",
+      extensionVersion: "2026.11.26.1",
       modelType: String(ctx.modelType),
       modelName: ctx.definition.name,
       modelId: ctx.modelId,

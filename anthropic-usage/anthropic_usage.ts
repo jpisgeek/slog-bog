@@ -930,7 +930,7 @@ async function collect(args: z.infer<typeof CollectArgsSchema>, ctx: Context) {
 }
 export const model = {
   type: "@jpisgeek/anthropic-usage",
-  version: "2026.09.05.1",
+  version: "2026.11.26.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     snapshot: {
