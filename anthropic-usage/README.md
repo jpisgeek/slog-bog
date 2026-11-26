@@ -12,15 +12,18 @@ https://github.com/jpisgeek/slog-bog/tree/main/anthropic-usage
 
 ## Install
 
-Clone this GitHub repository and register this extension's source in your Swamp
-repo. Replace the example path with the canonical location of your clone:
+Releases go to Swamp Club, starting on the beta channel. To install from beta:
+
+```sh
+swamp extension pull @jpisgeek/anthropic-usage --channel beta
+```
+
+To use a local source checkout, clone this repository and register the package
+in your Swamp repo. Replace the example path with your clone's location:
 
 ```sh
 swamp extension source add /example/slog-bog/anthropic-usage --only models,reports
 ```
-
-This repaired version is distributed through GitHub source, not a registry
-release.
 
 ## `@jpisgeek/anthropic-usage`
 
@@ -113,5 +116,4 @@ infrastructure, and both are listed in the bundle's sensitivity metadata so they
 can be stripped before a bundle is published anywhere.
 
 See [SECURITY.md](https://github.com/jpisgeek/slog-bog/blob/main/SECURITY.md)
-for the repository's security review requirements. This version is shared as
-GitHub source and is not published to the Swamp registry.
+for the repository's security review requirements.
