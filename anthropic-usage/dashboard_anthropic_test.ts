@@ -1,5 +1,5 @@
 import { assertEquals } from "jsr:@std/assert@1";
-import { normalize } from "./dashboard_anthropic.ts";
+import { normalize, report } from "./dashboard_anthropic.ts";
 type Json = Record<string, unknown>;
 const status = (state = "complete", errorKind = "", message = "") => ({
   state,
@@ -369,3 +369,28 @@ Deno.test("bundle IDs retain distinct Platform and Enterprise instances across r
   assertEquals(byId.get(a.id)?.producer.modelId, platform.modelId);
   assertEquals(byId.get(b.id)?.producer.modelId, enterprise.modelId);
 });
+
+for (const format of ["json", "markdown"] as const) {
+  Deno.test(`stored diagnostic text stays out of ${format} exports`, async () => {
+    const marker = "SYNTHETIC-DIAGNOSTIC-MARKER";
+    for (const dimension of ["usage", "costs"] as const) {
+      const key = dimension === "usage" ? "usageStatus" : "costStatus";
+      for (const state of ["unavailable", "partial"] as const) {
+        const input = snapshot({
+          [key]: status(state, "unauthorized", marker),
+          ...(state === "unavailable" ? { [dimension]: null } : {}),
+        });
+        const output = await report.execute(context(input));
+        const rendered = JSON.stringify(output[format]);
+        assertEquals(rendered.includes(marker), false);
+        assertEquals(rendered.includes("unauthorized"), true);
+      }
+    }
+    const unexpected = await report.execute(context(snapshot({
+      usage: null,
+      usageStatus: status("unavailable", marker, marker),
+    })));
+    assertEquals(JSON.stringify(unexpected[format]).includes(marker), false);
+    assertEquals(unexpected.json.state, "unknown");
+  });
+}

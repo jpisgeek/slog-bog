@@ -436,8 +436,11 @@ type Json = Record<string, unknown>;
 const StatusSchema = z.object({
   state: z.enum(["complete", "partial", "unavailable", "unsupported"]),
   pagesRead: z.number().int().nonnegative(),
-  errorKind: z.string(),
-  message: z.string(),
+  // Stored diagnostic text is outside the report's disclosure boundary.
+  errorKind: z.enum([
+    "", "unsupported", "unauthorized", "rate-limited", "timeout",
+    "unreachable", "invalid-response", "http-error",
+  ]),
 });
 const RefreshStateSchema = z.enum(["absent", "observed", "invalid"]);
 type RefreshState = z.infer<typeof RefreshStateSchema>;
@@ -728,16 +731,16 @@ function unavailable(id: string, title: string, status: Status) {
     title,
     state,
     impact: "required",
-    summary: status.message || `${title} unavailable`,
+    summary: status.errorKind || `${title} unavailable`,
     coverage: {
       kind: "unknown",
       scope: `Anthropic organization ${id}`,
-      notes: status.message || "No authoritative response",
+      notes: status.errorKind || "No authoritative response",
     },
-    freshness: { state: "unknown", reason: status.message || "No observation" },
+    freshness: { state: "unknown", reason: status.errorKind || "No observation" },
     completeness: {
       state: "unknown",
-      reason: status.message || "No authoritative response",
+      reason: status.errorKind || "No authoritative response",
     },
     metrics: [{
       id: `${id}-total`,
@@ -750,7 +753,7 @@ function unavailable(id: string, title: string, status: Status) {
         : state === "unsupported"
         ? "unsupported"
         : "unknown",
-      reason: status.message || `${title} unavailable`,
+      reason: status.errorKind || `${title} unavailable`,
     }],
     facts: [],
     exceptions: [{
@@ -762,7 +765,7 @@ function unavailable(id: string, title: string, status: Status) {
         : state === "unsupported"
         ? "Capability unsupported"
         : `${title} unavailable`,
-      detail: status.message || "No authoritative response",
+      detail: status.errorKind || "No authoritative response",
       source: "@jpisgeek/anthropic-usage",
       suppressed: false,
       suppressReason: "",
@@ -777,7 +780,7 @@ function completeness(status: Status, count: number, capped: boolean) {
     return {
       state: "partial" as const,
       observed: count,
-      reason: status.message ||
+      reason: status.errorKind ||
         "Grouped Enterprise results are capped at the top 100 groups per bucket",
     };
   }
@@ -888,7 +891,7 @@ function usageSection(s: Snapshot) {
             : sectionState === "unsupported"
             ? "Usage capability unsupported"
             : "Usage coverage is partial",
-          detail: s.usageStatus.message ||
+          detail: s.usageStatus.errorKind ||
             "Grouped Enterprise results have a documented top-100 cap",
           source: "@jpisgeek/anthropic-usage",
           suppressed: false,
@@ -1011,7 +1014,7 @@ function costSection(s: Snapshot) {
             : sectionState === "unsupported"
             ? "Cost capability unsupported"
             : "Cost coverage is partial",
-          detail: s.costStatus.message ||
+          detail: s.costStatus.errorKind ||
             "Grouped Enterprise results have a documented top-100 cap",
           source: "@jpisgeek/anthropic-usage",
           suppressed: false,
@@ -1046,7 +1049,6 @@ export async function normalize(ctx: Context): Promise<DashboardBundleV1> {
     state: "unavailable",
     pagesRead: 0,
     errorKind: "invalid-response",
-    message: "No valid Anthropic organization snapshot was available",
   };
   const sections = s ? [usageSection(s), costSection(s)] : [
     unavailable("usage", "Token usage", missing),
