@@ -12,10 +12,10 @@ https://github.com/jpisgeek/slog-bog/tree/main/anthropic-usage
 
 ## Install
 
-Releases go to Swamp Club, starting on the beta channel. To install from beta:
+Install the extension from the Swamp Club registry:
 
 ```sh
-swamp extension pull @jpisgeek/anthropic-usage --channel beta
+swamp extension pull @jpisgeek/anthropic-usage
 ```
 
 To use a local source checkout, clone this repository and register the package
